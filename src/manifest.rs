@@ -1,7 +1,7 @@
 use crate::{Error, Result, RollupResolution};
 use crc32fast::hash;
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -100,9 +100,9 @@ impl Manifest {
             let _ = std::fs::remove_file(&temporary);
             return Err(Error::Io(error));
         }
-        File::open(directory)?.sync_all()?;
+        crate::storage::sync_directory(directory)?;
         std::fs::remove_file(&temporary)?;
-        File::open(directory)?.sync_all()?;
+        crate::storage::sync_directory(directory)?;
         Ok(())
     }
 }
@@ -154,9 +154,7 @@ pub(crate) fn prune_generations(
             let _ = std::fs::remove_file(path);
         }
     }
-    if let Ok(file) = File::open(directory) {
-        let _ = file.sync_all();
-    }
+    let _ = crate::storage::sync_directory(directory);
     Ok(retained)
 }
 

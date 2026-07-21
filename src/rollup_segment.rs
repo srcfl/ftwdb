@@ -1,7 +1,7 @@
 use crate::{Error, GaugeBucket, Result, Sample};
 use crc32fast::hash;
 use lz4_flex::block::{compress_prepend_size, decompress};
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -356,12 +356,12 @@ fn temporary_path(path: &Path) -> Result<PathBuf> {
     Ok(parent.join(format!(".{file_name}.tmp-{}-{nonce}", std::process::id())))
 }
 
+/// Routes through the shared, platform-gated directory sync helper so the
+/// Unix/non-Unix policy lives in exactly one place (`storage::sync_directory`).
+/// A missing parent was already rejected by `temporary_path` before any
+/// caller reaches this sync.
 fn sync_parent(path: &Path) -> Result<()> {
-    let parent = path.parent().ok_or(Error::InvalidConfig(
-        "rollup segment path must have a parent directory",
-    ))?;
-    File::open(parent)?.sync_all()?;
-    Ok(())
+    crate::storage::sync_parent_directory(path)
 }
 
 fn corruption<T>(offset: u64, reason: &str) -> Result<T> {

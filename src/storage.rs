@@ -984,10 +984,25 @@ fn quarantine_corrupt_tail(path: &Path, offset: u64, frame_header: &[u8], payloa
 }
 
 /// Makes a directory's entries durable, exactly like segment and manifest
-/// publication do for their parents. Opening the directory and syncing it is
-/// Unix semantics; Windows support is tracked separately (issue #15).
+/// publication do for their parents. Opening the directory and fsyncing the
+/// handle is Unix semantics; every directory sync in the crate goes through
+/// this one helper so the platform gate lives in a single place.
+#[cfg(unix)]
 pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+/// On non-Unix platforms a directory cannot generally be opened as a file
+/// and fsynced — Windows rejects `File::open` on a directory with
+/// `PermissionDenied` — so directory syncs are a documented no-op, the
+/// standard practice for portable storage engines. File *contents* are still
+/// synced everywhere; only the durability of directory entries (file
+/// creation, rename publication) is left to the operating system, so the
+/// crate's entry-durability guarantees are Unix-only (see
+/// docs/architecture.md).
+#[cfg(not(unix))]
+pub(crate) fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 

@@ -88,6 +88,14 @@ SQLite's “powersafe overwrite” property. Therefore new data is appended, eve
 frame is checksummed, immutable outputs are fully written and synced before
 publication, and manifest replacement includes a directory sync.
 
+Directory-entry durability is Unix-only. Directory syncs open the directory
+and fsync the handle, which non-Unix platforms (notably Windows) reject, so
+there they are a deliberate no-op — the standard practice for portable
+storage engines. File contents are still synced on every platform, but a
+newly created database file or a just-published segment/manifest rename may
+not survive power loss on non-Unix systems until the operating system flushes
+the directory metadata on its own.
+
 The test matrix must include process kill, arbitrary frame truncation, payload
 bit flips, full-disk errors, failed sync, stale manifests, and real power-cut
 testing on representative SD hardware. Process tests alone cannot prove power

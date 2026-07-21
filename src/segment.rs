@@ -776,10 +776,10 @@ fn temporary_path(path: &Path) -> Result<PathBuf> {
     )))
 }
 
+/// Routes through the shared, platform-gated directory sync helper so the
+/// Unix/non-Unix policy lives in exactly one place (`storage::sync_directory`).
 fn sync_parent(path: &Path) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    File::open(parent)?.sync_all()?;
-    Ok(())
+    crate::storage::sync_parent_directory(path)
 }
 
 fn corruption<T>(offset: u64, reason: &str) -> Result<T> {
