@@ -209,6 +209,9 @@ impl Store {
 
     /// Compatibility append for a previously initialized catalog. New code
     /// should prefer a mixed `Transaction` so metadata and values are atomic.
+    /// Like [`Database::append`], only catalog-independent point invariants
+    /// are enforced; series existence and run provenance are checked
+    /// exclusively by [`Store::commit`].
     pub fn append(&mut self, points: &[Point]) -> Result<Commit> {
         self.ensure_writable()?;
         let mut commit = self.database.append(points)?;
