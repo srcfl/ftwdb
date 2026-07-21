@@ -2,21 +2,28 @@
 
 ## Integrity check
 
-`ftwdb check-store <directory>` opens and recovers the active commit log,
-loads the highest valid manifest generation, and re-opens every active rollup
-segment. It validates checksums, encoded lengths, aggregate invariants,
+`ftwdb check-store <directory>` opens the store read-only: the active commit
+log is opened without write access under a shared lock, torn-tail recovery is
+simulated in memory, and no manifest generation is published, pruned, or swept.
+It loads the highest valid manifest generation and re-opens every active rollup
+segment, validating checksums, encoded lengths, aggregate invariants,
 descriptor coverage, and raw-source watermarks. The command emits a single JSON
-record with raw commit/point counts and active rollup file/bucket/byte counts.
+record with raw commit/point counts, active rollup file/bucket/byte counts, and
+a `stale_rollup_files` count of rollups whose provenance trails the raw log —
+state a writable open would reconcile but a check only reports.
 
 Inactive files are not required for the current database state and are not
 included in this check. Rollup files that no retained manifest generation
-references are removed automatically after publication and at startup.
+references are removed automatically after publication and at writable
+startup; a read-only open never deletes them.
 
 ## Snapshot backup
 
-`ftwdb backup <source> <absent-destination>` uses this publication order:
+`ftwdb backup <source> <absent-destination>` opens the source read-only, so a
+backup can never alter (or accidentally create) the store it is copying, and
+uses this publication order:
 
-1. flush and integrity-check the source;
+1. integrity-check the source;
 2. create a hidden sibling directory;
 3. copy and sync `active.wlog`;
 4. hard-link active immutable rollups and the selected manifest when source and

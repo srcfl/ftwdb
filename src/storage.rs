@@ -129,6 +129,7 @@ pub struct PlanOutcome {
 pub struct Database {
     file: File,
     config: Config,
+    read_only: bool,
     index: HashMap<u64, Vec<Point>>,
     catalog: Catalog,
     commits: u64,
@@ -145,20 +146,48 @@ impl Database {
     }
 
     pub fn open_with(path: impl AsRef<Path>, config: Config) -> Result<Self> {
-        validate_config(config)?;
-        let path = path.as_ref();
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(path)?;
+        Self::open_mode(path.as_ref(), config, false)
+    }
 
-        // Take an exclusive advisory lock before recovery so a second opener
-        // can neither interleave frames nor truncate this handle's in-flight
-        // tail. The lock lives exactly as long as the handle: closing or
-        // dropping the database releases it, even on panic or crash.
-        match file.try_lock() {
+    /// Opens an existing database without any possibility of mutating it.
+    ///
+    /// The file is opened without write access and is never created, torn-tail
+    /// recovery is simulated in memory instead of physically truncating the
+    /// file, and every writer API (`append`, `commit`, `flush`) fails with
+    /// [`Error::ReadOnly`]. A shared advisory lock replaces the exclusive one,
+    /// so concurrent read-only openers coexist while a live exclusive writer
+    /// still blocks (and is blocked by) read-only opens, preventing reads of a
+    /// mid-write file.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_mode(path.as_ref(), Config::default(), true)
+    }
+
+    fn open_mode(path: &Path, config: Config, read_only: bool) -> Result<Self> {
+        validate_config(config)?;
+        let mut file = if read_only {
+            OpenOptions::new().read(true).open(path)?
+        } else {
+            OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(path)?
+        };
+
+        // Take an advisory lock before recovery so a writer and a reader can
+        // never interleave: the exclusive writer lock keeps a second opener
+        // from interleaving frames or truncating this handle's in-flight
+        // tail, while the shared read-only lock admits other inspectors but
+        // excludes any exclusive writer. The lock lives exactly as long as
+        // the handle: closing or dropping the database releases it, even on
+        // panic or crash.
+        let lock_result = if read_only {
+            file.try_lock_shared()
+        } else {
+            file.try_lock()
+        };
+        match lock_result {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
                 return Err(Error::Locked {
@@ -168,7 +197,13 @@ impl Database {
             Err(TryLockError::Error(error)) => return Err(Error::Io(error)),
         }
 
-        if file.metadata()?.len() == 0 {
+        if read_only {
+            // A writable open initializes an empty file; a read-only open
+            // must instead reject anything too short to hold a header.
+            if file.metadata()?.len() < DATABASE_HEADER_BYTES as u64 {
+                return Err(Error::InvalidHeader);
+            }
+        } else if file.metadata()?.len() == 0 {
             write_database_header(&mut file)?;
         }
 
@@ -176,10 +211,12 @@ impl Database {
             &mut file,
             config.max_batch_points,
             config.max_transaction_bytes,
+            read_only,
         )?;
         Ok(Self {
             file,
             config,
+            read_only,
             index: scan.index,
             catalog: scan.catalog,
             commits: scan.commits,
@@ -193,6 +230,9 @@ impl Database {
 
     /// Appends one atomic, checksummed batch.
     pub fn append(&mut self, points: &[Point]) -> Result<Commit> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
         if self.poisoned {
             return Err(Error::Poisoned);
         }
@@ -283,6 +323,9 @@ impl Database {
 
     /// Atomically commits catalog changes and point batches in one frame.
     pub fn commit(&mut self, transaction: Transaction) -> Result<Commit> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
         if self.poisoned {
             return Err(Error::Poisoned);
         }
@@ -385,6 +428,9 @@ impl Database {
 
     /// Makes all prior appends durable according to the operating system.
     pub fn flush(&mut self) -> Result<()> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
         if self.poisoned {
             return Err(Error::Poisoned);
         }
@@ -393,9 +439,18 @@ impl Database {
         Ok(())
     }
 
-    /// Flushes and closes the database.
+    /// Flushes and closes the database. A read-only handle has nothing to
+    /// flush and simply releases its shared lock.
     pub fn close(mut self) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
         self.flush()
+    }
+
+    #[must_use]
+    pub const fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     #[must_use]
@@ -543,12 +598,21 @@ impl Database {
     }
 
     pub fn stats(&self) -> Result<Stats> {
+        // A read-only open leaves a torn tail on disk, so its physical length
+        // is reduced by the simulated truncation to report the same logical
+        // length a writable recovery would have left behind.
+        let physical_bytes = self.file.metadata()?.len();
+        let file_bytes = if self.read_only {
+            physical_bytes.saturating_sub(self.recovered_tail_bytes)
+        } else {
+            physical_bytes
+        };
         Ok(Stats {
             points: self.points,
             commits: self.commits,
             series: self.index.len(),
             catalog_records: self.catalog_records,
-            file_bytes: self.file.metadata()?.len(),
+            file_bytes,
             recovered_tail_bytes: self.recovered_tail_bytes,
         })
     }
@@ -593,10 +657,14 @@ struct Scan {
     recovered_tail_bytes: u64,
 }
 
+/// Replays the log, recovering from a torn tail. With `simulate_recovery` the
+/// torn tail is skipped and accounted exactly as if it had been truncated, but
+/// the file is never written; without it the tail is physically removed.
 fn scan_and_recover(
     file: &mut File,
     max_batch_points: usize,
     max_transaction_bytes: usize,
+    simulate_recovery: bool,
 ) -> Result<Scan> {
     let mut database_header = [0_u8; DATABASE_HEADER_BYTES];
     file.seek(SeekFrom::Start(0))?;
@@ -626,7 +694,9 @@ fn scan_and_recover(
         let remaining = original_len - offset;
         if remaining < FRAME_HEADER_BYTES as u64 {
             recovered_tail_bytes = remaining;
-            truncate_recovered_tail(file, offset)?;
+            if !simulate_recovery {
+                truncate_recovered_tail(file, offset)?;
+            }
             break;
         }
 
@@ -671,7 +741,9 @@ fn scan_and_recover(
         let frame_len = FRAME_HEADER_BYTES as u64 + payload_len as u64;
         if remaining < frame_len {
             recovered_tail_bytes = remaining;
-            truncate_recovered_tail(file, offset)?;
+            if !simulate_recovery {
+                truncate_recovered_tail(file, offset)?;
+            }
             break;
         }
 
@@ -680,7 +752,9 @@ fn scan_and_recover(
         if hash(&payload) != payload_checksum {
             if remaining == frame_len {
                 recovered_tail_bytes = frame_len;
-                truncate_recovered_tail(file, offset)?;
+                if !simulate_recovery {
+                    truncate_recovered_tail(file, offset)?;
+                }
                 break;
             }
             return corruption(offset, "payload checksum mismatch before valid tail");
@@ -1060,6 +1134,105 @@ mod tests {
         let mut reopened = Database::open(&path).unwrap();
         reopened.append(&[point(1, 1, 1, 1.0)]).unwrap();
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn read_only_open_simulates_recovery_without_mutating_the_file() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("read-only-torn.ftwdb");
+        let first_length;
+        {
+            let mut database = Database::open_with(
+                &path,
+                Config {
+                    durability: Durability::Manual,
+                    ..Config::default()
+                },
+            )
+            .unwrap();
+            database.append(&[point(1, 1, 1, 1.0)]).unwrap();
+            database.flush().unwrap();
+            first_length = database.stats().unwrap().file_bytes;
+            database.append(&[point(2, 2, 2, 2.0)]).unwrap();
+        }
+        let full_length = std::fs::metadata(&path).unwrap().len();
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(full_length - 10).unwrap();
+        drop(file);
+        let bytes_before = std::fs::read(&path).unwrap();
+
+        let database = Database::open_read_only(&path).unwrap();
+        let stats = database.stats().unwrap();
+        assert!(stats.recovered_tail_bytes > 0);
+        assert_eq!(stats.file_bytes, first_length);
+        assert_eq!(database.query_latest(7, 0, 10).len(), 1);
+        database.close().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
+    }
+
+    #[test]
+    fn read_only_open_does_not_create_a_missing_file() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("absent.ftwdb");
+        match Database::open_read_only(&path) {
+            Err(Error::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+            Err(other) => panic!("expected a not-found error, got {other:?}"),
+            Ok(_) => panic!("expected a not-found error, got an open database"),
+        }
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn writer_apis_fail_cleanly_on_a_read_only_handle() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("read-only-writers.ftwdb");
+        {
+            let mut database = Database::open(&path).unwrap();
+            database.append(&[point(1, 1, 1, 1.0)]).unwrap();
+            database.close().unwrap();
+        }
+        let mut database = Database::open_read_only(&path).unwrap();
+        assert!(database.is_read_only());
+        assert!(matches!(
+            database.append(&[point(2, 2, 2, 2.0)]),
+            Err(Error::ReadOnly)
+        ));
+        assert!(matches!(
+            database.commit(Transaction::new()),
+            Err(Error::ReadOnly)
+        ));
+        assert!(matches!(database.flush(), Err(Error::ReadOnly)));
+        assert_eq!(database.query_latest(7, 0, 10).len(), 1);
+        database.close().unwrap();
+    }
+
+    #[test]
+    fn shared_and_exclusive_locks_exclude_each_other() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("lock-interplay.ftwdb");
+        {
+            let mut database = Database::open(&path).unwrap();
+            database.append(&[point(1, 1, 1, 1.0)]).unwrap();
+            database.close().unwrap();
+        }
+
+        // Read-only openers share the lock with each other...
+        let first_reader = Database::open_read_only(&path).unwrap();
+        let second_reader = Database::open_read_only(&path).unwrap();
+        // ...but exclude an exclusive writer.
+        assert!(matches!(Database::open(&path), Err(Error::Locked { .. })));
+        drop(first_reader);
+        assert!(matches!(Database::open(&path), Err(Error::Locked { .. })));
+        drop(second_reader);
+
+        // A live exclusive writer excludes read-only openers.
+        let writer = Database::open(&path).unwrap();
+        assert!(matches!(
+            Database::open_read_only(&path),
+            Err(Error::Locked { .. })
+        ));
+        drop(writer);
+        Database::open_read_only(&path).unwrap().close().unwrap();
     }
 
     #[test]

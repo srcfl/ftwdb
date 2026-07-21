@@ -54,6 +54,10 @@ pub struct IntegrityReport {
     pub active_rollup_files: usize,
     pub active_rollup_buckets: u64,
     pub active_rollup_bytes: u64,
+    /// Active rollups whose provenance trails the raw log. A writable open
+    /// reconciles these by publishing an invalidating manifest generation; a
+    /// read-only open leaves the store untouched and only reports them here.
+    pub stale_rollup_files: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -74,6 +78,8 @@ pub struct Store {
     manifest: Manifest,
     rollup_cache: RwLock<HashMap<String, RollupSegment>>,
     poisoned: bool,
+    read_only: bool,
+    stale_rollup_files: usize,
 }
 
 impl Store {
@@ -107,11 +113,46 @@ impl Store {
             manifest,
             rollup_cache: RwLock::new(HashMap::new()),
             poisoned: false,
+            read_only: false,
+            stale_rollup_files: 0,
         };
         store.verify_and_reconcile_manifest()?;
         // Reclaims superseded manifests/segments and any segment orphaned by
         // a crash between `RollupSegment::create` and manifest publication.
         store.remove_unreferenced_files();
+        Ok(store)
+    }
+
+    /// Opens an existing store without mutating anything on disk.
+    ///
+    /// No directory is created, the active log is opened read-only with
+    /// simulated torn-tail recovery, no manifest generation is published, and
+    /// neither manifest pruning nor the orphaned-rollup sweep runs. Rollups
+    /// whose provenance trails the raw log — which a writable open would
+    /// invalidate and rebuild — are surfaced through
+    /// [`IntegrityReport::stale_rollup_files`] instead. Writer APIs (`commit`,
+    /// `append`, `maintain`, `flush`) fail with [`Error::ReadOnly`], while
+    /// queries, `check_integrity`, and `backup_to` remain available. The
+    /// shared lock on the active log admits concurrent read-only openers but
+    /// excludes any exclusive writer.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let root = path.as_ref().to_path_buf();
+        let manifest_directory = root.join(MANIFEST_DIRECTORY);
+        let rollup_directory = root.join(ROLLUP_DIRECTORY);
+        let database = Database::open_read_only(root.join(ACTIVE_LOG))?;
+        let manifest = Manifest::load(&manifest_directory)?;
+        let mut store = Self {
+            root,
+            rollup_directory,
+            manifest_directory,
+            database,
+            manifest,
+            rollup_cache: RwLock::new(HashMap::new()),
+            poisoned: false,
+            read_only: true,
+            stale_rollup_files: 0,
+        };
+        store.verify_manifest_read_only()?;
         Ok(store)
     }
 
@@ -132,7 +173,7 @@ impl Store {
     /// Commits catalog and data records atomically, then durably advances the
     /// rollup manifest if new points affect or supersede materialized state.
     pub fn commit(&mut self, transaction: Transaction) -> Result<Commit> {
-        self.ensure_healthy()?;
+        self.ensure_writable()?;
         let committed_points: Vec<Point> = transaction
             .records
             .iter()
@@ -158,7 +199,7 @@ impl Store {
     /// Compatibility append for a previously initialized catalog. New code
     /// should prefer a mixed `Transaction` so metadata and values are atomic.
     pub fn append(&mut self, points: &[Point]) -> Result<Commit> {
-        self.ensure_healthy()?;
+        self.ensure_writable()?;
         let mut commit = self.database.append(points)?;
         if !points.is_empty() && self.manifest.rollups.iter().any(|rollup| rollup.active) {
             if !commit.durable {
@@ -173,7 +214,7 @@ impl Store {
     /// Builds every completed configured gauge bucket and atomically publishes
     /// one manifest generation after all new segment files are durable.
     pub fn maintain(&mut self, now_micros: i64) -> Result<MaintenanceReport> {
-        self.ensure_healthy()?;
+        self.ensure_writable()?;
         // A durable rollup may never get ahead of the raw source it summarizes.
         self.database.flush()?;
         let stats = self.database.stats()?;
@@ -449,11 +490,16 @@ impl Store {
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        self.ensure_healthy()?;
+        self.ensure_writable()?;
         self.database.flush()
     }
 
+    /// Flushes and closes the store. A read-only store has nothing to flush
+    /// and simply releases its shared lock.
     pub fn close(mut self) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
         self.flush()
     }
 
@@ -466,6 +512,7 @@ impl Store {
             manifest_generation: self.manifest.generation,
             raw_points: raw.points,
             raw_commits: raw.commits,
+            stale_rollup_files: self.stale_rollup_files,
             ..IntegrityReport::default()
         };
         for descriptor in self.active_rollups() {
@@ -505,7 +552,12 @@ impl Store {
             "backup destination must have a parent directory",
         ))?;
         std::fs::create_dir_all(parent)?;
-        self.database.flush()?;
+        // Flushing is the only mutation `backup_to` performs on the source,
+        // and a read-only handle has nothing buffered, so backups from a
+        // read-only store are allowed and provably leave the source intact.
+        if !self.read_only {
+            self.database.flush()?;
+        }
         self.check_integrity()?;
 
         let name = destination
@@ -681,6 +733,44 @@ impl Store {
         Ok(())
     }
 
+    /// The read-only sibling of `verify_and_reconcile_manifest`: identical
+    /// corruption checks, but a descriptor whose provenance trails the raw
+    /// log is counted for [`IntegrityReport::stale_rollup_files`] instead of
+    /// being invalidated by publishing a new manifest generation.
+    fn verify_manifest_read_only(&mut self) -> Result<()> {
+        let stats = self.database.stats()?;
+        let mut stale_rollup_files = 0_usize;
+        let mut cache = self.rollup_cache.write().map_err(|_| Error::Poisoned)?;
+        for descriptor in self.manifest.rollups.iter().filter(|rollup| rollup.active) {
+            if descriptor.source_points > stats.points {
+                return Err(Error::Corruption {
+                    offset: 0,
+                    reason: format!("rollup {} is ahead of its raw source", descriptor.file),
+                });
+            }
+            let segment = RollupSegment::open(self.rollup_directory.join(&descriptor.file))?;
+            let segment_stats = segment.stats();
+            if segment_stats
+                .min_start
+                .is_none_or(|start| start < descriptor.start)
+                || segment_stats.max_end.is_none_or(|end| end > descriptor.end)
+            {
+                return Err(Error::Corruption {
+                    offset: 0,
+                    reason: format!("rollup {} bounds do not match manifest", descriptor.file),
+                });
+            }
+            if descriptor.source_points < stats.points {
+                stale_rollup_files += 1;
+            } else {
+                cache.insert(descriptor.file.clone(), segment);
+            }
+        }
+        drop(cache);
+        self.stale_rollup_files = stale_rollup_files;
+        Ok(())
+    }
+
     fn publish_or_poison(&mut self, mut next: Manifest) -> Result<()> {
         // Inactive descriptors are pure history: queries, reconciliation,
         // integrity checks, and backups all filter on `active`, so a new
@@ -752,6 +842,13 @@ impl Store {
         } else {
             Ok(())
         }
+    }
+
+    fn ensure_writable(&self) -> Result<()> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        self.ensure_healthy()
     }
 }
 
@@ -982,6 +1079,25 @@ mod tests {
     const SECOND: i64 = 1_000_000;
     const DAY: i64 = 86_400 * SECOND;
 
+    /// Every file under `root` (recursively) with its full contents, so a
+    /// test can prove an operation changed nothing on disk.
+    fn directory_snapshot(root: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
+        fn walk(directory: &std::path::Path, prefix: &str, into: &mut BTreeMap<String, Vec<u8>>) {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
+                if entry.metadata().unwrap().is_dir() {
+                    walk(&entry.path(), &format!("{name}/"), into);
+                } else {
+                    into.insert(name, std::fs::read(entry.path()).unwrap());
+                }
+            }
+        }
+        let mut snapshot = BTreeMap::new();
+        walk(root, "", &mut snapshot);
+        snapshot
+    }
+
     fn stored_files(directory: &std::path::Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(directory)
             .unwrap()
@@ -1040,6 +1156,122 @@ mod tests {
         first.close().unwrap();
         let mut reopened = Store::open(directory.path()).unwrap();
         initialize(&mut reopened, Vec::new(), None);
+    }
+
+    #[test]
+    fn read_only_open_neither_reconciles_nor_sweeps() {
+        let directory = tempdir().unwrap();
+        let resolution = RollupResolution::FixedMicros(5 * SECOND);
+        {
+            let mut store = Store::open(directory.path()).unwrap();
+            initialize(
+                &mut store,
+                vec![RollupTier {
+                    resolution: resolution.clone(),
+                    retain_for_micros: None,
+                }],
+                None,
+            );
+            let mut transaction = Transaction::new();
+            transaction.append_points(points());
+            store.commit(transaction).unwrap();
+            store.maintain(DAY).unwrap();
+            store.close().unwrap();
+        }
+        // Rollup provenance now trails the raw log, as after a crash between
+        // raw fsync and manifest invalidation: a writable open would publish
+        // a reconciling manifest generation.
+        {
+            let mut database = crate::Database::open(directory.path().join("active.wlog")).unwrap();
+            let mut correction = Point::actual(1, 6 * SECOND, 100.0);
+            correction.change_time = 30 * SECOND;
+            let mut transaction = Transaction::new();
+            transaction.append_points(vec![correction]);
+            database.commit(transaction).unwrap();
+            database.close().unwrap();
+        }
+        // An orphan that a writable open would sweep.
+        std::fs::write(
+            directory
+                .path()
+                .join("rollups")
+                .join("g9-s1-f5000000-0-42.rseg"),
+            b"junk",
+        )
+        .unwrap();
+        let before = directory_snapshot(directory.path());
+
+        let mut store = Store::open_read_only(directory.path()).unwrap();
+        // Staleness is surfaced as information instead of a mutation.
+        assert_eq!(store.check_integrity().unwrap().stale_rollup_files, 1);
+        // The stale materialization is not served; queries fall back to raw.
+        assert_eq!(
+            store
+                .query_gauge(1, 0, 20 * SECOND, &resolution)
+                .unwrap()
+                .source,
+            RollupSource::Raw
+        );
+        // Writer APIs fail with a structured error.
+        assert!(matches!(
+            store.commit(Transaction::new()),
+            Err(crate::Error::ReadOnly)
+        ));
+        assert!(matches!(store.append(&[]), Err(crate::Error::ReadOnly)));
+        assert!(matches!(store.maintain(DAY), Err(crate::Error::ReadOnly)));
+        assert!(matches!(store.flush(), Err(crate::Error::ReadOnly)));
+        store.close().unwrap();
+
+        assert_eq!(directory_snapshot(directory.path()), before);
+    }
+
+    #[test]
+    fn read_only_store_open_does_not_create_a_missing_store() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("absent-store");
+        assert!(Store::open_read_only(&path).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn backup_from_a_read_only_store_leaves_the_source_untouched() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("backup");
+        let resolution = RollupResolution::FixedMicros(5 * SECOND);
+        {
+            let mut store = Store::open(&source).unwrap();
+            initialize(
+                &mut store,
+                vec![RollupTier {
+                    resolution: resolution.clone(),
+                    retain_for_micros: None,
+                }],
+                None,
+            );
+            let mut transaction = Transaction::new();
+            transaction.append_points(points());
+            store.commit(transaction).unwrap();
+            store.maintain(DAY).unwrap();
+            store.close().unwrap();
+        }
+        let before = directory_snapshot(&source);
+
+        let mut store = Store::open_read_only(&source).unwrap();
+        let report = store.backup_to(&destination).unwrap();
+        assert!(report.files >= 3);
+        store.close().unwrap();
+        assert_eq!(directory_snapshot(&source), before);
+
+        let backup = Store::open(&destination).unwrap();
+        backup.check_integrity().unwrap();
+        assert_eq!(
+            backup
+                .query_gauge(1, 0, 20 * SECOND, &resolution)
+                .unwrap()
+                .source,
+            RollupSource::Materialized
+        );
     }
 
     #[test]
