@@ -43,4 +43,7 @@ pub use store::{
 };
 pub use transaction::Transaction;
 pub use tsbs::{TsbsIotLoadReport, load_tsbs_iot};
-pub use workload::{EnergyWorkload, WorkloadConfig, WorkloadSummary, gauge_bucket_checksum};
+pub use workload::{
+    EnergyWorkload, MAX_WORKLOAD_BUNDLE_BYTES, MAX_WORKLOAD_DAYS, MAX_WORKLOAD_POINTS,
+    MAX_WORKLOAD_SITES, WorkloadConfig, WorkloadSummary, gauge_bucket_checksum,
+};

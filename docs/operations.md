@@ -40,6 +40,14 @@ The active log is always copied, never hard-linked, because later appends to a
 shared inode would silently mutate the backup. A unit test writes to the source
 after publication and proves the backup point count remains unchanged.
 
+The `ftwdb-backup-v1` JSON record includes `linked_files`, `copied_files`,
+`hard_link_fallbacks`, and `hard_link_fallback_error_kinds`. Error kinds use
+fixed names such as `crosses-devices`, `permission-denied`, and `storage-full`;
+the command does not put raw operating-system error text in JSON. The active
+log counts as copied. If a hard link fails but the copy works, the report keeps
+the link error kind. If both fail, the returned I/O error keeps the copy error
+kind and its text and source also include the hard-link failure.
+
 This is a local consistent snapshot, not yet a remote backup policy. Encryption,
 incremental upload, retention, restore drills, and salvage of a corrupted source
 remain operational work.
