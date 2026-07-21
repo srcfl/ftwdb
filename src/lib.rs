@@ -30,7 +30,7 @@ pub use model::{
 pub use rollup::{CalendarGaugeRollup, FixedGaugeRollup, GaugeBucket};
 pub use rollup_segment::{RollupSegment, RollupSegmentStats};
 pub use segment::{Segment, SegmentStats};
-pub use storage::{Commit, Config, Database, Durability, PlanOutcome, Point, Stats};
+pub use storage::{Commit, Config, Database, Durability, PlanOutcome, Point, RecoveredTail, Stats};
 pub use store::{
     BackupReport, IntegrityReport, MaintenanceReport, RetentionGate, RollupQuery, RollupSource,
     Store,

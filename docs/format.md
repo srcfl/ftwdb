@@ -39,8 +39,13 @@ uncompressed; it is a durability test vehicle, not the final segment format.
 | 68 | 4 | flags |
 
 The complete batch frame is the recovery unit. An incomplete final header or
-payload is truncated on open. A checksum failure in the final frame discards
-that frame. A checksum failure before a later frame is reported as corruption.
+payload is truncated on open and reported as a short tail — the expected
+power-loss signature. A checksum failure in a full-length final frame also
+removes that frame, but is reported distinctly as a checksum-mismatch tail
+(media corruption rather than a torn write), and a writable open first
+preserves the removed bytes in a `<dbfile>.quarantine-<offset>` sidecar;
+read-only opens never write the sidecar. A checksum failure before a later
+frame is reported as corruption.
 
 ## Mixed transaction payload
 

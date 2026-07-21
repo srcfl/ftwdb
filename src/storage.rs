@@ -123,6 +123,37 @@ pub struct Commit {
     pub deduplicated: bool,
 }
 
+/// Why recovery removed (or, read-only, virtually removed) the log tail.
+///
+/// A short tail and a checksum-corrupt tail demand different operator
+/// responses: the first is the expected signature of power loss mid-append,
+/// while the second means every promised byte reached disk and then changed —
+/// media corruption that the same medium may inflict on older frames next.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RecoveredTail {
+    /// The log ended exactly on a frame boundary; nothing was recovered.
+    #[default]
+    None,
+    /// The final frame has fewer bytes than its header promises (or too few
+    /// bytes for a header at all): a torn write from power loss or crash.
+    ShortTail,
+    /// The final frame is present at full length but its payload checksum
+    /// does not match: bit rot rather than a torn write. In write mode the
+    /// removed bytes are preserved in a `<dbfile>.quarantine-<offset>`
+    /// sidecar for forensics.
+    ChecksumMismatch,
+}
+
+impl std::fmt::Display for RecoveredTail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::None => "none",
+            Self::ShortTail => "short-tail",
+            Self::ChecksumMismatch => "checksum-mismatch",
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Stats {
     pub points: u64,
@@ -131,6 +162,9 @@ pub struct Stats {
     pub catalog_records: u64,
     pub file_bytes: u64,
     pub recovered_tail_bytes: u64,
+    /// Distinguishes a power-cut torn tail from a checksum-corrupt one when
+    /// `recovered_tail_bytes` is non-zero.
+    pub recovered_tail: RecoveredTail,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -159,6 +193,7 @@ pub struct Database {
     points: u64,
     catalog_records: u64,
     recovered_tail_bytes: u64,
+    recovered_tail: RecoveredTail,
     bytes_since_sync: u64,
     poisoned: bool,
 }
@@ -239,6 +274,7 @@ impl Database {
 
         let scan = scan_and_recover(
             &mut file,
+            path,
             config.max_batch_points,
             config.max_transaction_bytes,
             read_only,
@@ -254,6 +290,7 @@ impl Database {
             points: scan.points,
             catalog_records: scan.catalog_records,
             recovered_tail_bytes: scan.recovered_tail_bytes,
+            recovered_tail: scan.recovered_tail,
             bytes_since_sync: 0,
             poisoned: false,
         })
@@ -704,6 +741,7 @@ impl Database {
             catalog_records: self.catalog_records,
             file_bytes,
             recovered_tail_bytes: self.recovered_tail_bytes,
+            recovered_tail: self.recovered_tail,
         })
     }
 }
@@ -746,13 +784,17 @@ struct Scan {
     points: u64,
     catalog_records: u64,
     recovered_tail_bytes: u64,
+    recovered_tail: RecoveredTail,
 }
 
 /// Replays the log, recovering from a torn tail. With `simulate_recovery` the
 /// torn tail is skipped and accounted exactly as if it had been truncated, but
-/// the file is never written; without it the tail is physically removed.
+/// the file is never written; without it the tail is physically removed, and a
+/// checksum-corrupt (rather than merely short) tail is first copied to a
+/// quarantine sidecar next to `path`.
 fn scan_and_recover(
     file: &mut File,
+    path: &Path,
     max_batch_points: usize,
     max_transaction_bytes: usize,
     simulate_recovery: bool,
@@ -781,11 +823,13 @@ fn scan_and_recover(
     let mut points = 0_u64;
     let mut catalog_records = 0_u64;
     let mut recovered_tail_bytes = 0_u64;
+    let mut recovered_tail = RecoveredTail::None;
 
     while offset < original_len {
         let remaining = original_len - offset;
         if remaining < FRAME_HEADER_BYTES as u64 {
             recovered_tail_bytes = remaining;
+            recovered_tail = RecoveredTail::ShortTail;
             if !simulate_recovery {
                 truncate_recovered_tail(file, offset)?;
             }
@@ -838,6 +882,7 @@ fn scan_and_recover(
         let frame_len = FRAME_HEADER_BYTES as u64 + payload_len as u64;
         if remaining < frame_len {
             recovered_tail_bytes = remaining;
+            recovered_tail = RecoveredTail::ShortTail;
             if !simulate_recovery {
                 truncate_recovered_tail(file, offset)?;
             }
@@ -848,8 +893,12 @@ fn scan_and_recover(
         file.read_exact(&mut payload)?;
         if hash(&payload) != payload_checksum {
             if remaining == frame_len {
+                // Every byte the header promised is present, so this is not a
+                // torn write: the payload changed after it reached disk.
                 recovered_tail_bytes = frame_len;
+                recovered_tail = RecoveredTail::ChecksumMismatch;
                 if !simulate_recovery {
+                    quarantine_corrupt_tail(path, offset, &frame_header, &payload);
                     truncate_recovered_tail(file, offset)?;
                 }
                 break;
@@ -913,7 +962,25 @@ fn scan_and_recover(
         points,
         catalog_records,
         recovered_tail_bytes,
+        recovered_tail,
     })
+}
+
+/// Best-effort copy of a checksum-corrupt final frame into a
+/// `<dbfile>.quarantine-<offset>` sidecar before the tail is truncated, so
+/// media corruption remains available for forensics instead of being
+/// destroyed. Failure to write the sidecar must not fail recovery: the
+/// sidecar is purely diagnostic, and the corrupt tail most likely means the
+/// medium is already misbehaving — refusing to open the database because a
+/// diagnostic could not be saved would turn recoverable corruption into an
+/// outage. Read-only opens never call this (they must not write anything).
+fn quarantine_corrupt_tail(path: &Path, offset: u64, frame_header: &[u8], payload: &[u8]) {
+    let mut sidecar = path.as_os_str().to_owned();
+    sidecar.push(format!(".quarantine-{offset}"));
+    let mut removed = Vec::with_capacity(frame_header.len() + payload.len());
+    removed.extend_from_slice(frame_header);
+    removed.extend_from_slice(payload);
+    let _ = std::fs::write(sidecar, removed);
 }
 
 /// Makes a directory's entries durable, exactly like segment and manifest
@@ -1417,6 +1484,7 @@ mod tests {
         let database = Database::open_read_only(&path).unwrap();
         let stats = database.stats().unwrap();
         assert!(stats.recovered_tail_bytes > 0);
+        assert_eq!(stats.recovered_tail, super::RecoveredTail::ShortTail);
         assert_eq!(stats.file_bytes, first_length);
         assert_eq!(database.query_latest(7, 0, 10).len(), 1);
         database.close().unwrap();
@@ -1515,6 +1583,85 @@ mod tests {
         assert_eq!(database.query_latest(7, 0, 10).len(), 1);
         assert_eq!(database.stats().unwrap().file_bytes, first_length);
         assert!(database.stats().unwrap().recovered_tail_bytes > 0);
+        // A torn write is reported as a short tail, and only a
+        // checksum-corrupt tail earns a quarantine sidecar.
+        assert_eq!(
+            database.stats().unwrap().recovered_tail,
+            super::RecoveredTail::ShortTail
+        );
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            1,
+            "a short tail must not leave a quarantine sidecar"
+        );
+    }
+
+    #[test]
+    fn checksum_corrupt_final_frame_is_quarantined_and_distinguished() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("bit-rot.ftwdb");
+        let first_length;
+        {
+            let mut database = Database::open(&path).unwrap();
+            database.append(&[point(1, 1, 1, 1.0)]).unwrap();
+            first_length = database.stats().unwrap().file_bytes;
+            database.append(&[point(2, 2, 2, 2.0)]).unwrap();
+            database.close().unwrap();
+        }
+        // Flip one payload byte inside the final frame: its full length is
+        // present, so this is bit rot, not a torn write.
+        let full_length = std::fs::metadata(&path).unwrap().len();
+        let corrupt_offset = first_length + 24 + 8;
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(corrupt_offset)).unwrap();
+        file.write_all(&[0xFF]).unwrap();
+        file.sync_data().unwrap();
+        drop(file);
+        let removed_bytes = std::fs::read(&path).unwrap()[first_length as usize..].to_vec();
+
+        let database = Database::open(&path).unwrap();
+        let stats = database.stats().unwrap();
+        assert_eq!(stats.recovered_tail, super::RecoveredTail::ChecksumMismatch);
+        assert_eq!(stats.recovered_tail_bytes, full_length - first_length);
+        assert_eq!(stats.file_bytes, first_length);
+        assert_eq!(database.query_latest(7, 0, 10).len(), 1);
+
+        // The removed frame survives byte-for-byte in the sidecar.
+        let sidecar = directory
+            .path()
+            .join(format!("bit-rot.ftwdb.quarantine-{first_length}"));
+        assert_eq!(std::fs::read(sidecar).unwrap(), removed_bytes);
+    }
+
+    #[test]
+    fn read_only_open_reports_a_checksum_corrupt_tail_without_a_sidecar() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("bit-rot-ro.ftwdb");
+        let first_length;
+        {
+            let mut database = Database::open(&path).unwrap();
+            database.append(&[point(1, 1, 1, 1.0)]).unwrap();
+            first_length = database.stats().unwrap().file_bytes;
+            database.append(&[point(2, 2, 2, 2.0)]).unwrap();
+            database.close().unwrap();
+        }
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(first_length + 24 + 8)).unwrap();
+        file.write_all(&[0xFF]).unwrap();
+        file.sync_data().unwrap();
+        drop(file);
+        let bytes_before = std::fs::read(&path).unwrap();
+
+        let database = Database::open_read_only(&path).unwrap();
+        let stats = database.stats().unwrap();
+        assert_eq!(stats.recovered_tail, super::RecoveredTail::ChecksumMismatch);
+        assert!(stats.recovered_tail_bytes > 0);
+        assert_eq!(stats.file_bytes, first_length);
+        database.close().unwrap();
+
+        // Read-only means read-only: no truncation and no quarantine sidecar.
+        assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[cfg(unix)]
