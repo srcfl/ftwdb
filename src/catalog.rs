@@ -233,7 +233,7 @@ pub(crate) fn validate_point_intervals(points: &[Point]) -> Result<()> {
     Ok(())
 }
 
-fn validate_entity(entity: &Entity) -> Result<()> {
+pub(crate) fn validate_entity(entity: &Entity) -> Result<()> {
     if entity.id.0 == 0 {
         return invalid("entity id zero is reserved".to_owned());
     }
@@ -262,7 +262,7 @@ fn validate_relation(relation: &Relation) -> Result<()> {
     Ok(())
 }
 
-fn validate_run(run: &Run) -> Result<()> {
+pub(crate) fn validate_run(run: &Run) -> Result<()> {
     if run.id.0 == 0 || run.workflow.trim().is_empty() {
         return invalid("run id and workflow are required".to_owned());
     }

@@ -63,11 +63,34 @@ pub struct IntegrityReport {
     pub stale_rollup_files: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BackupReport {
     pub files: usize,
     pub bytes: u64,
     pub manifest_generation: u64,
+    pub linked_files: usize,
+    pub copied_files: usize,
+    pub hard_link_fallbacks: usize,
+    pub hard_link_fallback_error_kinds: Vec<std::io::ErrorKind>,
+}
+
+impl BackupReport {
+    fn record_copy(&mut self) {
+        self.files += 1;
+        self.copied_files += 1;
+    }
+
+    fn record_link_or_copy(&mut self, outcome: LinkOrCopy) {
+        self.files += 1;
+        match outcome {
+            LinkOrCopy::Linked => self.linked_files += 1,
+            LinkOrCopy::Copied { link_error } => {
+                self.copied_files += 1;
+                self.hard_link_fallbacks += 1;
+                self.hard_link_fallback_error_kinds.push(link_error.kind());
+            }
+        }
+    }
 }
 
 /// A directory-level FTWDB store with a commit log and durable rollup
@@ -704,18 +727,19 @@ impl Store {
         // Never hard-link the active log: future appends to the source inode
         // must not mutate the backup snapshot.
         copy_and_sync(&self.root.join(ACTIVE_LOG), &temporary.join(ACTIVE_LOG))?;
-        report.files += 1;
+        report.record_copy();
         for descriptor in self.active_rollups() {
-            hard_link_or_copy(
+            let outcome = hard_link_or_copy(
                 &self.rollup_directory.join(&descriptor.file),
                 &rollups.join(&descriptor.file),
             )?;
-            report.files += 1;
+            report.record_link_or_copy(outcome);
         }
         if self.manifest.generation > 0 {
             let file = format!("MANIFEST.{:020}", self.manifest.generation);
-            hard_link_or_copy(&self.manifest_directory.join(&file), &manifests.join(&file))?;
-            report.files += 1;
+            let outcome =
+                hard_link_or_copy(&self.manifest_directory.join(&file), &manifests.join(&file))?;
+            report.record_link_or_copy(outcome);
         }
         sync_directory(&manifests)?;
         sync_directory(&rollups)?;
@@ -1075,17 +1099,75 @@ fn rollup_file_name(
     format!("g{generation}-s{series_id}-{tag}-{ordinal}-{nonce}.rseg")
 }
 
-fn copy_and_sync(source: &Path, destination: &Path) -> Result<u64> {
+fn copy_and_sync(source: &Path, destination: &Path) -> std::io::Result<u64> {
     let bytes = std::fs::copy(source, destination)?;
     std::fs::File::open(destination)?.sync_all()?;
     Ok(bytes)
 }
 
-fn hard_link_or_copy(source: &Path, destination: &Path) -> Result<()> {
-    if std::fs::hard_link(source, destination).is_err() {
-        copy_and_sync(source, destination)?;
+#[derive(Debug)]
+enum LinkOrCopy {
+    Linked,
+    Copied { link_error: std::io::Error },
+}
+
+#[derive(Debug)]
+struct HardLinkThenCopyError {
+    link_error: std::io::Error,
+    copy_error: std::io::Error,
+}
+
+impl std::fmt::Display for HardLinkThenCopyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "hard link failed: {}; copy failed: {}",
+            self.link_error, self.copy_error
+        )
     }
-    Ok(())
+}
+
+impl std::error::Error for HardLinkThenCopyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.link_error)
+    }
+}
+
+fn hard_link_or_copy_with<L, C>(
+    source: &Path,
+    destination: &Path,
+    link: L,
+    copy: C,
+) -> std::io::Result<LinkOrCopy>
+where
+    L: FnOnce(&Path, &Path) -> std::io::Result<()>,
+    C: FnOnce(&Path, &Path) -> std::io::Result<u64>,
+{
+    match link(source, destination) {
+        Ok(()) => Ok(LinkOrCopy::Linked),
+        Err(link_error) => match copy(source, destination) {
+            Ok(_) => Ok(LinkOrCopy::Copied { link_error }),
+            Err(copy_error) => {
+                let kind = copy_error.kind();
+                Err(std::io::Error::new(
+                    kind,
+                    HardLinkThenCopyError {
+                        link_error,
+                        copy_error,
+                    },
+                ))
+            }
+        },
+    }
+}
+
+fn hard_link_or_copy(source: &Path, destination: &Path) -> std::io::Result<LinkOrCopy> {
+    hard_link_or_copy_with(
+        source,
+        destination,
+        |source, destination| std::fs::hard_link(source, destination),
+        copy_and_sync,
+    )
 }
 
 fn directory_bytes(path: &Path) -> Result<u64> {
@@ -1104,17 +1186,110 @@ fn directory_bytes(path: &Path) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RollupSource, Store};
+    use super::{BackupReport, LinkOrCopy, RollupSource, Store, hard_link_or_copy_with};
     use crate::{
         CalendarUnit, Entity, EntityId, Point, RollupPolicy, RollupResolution, RollupTier,
         SeriesDefinition, SeriesSemantics, Transaction,
     };
     use std::collections::BTreeMap;
+    use std::error::Error as _;
     use std::io::{Seek, SeekFrom, Write};
+    use std::path::Path;
     use tempfile::tempdir;
 
     const SECOND: i64 = 1_000_000;
     const DAY: i64 = 86_400 * SECOND;
+
+    #[test]
+    fn hard_link_path_does_not_copy() {
+        let result = hard_link_or_copy_with(
+            Path::new("source"),
+            Path::new("destination"),
+            |_, _| Ok(()),
+            |_, _| panic!("copy must not run after a successful hard link"),
+        )
+        .unwrap();
+
+        assert!(matches!(result, LinkOrCopy::Linked));
+    }
+
+    #[test]
+    fn copy_fallback_reports_the_hard_link_cause() {
+        let result = hard_link_or_copy_with(
+            Path::new("source"),
+            Path::new("destination"),
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "link denied",
+                ))
+            },
+            |_, _| Ok(12),
+        )
+        .unwrap();
+
+        match result {
+            LinkOrCopy::Copied { link_error } => {
+                assert_eq!(link_error.kind(), std::io::ErrorKind::PermissionDenied);
+                assert!(link_error.to_string().contains("link denied"));
+            }
+            LinkOrCopy::Linked => panic!("expected a copy fallback"),
+        }
+    }
+
+    #[test]
+    fn backup_report_counts_links_copies_and_fallback_kinds() {
+        let mut report = BackupReport::default();
+        report.record_copy();
+        report.record_link_or_copy(LinkOrCopy::Linked);
+        report.record_link_or_copy(LinkOrCopy::Copied {
+            link_error: std::io::Error::new(
+                std::io::ErrorKind::CrossesDevices,
+                "different filesystems",
+            ),
+        });
+
+        assert_eq!(report.files, 3);
+        assert_eq!(report.linked_files, 1);
+        assert_eq!(report.copied_files, 2);
+        assert_eq!(report.hard_link_fallbacks, 1);
+        assert_eq!(
+            report.hard_link_fallback_error_kinds,
+            [std::io::ErrorKind::CrossesDevices]
+        );
+    }
+
+    #[test]
+    fn double_failure_keeps_copy_kind_and_both_causes() {
+        let error = hard_link_or_copy_with(
+            Path::new("source"),
+            Path::new("destination"),
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "link denied",
+                ))
+            },
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "copy disk full",
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+        let message = error.to_string();
+        assert!(message.contains("link denied"));
+        assert!(message.contains("copy disk full"));
+        let link = error
+            .source()
+            .unwrap()
+            .downcast_ref::<std::io::Error>()
+            .unwrap();
+        assert_eq!(link.kind(), std::io::ErrorKind::PermissionDenied);
+    }
 
     /// Every file under `root` (recursively) with its full contents, so a
     /// test can prove an operation changed nothing on disk.
@@ -1313,6 +1488,10 @@ mod tests {
         let mut store = Store::open_read_only(&source).unwrap();
         let report = store.backup_to(&destination).unwrap();
         assert!(report.files >= 3);
+        assert_eq!(report.copied_files, 1);
+        assert_eq!(report.linked_files + report.copied_files, report.files);
+        assert_eq!(report.hard_link_fallbacks, 0);
+        assert!(report.hard_link_fallback_error_kinds.is_empty());
         store.close().unwrap();
         assert_eq!(directory_snapshot(&source), before);
 
@@ -1875,6 +2054,10 @@ mod tests {
         let report = store.backup_to(&destination).unwrap();
         assert!(report.files >= 3);
         assert!(report.bytes > 0);
+        assert_eq!(report.copied_files, 1);
+        assert_eq!(report.linked_files + report.copied_files, report.files);
+        assert_eq!(report.hard_link_fallbacks, 0);
+        assert!(report.hard_link_fallback_error_kinds.is_empty());
 
         let backup = Store::open(&destination).unwrap();
         assert_eq!(

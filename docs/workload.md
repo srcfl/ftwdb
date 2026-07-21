@@ -2,9 +2,10 @@
 
 The benchmark generator is part of the library and CLI, not an unpublished
 script. A configuration contains seed, site count, day count, cadence, and UTC
-start. Its SplitMix64 stream and formulas are host-independent. The canonical
-Postcard snapshot gets a CRC32 dataset identity; CSV exports let non-Rust
-adapters ingest the exact same records.
+start. Its SplitMix64 stream is fixed, but floating-point formula results may
+differ across host math libraries. The canonical Postcard snapshot gets a
+CRC32 dataset identity; CSV exports let non-Rust adapters ingest the exact same
+records.
 
 ## Included domain behavior
 
@@ -41,6 +42,26 @@ The FTWDB runner emits one JSON result line with dataset CRC, result CRC,
 ingest and maintenance duration, cold/warm query duration, stored bytes, and
 durability mode. It refuses a non-empty target directory to prevent accidental
 append-to-old-data results.
+
+## Size and memory contract
+
+The generator, writer, and reader use the same v1 checks. A configuration may
+have at most 256 sites, 366 days, a cadence from 1 to 86,400 seconds, and four
+million points. Their combined point count must also stay below that limit.
+Text fields may use 1,024 bytes, property maps 64 entries, rollup policies 16
+tiers, and plan objective maps 64 entries. The canonical Postcard file may use
+at most 256 MiB.
+
+These limits include the normal one-site annual run: 366 days at a 60-second
+cadence has an upper bound of 3,460,902 points. The 256 MiB file limit keeps an
+input error from causing an unbounded read on an edge host. The decoded model
+still needs memory for its records and points.
+
+The v1 byte layout has not changed. The writer sends Postcard bytes and CRC32
+through one bounded stream instead of making a second full copy. The reader
+uses an 8 KiB input buffer and 1 KiB field buffer. It checks every declared
+sequence and map length before reserving space, then checks the shared model
+rules, summary counts, trailing bytes, and CRC32.
 
 ## Correctness before speed
 

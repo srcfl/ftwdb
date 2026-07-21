@@ -1,13 +1,15 @@
+use crate::catalog::{validate_entity, validate_point_intervals, validate_run};
 use crate::{
     CalendarUnit, Entity, EntityId, Error, GaugeBucket, Plan, PlanStatus, Point, Properties,
-    PropertyValue, Result, RollupPolicy, RollupResolution, RollupTier, Run, RunId, RunKind,
-    RunStatus, SeriesDefinition, SeriesSemantics, Transaction,
+    PropertyValue, RelationId, Result, RollupPolicy, RollupResolution, RollupTier, Run, RunId,
+    RunKind, RunStatus, SeriesDefinition, SeriesSemantics, Transaction,
 };
 use crc32fast::Hasher;
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 const SECOND: i64 = 1_000_000;
@@ -15,6 +17,25 @@ const MINUTE: i64 = 60 * SECOND;
 const HOUR: i64 = 60 * MINUTE;
 const DAY: i64 = 24 * HOUR;
 const FIVE_MINUTES: i64 = 5 * MINUTE;
+
+/// Workload v1 limits keep reads and writes bounded on small edge systems.
+/// One site with 366 days at a 60-second cadence stays below these limits.
+pub const MAX_WORKLOAD_BUNDLE_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_WORKLOAD_SITES: u32 = 256;
+pub const MAX_WORKLOAD_DAYS: u32 = 366;
+pub const MAX_WORKLOAD_POINTS: usize = 4_000_000;
+
+const MAX_WORKLOAD_ENTITIES: usize = MAX_WORKLOAD_SITES as usize;
+const MAX_WORKLOAD_SERIES: usize = MAX_WORKLOAD_ENTITIES * 9;
+const MAX_WORKLOAD_RUNS: usize = MAX_WORKLOAD_ENTITIES * MAX_WORKLOAD_DAYS as usize * 2;
+const MAX_WORKLOAD_PLANS: usize = MAX_WORKLOAD_ENTITIES * MAX_WORKLOAD_DAYS as usize;
+const MAX_WORKLOAD_TEXT_BYTES: usize = 1_024;
+const MAX_WORKLOAD_PROPERTIES: usize = 64;
+const MAX_WORKLOAD_ROLLUP_TIERS: usize = 16;
+const MAX_WORKLOAD_OBJECTIVE_TERMS: usize = 64;
+const WORKLOAD_READER_BUFFER_BYTES: usize = 8 * 1_024;
+const WORKLOAD_SCRATCH_BYTES: usize = MAX_WORKLOAD_TEXT_BYTES;
+const MAX_WORKLOAD_SUMMARY_BYTES: u64 = 64 * 1_024;
 
 const GRID_POWER: u64 = 1;
 const SOLAR_POWER: u64 = 2;
@@ -33,6 +54,601 @@ pub struct WorkloadConfig {
     pub days: u32,
     pub cadence_seconds: u32,
     pub start_micros: i64,
+}
+
+fn expected_point_limit(config: WorkloadConfig) -> Result<usize> {
+    let sites = u64::from(config.sites);
+    let days = u64::from(config.days);
+    let cadence = u64::from(config.cadence_seconds);
+    let telemetry_steps = days
+        .checked_mul(86_400)
+        .and_then(|seconds| seconds.checked_div(cadence))
+        .and_then(|steps| steps.checked_add(1))
+        .ok_or(Error::InvalidConfig("workload point limit overflows"))?;
+    let per_site = telemetry_steps
+        .checked_mul(6)
+        .and_then(|telemetry| {
+            days.checked_mul(816)
+                .and_then(|extra| telemetry.checked_add(extra))
+        })
+        .ok_or(Error::InvalidConfig("workload point limit overflows"))?;
+    let points = sites
+        .checked_mul(per_site)
+        .ok_or(Error::InvalidConfig("workload point limit overflows"))?;
+    usize::try_from(points).map_err(|_| Error::InvalidConfig("workload point limit overflows"))
+}
+
+fn check_count(name: &str, actual: usize, expected: usize, maximum: usize) -> Result<()> {
+    if actual > maximum {
+        return Err(Error::InvalidModel(format!(
+            "workload {name} count exceeds its limit"
+        )));
+    }
+    if actual != expected {
+        return Err(Error::InvalidModel(format!(
+            "workload has {actual} {name}; configuration requires {expected}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_text(value: &str) -> Result<()> {
+    if value.len() > MAX_WORKLOAD_TEXT_BYTES {
+        return Err(Error::InvalidModel(
+            "workload text exceeds the 1024-byte limit".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_properties(properties: &Properties) -> Result<()> {
+    if properties.len() > MAX_WORKLOAD_PROPERTIES {
+        return Err(Error::InvalidModel(
+            "workload properties exceed the 64-entry limit".to_owned(),
+        ));
+    }
+    for (name, value) in properties {
+        validate_text(name)?;
+        if let PropertyValue::Text(text) = value {
+            validate_text(text)?;
+        }
+    }
+    Ok(())
+}
+
+struct ChecksummedWriter<W> {
+    inner: W,
+    hasher: Hasher,
+    written: u64,
+    limit: u64,
+}
+
+impl<W> ChecksummedWriter<W> {
+    fn new(inner: W, limit: u64) -> Self {
+        Self {
+            inner,
+            hasher: Hasher::new(),
+            written: 0,
+            limit,
+        }
+    }
+
+    fn checksum(&self) -> u32 {
+        self.hasher.clone().finalize()
+    }
+}
+
+impl<W: Write> Write for ChecksummedWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.limit.saturating_sub(self.written);
+        if buffer.len() as u64 > remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                "workload bundle exceeds the 256 MiB writer limit",
+            ));
+        }
+        let written = self.inner.write(buffer)?;
+        self.hasher.update(&buffer[..written]);
+        self.written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+struct ChecksummedReader<R> {
+    inner: R,
+    hasher: Hasher,
+}
+
+impl<R> ChecksummedReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: Hasher::new(),
+        }
+    }
+
+    fn checksum(&self) -> u32 {
+        self.hasher.clone().finalize()
+    }
+}
+
+impl<R: Read> Read for ChecksummedReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.hasher.update(&buffer[..read]);
+        Ok(read)
+    }
+}
+
+fn read_workload_from_reader<R: Read>(reader: R, expected_crc32: u32) -> Result<EnergyWorkload> {
+    let reader = BufReader::with_capacity(WORKLOAD_READER_BUFFER_BYTES, reader);
+    let reader = ChecksummedReader::new(reader);
+    let mut scratch = [0_u8; WORKLOAD_SCRATCH_BYTES];
+    let (workload, (mut reader, _)): (EnergyWorkload, _) =
+        postcard::from_io((reader, &mut scratch))
+            .map_err(|error| Error::Serialization(format!("workload decode failed: {error}")))?;
+    let actual_crc32 = reader.checksum();
+    let mut trailing = [0_u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        return Err(Error::Serialization(
+            "workload bundle has trailing data".to_owned(),
+        ));
+    }
+    if actual_crc32 != expected_crc32 {
+        return Err(Error::Serialization(format!(
+            "workload checksum mismatch: expected {expected_crc32:08x}, got {actual_crc32:08x}"
+        )));
+    }
+    Ok(workload)
+}
+
+#[derive(Debug)]
+struct BundleSummary {
+    seed: u64,
+    entities: usize,
+    series: usize,
+    runs: usize,
+    plans: usize,
+    points: usize,
+    crc32: u32,
+}
+
+impl BundleSummary {
+    fn check(&self, workload: &EnergyWorkload) -> Result<()> {
+        let summary = workload.summary_with_crc(self.crc32);
+        if self.seed != workload.config.seed
+            || self.entities != summary.entities
+            || self.series != summary.series
+            || self.runs != summary.runs
+            || self.plans != summary.plans
+            || self.points != summary.points
+        {
+            return Err(Error::Serialization(
+                "workload summary does not match the canonical bundle".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn read_bundle_summary(path: impl AsRef<Path>) -> Result<BundleSummary> {
+    let path = path.as_ref();
+    if path.metadata()?.len() > MAX_WORKLOAD_SUMMARY_BYTES {
+        return Err(Error::Serialization(
+            "workload summary exceeds 64 KiB".to_owned(),
+        ));
+    }
+    let contents = std::fs::read_to_string(path)?;
+    let mut values = BTreeMap::new();
+    for line in contents.lines() {
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| Error::Serialization("workload summary line lacks '='".to_owned()))?;
+        if values.insert(key, value).is_some() {
+            return Err(Error::Serialization(
+                "workload summary repeats a field".to_owned(),
+            ));
+        }
+    }
+    if values.get("format") != Some(&"ftwdb-energy-workload-v1") {
+        return Err(Error::Serialization(
+            "workload summary has an unsupported format".to_owned(),
+        ));
+    }
+    fn decimal<T: std::str::FromStr>(
+        values: &BTreeMap<&str, &str>,
+        name: &'static str,
+    ) -> Result<T> {
+        values
+            .get(name)
+            .ok_or_else(|| Error::Serialization(format!("workload summary lacks {name}")))?
+            .parse()
+            .map_err(|_| Error::Serialization(format!("workload summary has invalid {name}")))
+    }
+    let crc = values
+        .get("crc32")
+        .ok_or_else(|| Error::Serialization("workload summary lacks crc32".to_owned()))?;
+    let crc32 = u32::from_str_radix(crc, 16)
+        .map_err(|_| Error::Serialization("workload summary has invalid crc32".to_owned()))?;
+    Ok(BundleSummary {
+        seed: decimal(&values, "seed")?,
+        entities: decimal(&values, "entities")?,
+        series: decimal(&values, "series")?,
+        runs: decimal(&values, "runs")?,
+        plans: decimal(&values, "plans")?,
+        points: decimal(&values, "points")?,
+        crc32,
+    })
+}
+
+struct BoundedVec<T, const N: usize>(Vec<T>);
+
+impl<'de, T: Deserialize<'de>, const N: usize> Deserialize<'de> for BoundedVec<T, N> {
+    fn deserialize<D: de::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct BoundedVecVisitor<T, const N: usize>(std::marker::PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>, const N: usize> Visitor<'de> for BoundedVecVisitor<T, N> {
+            type Value = BoundedVec<T, N>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "a sequence with at most {N} entries")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let length = sequence.size_hint().unwrap_or(0);
+                if length > N {
+                    return Err(de::Error::custom(
+                        "workload sequence length exceeds its limit",
+                    ));
+                }
+                let mut values = Vec::with_capacity(length);
+                while let Some(value) = sequence.next_element()? {
+                    if values.len() == N {
+                        return Err(de::Error::custom(
+                            "workload sequence length exceeds its limit",
+                        ));
+                    }
+                    values.push(value);
+                }
+                Ok(BoundedVec(values))
+            }
+        }
+
+        deserializer.deserialize_seq(BoundedVecVisitor(std::marker::PhantomData))
+    }
+}
+
+struct BoundedMap<K, V, const N: usize>(BTreeMap<K, V>);
+
+impl<'de, K, V, const N: usize> Deserialize<'de> for BoundedMap<K, V, N>
+where
+    K: Deserialize<'de> + Ord,
+    V: Deserialize<'de>,
+{
+    fn deserialize<D: de::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct BoundedMapVisitor<K, V, const N: usize>(std::marker::PhantomData<(K, V)>);
+
+        impl<'de, K, V, const N: usize> Visitor<'de> for BoundedMapVisitor<K, V, N>
+        where
+            K: Deserialize<'de> + Ord,
+            V: Deserialize<'de>,
+        {
+            type Value = BoundedMap<K, V, N>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "a map with at most {N} entries")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                if map.size_hint().is_some_and(|length| length > N) {
+                    return Err(de::Error::custom("workload map length exceeds its limit"));
+                }
+                let mut values = BTreeMap::new();
+                while let Some((key, value)) = map.next_entry()? {
+                    if values.len() == N && !values.contains_key(&key) {
+                        return Err(de::Error::custom("workload map length exceeds its limit"));
+                    }
+                    values.insert(key, value);
+                }
+                Ok(BoundedMap(values))
+            }
+        }
+
+        deserializer.deserialize_map(BoundedMapVisitor(std::marker::PhantomData))
+    }
+}
+
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+struct BoundedString<const N: usize>(String);
+
+impl<'de, const N: usize> Deserialize<'de> for BoundedString<N> {
+    fn deserialize<D: de::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct BoundedStringVisitor<const N: usize>;
+
+        impl<'de, const N: usize> Visitor<'de> for BoundedStringVisitor<N> {
+            type Value = BoundedString<N>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "a string with at most {N} bytes")
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> {
+                if value.len() > N {
+                    return Err(E::custom("workload string length exceeds its limit"));
+                }
+                Ok(BoundedString(value.to_owned()))
+            }
+
+            fn visit_string<E: de::Error>(
+                self,
+                value: String,
+            ) -> std::result::Result<Self::Value, E> {
+                if value.len() > N {
+                    return Err(E::custom("workload string length exceeds its limit"));
+                }
+                Ok(BoundedString(value))
+            }
+        }
+
+        deserializer.deserialize_string(BoundedStringVisitor)
+    }
+}
+
+type WorkloadString = BoundedString<MAX_WORKLOAD_TEXT_BYTES>;
+type WorkloadProperties = BoundedMap<WorkloadString, WirePropertyValue, MAX_WORKLOAD_PROPERTIES>;
+
+#[derive(Deserialize)]
+enum WirePropertyValue {
+    Null,
+    Bool(bool),
+    Integer(i64),
+    Float(f64),
+    Text(WorkloadString),
+}
+
+impl From<WirePropertyValue> for PropertyValue {
+    fn from(value: WirePropertyValue) -> Self {
+        match value {
+            WirePropertyValue::Null => Self::Null,
+            WirePropertyValue::Bool(value) => Self::Bool(value),
+            WirePropertyValue::Integer(value) => Self::Integer(value),
+            WirePropertyValue::Float(value) => Self::Float(value),
+            WirePropertyValue::Text(value) => Self::Text(value.0),
+        }
+    }
+}
+
+fn into_properties(properties: WorkloadProperties) -> Properties {
+    properties
+        .0
+        .into_iter()
+        .map(|(key, value)| (key.0, value.into()))
+        .collect()
+}
+
+#[derive(Deserialize)]
+struct WireEntity {
+    id: EntityId,
+    kind: WorkloadString,
+    name: WorkloadString,
+    parent: Option<EntityId>,
+    valid_from: i64,
+    valid_to: Option<i64>,
+    properties: WorkloadProperties,
+}
+
+impl From<WireEntity> for Entity {
+    fn from(value: WireEntity) -> Self {
+        Self {
+            id: value.id,
+            kind: value.kind.0,
+            name: value.name.0,
+            parent: value.parent,
+            valid_from: value.valid_from,
+            valid_to: value.valid_to,
+            properties: into_properties(value.properties),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+enum WireRollupResolution {
+    FixedMicros(i64),
+    Calendar {
+        unit: CalendarUnit,
+        iana_timezone: WorkloadString,
+    },
+}
+
+impl From<WireRollupResolution> for RollupResolution {
+    fn from(value: WireRollupResolution) -> Self {
+        match value {
+            WireRollupResolution::FixedMicros(value) => Self::FixedMicros(value),
+            WireRollupResolution::Calendar {
+                unit,
+                iana_timezone,
+            } => Self::Calendar {
+                unit,
+                iana_timezone: iana_timezone.0,
+            },
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct WireRollupTier {
+    resolution: WireRollupResolution,
+    retain_for_micros: Option<i64>,
+}
+
+impl From<WireRollupTier> for RollupTier {
+    fn from(value: WireRollupTier) -> Self {
+        Self {
+            resolution: value.resolution.into(),
+            retain_for_micros: value.retain_for_micros,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct WireRollupPolicy {
+    raw_retain_for_micros: Option<i64>,
+    tiers: BoundedVec<WireRollupTier, MAX_WORKLOAD_ROLLUP_TIERS>,
+}
+
+impl From<WireRollupPolicy> for RollupPolicy {
+    fn from(value: WireRollupPolicy) -> Self {
+        Self {
+            raw_retain_for_micros: value.raw_retain_for_micros,
+            tiers: value.tiers.0.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct WireSeriesDefinition {
+    id: u64,
+    owner_entity: Option<EntityId>,
+    owner_relation: Option<RelationId>,
+    name: WorkloadString,
+    physical_quantity: WorkloadString,
+    canonical_unit: WorkloadString,
+    semantics: SeriesSemantics,
+    maximum_gap_micros: Option<i64>,
+    rollup_policy: WireRollupPolicy,
+}
+
+impl From<WireSeriesDefinition> for SeriesDefinition {
+    fn from(value: WireSeriesDefinition) -> Self {
+        Self {
+            id: value.id,
+            owner_entity: value.owner_entity,
+            owner_relation: value.owner_relation,
+            name: value.name.0,
+            physical_quantity: value.physical_quantity.0,
+            canonical_unit: value.canonical_unit.0,
+            semantics: value.semantics,
+            maximum_gap_micros: value.maximum_gap_micros,
+            rollup_policy: value.rollup_policy.into(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct WireRun {
+    id: RunId,
+    kind: RunKind,
+    status: RunStatus,
+    created_at: i64,
+    knowledge_time: i64,
+    workflow: WorkloadString,
+    model: WorkloadString,
+    model_version: WorkloadString,
+    parent_run: Option<RunId>,
+    input_snapshot: Option<RunId>,
+    attributes: WorkloadProperties,
+}
+
+impl From<WireRun> for Run {
+    fn from(value: WireRun) -> Self {
+        Self {
+            id: value.id,
+            kind: value.kind,
+            status: value.status,
+            created_at: value.created_at,
+            knowledge_time: value.knowledge_time,
+            workflow: value.workflow.0,
+            model: value.model.0,
+            model_version: value.model_version.0,
+            parent_run: value.parent_run,
+            input_snapshot: value.input_snapshot,
+            attributes: into_properties(value.attributes),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct WirePlan {
+    id: u128,
+    run_id: RunId,
+    status: PlanStatus,
+    horizon_start: i64,
+    horizon_end: i64,
+    resolution_micros: i64,
+    scenario: WorkloadString,
+    objective_terms: BoundedMap<WorkloadString, f64, MAX_WORKLOAD_OBJECTIVE_TERMS>,
+    objective_value: Option<f64>,
+    supersedes: Option<u128>,
+    attributes: WorkloadProperties,
+}
+
+impl From<WirePlan> for Plan {
+    fn from(value: WirePlan) -> Self {
+        Self {
+            id: value.id,
+            run_id: value.run_id,
+            status: value.status,
+            horizon_start: value.horizon_start,
+            horizon_end: value.horizon_end,
+            resolution_micros: value.resolution_micros,
+            scenario: value.scenario.0,
+            objective_terms: value
+                .objective_terms
+                .0
+                .into_iter()
+                .map(|(name, value)| (name.0, value))
+                .collect(),
+            objective_value: value.objective_value,
+            supersedes: value.supersedes,
+            attributes: into_properties(value.attributes),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct WireWorkload {
+    config: WorkloadConfig,
+    entities: BoundedVec<WireEntity, MAX_WORKLOAD_ENTITIES>,
+    series: BoundedVec<WireSeriesDefinition, MAX_WORKLOAD_SERIES>,
+    runs: BoundedVec<WireRun, MAX_WORKLOAD_RUNS>,
+    plans: BoundedVec<WirePlan, MAX_WORKLOAD_PLANS>,
+    points: BoundedVec<Point, MAX_WORKLOAD_POINTS>,
+}
+
+impl<'de> Deserialize<'de> for EnergyWorkload {
+    fn deserialize<D: de::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let wire = WireWorkload::deserialize(deserializer)?;
+        let workload = Self {
+            config: wire.config,
+            entities: wire.entities.0.into_iter().map(Into::into).collect(),
+            series: wire.series.0.into_iter().map(Into::into).collect(),
+            runs: wire.runs.0.into_iter().map(Into::into).collect(),
+            plans: wire.plans.0.into_iter().map(Into::into).collect(),
+            points: wire.points.0,
+        };
+        workload
+            .validate_contract()
+            .map_err(|error| de::Error::custom(error.to_string()))?;
+        Ok(workload)
+    }
 }
 
 impl Default for WorkloadConfig {
@@ -61,12 +677,19 @@ impl WorkloadConfig {
                 "workload cadence must not exceed one day",
             ));
         }
-        let samples = u64::from(self.sites)
-            .saturating_mul(u64::from(self.days))
-            .saturating_mul(86_400 / u64::from(self.cadence_seconds));
-        if samples > 100_000_000 {
+        if self.sites > MAX_WORKLOAD_SITES {
+            return Err(Error::InvalidConfig("workload exceeds the 256-site limit"));
+        }
+        if self.days > MAX_WORKLOAD_DAYS {
+            return Err(Error::InvalidConfig("workload exceeds the 366-day limit"));
+        }
+        let _ = self
+            .start_micros
+            .checked_add(i64::from(self.days) * DAY)
+            .ok_or(Error::InvalidConfig("workload timestamp range overflows"))?;
+        if expected_point_limit(self)? > MAX_WORKLOAD_POINTS {
             return Err(Error::InvalidConfig(
-                "workload exceeds the 100 million base-sample safety limit",
+                "workload exceeds the four-million-point limit",
             ));
         }
         Ok(())
@@ -86,7 +709,7 @@ pub struct WorkloadSummary {
 /// A deterministic, engine-neutral energy workload. It intentionally combines
 /// telemetry and non-TSDB records so comparisons cannot silently omit the
 /// forecast/optimization product model.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct EnergyWorkload {
     pub config: WorkloadConfig,
     pub entities: Vec<Entity>,
@@ -119,6 +742,7 @@ impl EnergyWorkload {
                 point.change_time,
             )
         });
+        workload.validate_contract()?;
         Ok(workload)
     }
 
@@ -173,6 +797,7 @@ impl EnergyWorkload {
     /// Writes a portable CSV bundle for server adapters plus a binary canonical
     /// snapshot whose CRC is the dataset identity.
     pub fn write_bundle(&self, directory: impl AsRef<Path>) -> Result<WorkloadSummary> {
+        self.validate_contract()?;
         let directory = directory.as_ref();
         std::fs::create_dir_all(directory)?;
         write_entities(directory.join("entities.csv"), &self.entities)?;
@@ -180,12 +805,14 @@ impl EnergyWorkload {
         write_runs(directory.join("runs.csv"), &self.runs)?;
         write_plans(directory.join("plans.csv"), &self.plans)?;
         write_points(directory.join("points.csv"), &self.points)?;
-        let canonical = postcard::to_stdvec(self)
+        let file = File::create(directory.join("workload.postcard"))?;
+        let writer = BufWriter::new(file);
+        let mut writer = ChecksummedWriter::new(writer, MAX_WORKLOAD_BUNDLE_BYTES);
+        postcard::to_io(self, &mut writer)
             .map_err(|error| Error::Serialization(format!("workload encode failed: {error}")))?;
-        let mut file = File::create(directory.join("workload.postcard"))?;
-        file.write_all(&canonical)?;
-        file.sync_all()?;
-        let summary = self.summary();
+        writer.flush()?;
+        writer.inner.get_ref().sync_all()?;
+        let summary = self.summary_with_crc(writer.checksum());
         let mut summary_file = BufWriter::new(File::create(directory.join("summary.txt"))?);
         writeln!(summary_file, "format=ftwdb-energy-workload-v1")?;
         writeln!(summary_file, "seed={}", self.config.seed)?;
@@ -200,26 +827,202 @@ impl EnergyWorkload {
     }
 
     pub fn read_bundle(directory: impl AsRef<Path>) -> Result<Self> {
-        let path = directory.as_ref().join("workload.postcard");
+        let directory = directory.as_ref();
+        let path = directory.join("workload.postcard");
         let metadata = path.metadata()?;
-        if metadata.len() > 8 * 1024 * 1024 * 1024 {
+        if metadata.len() > MAX_WORKLOAD_BUNDLE_BYTES {
             return Err(Error::InvalidConfig(
-                "workload bundle exceeds the 8 GiB reader limit",
+                "workload bundle exceeds the 256 MiB reader limit",
             ));
         }
-        let encoded = std::fs::read(path)?;
-        let workload: Self = postcard::from_bytes(&encoded)
-            .map_err(|error| Error::Serialization(format!("workload decode failed: {error}")))?;
-        workload.config.validate()?;
+        let expected = read_bundle_summary(directory.join("summary.txt"))?;
+        let workload = read_workload_from_reader(File::open(path)?, expected.crc32)?;
+        expected.check(&workload)?;
         Ok(workload)
     }
 
     #[must_use]
     pub fn checksum(&self) -> u32 {
-        let mut hasher = Hasher::new();
-        let encoded = postcard::to_stdvec(self).expect("workload model is serializable");
-        hasher.update(&encoded);
-        hasher.finalize()
+        let mut writer = ChecksummedWriter::new(std::io::sink(), MAX_WORKLOAD_BUNDLE_BYTES);
+        postcard::to_io(self, &mut writer).expect("valid workload model is serializable");
+        writer.checksum()
+    }
+
+    fn summary_with_crc(&self, crc32: u32) -> WorkloadSummary {
+        WorkloadSummary {
+            entities: self.entities.len(),
+            series: self.series.len(),
+            runs: self.runs.len(),
+            plans: self.plans.len(),
+            points: self.points.len(),
+            crc32,
+        }
+    }
+
+    fn validate_contract(&self) -> Result<()> {
+        self.config.validate()?;
+        let sites = self.config.sites as usize;
+        let days = self.config.days as usize;
+        check_count(
+            "entities",
+            self.entities.len(),
+            sites,
+            MAX_WORKLOAD_ENTITIES,
+        )?;
+        check_count("series", self.series.len(), sites * 9, MAX_WORKLOAD_SERIES)?;
+        check_count("runs", self.runs.len(), sites * days * 2, MAX_WORKLOAD_RUNS)?;
+        check_count("plans", self.plans.len(), sites * days, MAX_WORKLOAD_PLANS)?;
+        if self.points.len() > expected_point_limit(self.config)? {
+            return Err(Error::InvalidModel(
+                "workload point count exceeds its configuration limit".to_owned(),
+            ));
+        }
+
+        let mut entity_ids = BTreeSet::new();
+        for entity in &self.entities {
+            validate_entity(entity)?;
+            if !entity_ids.insert(entity.id) {
+                return Err(Error::InvalidModel(format!(
+                    "workload repeats entity {}",
+                    entity.id.0
+                )));
+            }
+            validate_text(&entity.kind)?;
+            validate_text(&entity.name)?;
+            validate_properties(&entity.properties)?;
+        }
+        for entity in &self.entities {
+            if entity
+                .parent
+                .is_some_and(|parent| !entity_ids.contains(&parent))
+            {
+                return Err(Error::InvalidModel(format!(
+                    "workload entity {} refers to a missing parent",
+                    entity.id.0
+                )));
+            }
+        }
+
+        let mut series_ids = BTreeSet::new();
+        for series in &self.series {
+            series.validate().map_err(|reason| {
+                Error::InvalidModel(format!("invalid workload series: {reason}"))
+            })?;
+            if !series_ids.insert(series.id) {
+                return Err(Error::InvalidModel(format!(
+                    "workload repeats series {}",
+                    series.id
+                )));
+            }
+            if series
+                .owner_entity
+                .is_none_or(|owner| !entity_ids.contains(&owner))
+                || series.owner_relation.is_some()
+            {
+                return Err(Error::InvalidModel(format!(
+                    "workload series {} has a missing owner",
+                    series.id
+                )));
+            }
+            validate_text(&series.name)?;
+            validate_text(&series.physical_quantity)?;
+            validate_text(&series.canonical_unit)?;
+            if series.rollup_policy.tiers.len() > MAX_WORKLOAD_ROLLUP_TIERS {
+                return Err(Error::InvalidModel(
+                    "workload series has too many rollup tiers".to_owned(),
+                ));
+            }
+            for tier in &series.rollup_policy.tiers {
+                if let RollupResolution::Calendar { iana_timezone, .. } = &tier.resolution {
+                    validate_text(iana_timezone)?;
+                }
+            }
+        }
+        let mut run_kinds = BTreeMap::new();
+        for run in &self.runs {
+            validate_run(run)?;
+            if run_kinds.insert(run.id, run.kind).is_some() {
+                return Err(Error::InvalidModel(format!(
+                    "workload repeats run {}",
+                    run.id.0
+                )));
+            }
+            validate_text(&run.workflow)?;
+            validate_text(&run.model)?;
+            validate_text(&run.model_version)?;
+            validate_properties(&run.attributes)?;
+        }
+        for run in &self.runs {
+            if run
+                .parent_run
+                .is_some_and(|parent| !run_kinds.contains_key(&parent))
+                || run
+                    .input_snapshot
+                    .is_some_and(|input| !run_kinds.contains_key(&input))
+            {
+                return Err(Error::InvalidModel(format!(
+                    "workload run {} has missing provenance",
+                    run.id.0
+                )));
+            }
+        }
+
+        let mut plan_ids = BTreeSet::new();
+        for plan in &self.plans {
+            plan.validate().map_err(|reason| {
+                Error::InvalidModel(format!("invalid workload plan: {reason}"))
+            })?;
+            if !plan_ids.insert(plan.id) {
+                return Err(Error::InvalidModel(format!(
+                    "workload repeats plan {}",
+                    plan.id
+                )));
+            }
+            if run_kinds.get(&plan.run_id) != Some(&RunKind::Optimization) {
+                return Err(Error::InvalidModel(format!(
+                    "workload plan {} must refer to an optimization run",
+                    plan.id
+                )));
+            }
+            validate_text(&plan.scenario)?;
+            if plan.objective_terms.len() > MAX_WORKLOAD_OBJECTIVE_TERMS {
+                return Err(Error::InvalidModel(
+                    "workload plan has too many objective terms".to_owned(),
+                ));
+            }
+            for name in plan.objective_terms.keys() {
+                validate_text(name)?;
+            }
+            validate_properties(&plan.attributes)?;
+        }
+        for plan in &self.plans {
+            if plan
+                .supersedes
+                .is_some_and(|previous| !plan_ids.contains(&previous))
+            {
+                return Err(Error::InvalidModel(format!(
+                    "workload plan {} supersedes a missing plan",
+                    plan.id
+                )));
+            }
+        }
+
+        validate_point_intervals(&self.points)?;
+        for point in &self.points {
+            if !series_ids.contains(&point.series_id) {
+                return Err(Error::InvalidModel(format!(
+                    "workload point refers to undefined series {}",
+                    point.series_id
+                )));
+            }
+            if point.run_id != 0 && !run_kinds.contains_key(&RunId(point.run_id)) {
+                return Err(Error::InvalidModel(format!(
+                    "workload point refers to missing run {}",
+                    point.run_id
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn add_site(&mut self, site: u32, random: &mut SplitMix64) -> Result<()> {
@@ -728,9 +1531,33 @@ fn csv(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{EnergyWorkload, WorkloadConfig};
-    use crate::{RunKind, SeriesSemantics, Store};
+    use super::{
+        EnergyWorkload, MAX_WORKLOAD_BUNDLE_BYTES, MAX_WORKLOAD_DAYS, MAX_WORKLOAD_ENTITIES,
+        WorkloadConfig, read_workload_from_reader,
+    };
+    use crate::{EntityId, Error, RunKind, SeriesSemantics, Store};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use tempfile::tempdir;
+
+    struct ChunkedReader<R> {
+        inner: R,
+        maximum: usize,
+    }
+
+    impl<R: Read> Read for ChunkedReader<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let length = buffer.len().min(self.maximum);
+            self.inner.read(&mut buffer[..length])
+        }
+    }
+
+    fn append_varint(output: &mut Vec<u8>, mut value: usize) {
+        while value >= 0x80 {
+            output.push((value as u8 & 0x7f) | 0x80);
+            value >>= 7;
+        }
+        output.push(value as u8);
+    }
 
     #[test]
     fn same_seed_produces_identical_mixed_workload() {
@@ -809,5 +1636,193 @@ mod tests {
         ] {
             assert!(directory.path().join(file).metadata().unwrap().len() > 0);
         }
+    }
+
+    #[test]
+    fn v1_bundle_streams_through_one_byte_reader_chunks() {
+        let workload = EnergyWorkload::generate(WorkloadConfig {
+            seed: 95_961_480_299_586,
+            days: 1,
+            cadence_seconds: 3_600,
+            ..WorkloadConfig::default()
+        })
+        .unwrap();
+        // The old writer used this whole-model allocation. Test-only bytes
+        // prove that the streaming writer keeps the v1 layout on each host.
+        let legacy = postcard::to_stdvec(&workload).unwrap();
+        let legacy_crc = crc32fast::hash(&legacy);
+        assert_eq!(workload.checksum(), legacy_crc);
+        let directory = tempdir().unwrap();
+        workload.write_bundle(directory.path()).unwrap();
+        let path = directory.path().join("workload.postcard");
+        assert_eq!(std::fs::read(&path).unwrap(), legacy);
+        let file = std::fs::File::open(path).unwrap();
+        let decoded = read_workload_from_reader(
+            ChunkedReader {
+                inner: file,
+                maximum: 1,
+            },
+            legacy_crc,
+        )
+        .unwrap();
+
+        assert_eq!(decoded.config, workload.config);
+        assert_eq!(decoded.summary(), workload.summary());
+    }
+
+    #[test]
+    fn sparse_bundle_over_file_limit_is_rejected_before_decode() {
+        let directory = tempdir().unwrap();
+        let file = std::fs::File::create(directory.path().join("workload.postcard")).unwrap();
+        file.set_len(MAX_WORKLOAD_BUNDLE_BYTES + 1).unwrap();
+        drop(file);
+
+        assert!(matches!(
+            EnergyWorkload::read_bundle(directory.path()),
+            Err(Error::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn malicious_collection_length_and_varint_are_rejected() {
+        let mut oversized = Vec::new();
+        postcard::to_io(&WorkloadConfig::default(), &mut oversized).unwrap();
+        append_varint(&mut oversized, MAX_WORKLOAD_ENTITIES + 1);
+        let oversized_crc = crc32fast::hash(&oversized);
+        assert!(matches!(
+            read_workload_from_reader(std::io::Cursor::new(oversized), oversized_crc),
+            Err(Error::Serialization(_))
+        ));
+
+        let mut bad_varint = Vec::new();
+        postcard::to_io(&WorkloadConfig::default(), &mut bad_varint).unwrap();
+        bad_varint.extend_from_slice(&[0x80; 12]);
+        let bad_varint_crc = crc32fast::hash(&bad_varint);
+        assert!(matches!(
+            read_workload_from_reader(std::io::Cursor::new(bad_varint), bad_varint_crc),
+            Err(Error::Serialization(_))
+        ));
+
+        let mut oversized_points = Vec::new();
+        postcard::to_io(&WorkloadConfig::default(), &mut oversized_points).unwrap();
+        oversized_points.extend_from_slice(&[0, 0, 0, 0]);
+        append_varint(&mut oversized_points, super::MAX_WORKLOAD_POINTS + 1);
+        let oversized_points_crc = crc32fast::hash(&oversized_points);
+        assert!(matches!(
+            read_workload_from_reader(std::io::Cursor::new(oversized_points), oversized_points_crc),
+            Err(Error::Serialization(_))
+        ));
+    }
+
+    #[test]
+    fn invalid_model_ids_and_references_are_rejected_on_write_and_read() {
+        let workload = EnergyWorkload::generate(WorkloadConfig {
+            days: 1,
+            cadence_seconds: 3_600,
+            ..WorkloadConfig::default()
+        })
+        .unwrap();
+
+        let mut invalid_entity = workload.clone();
+        invalid_entity.entities[0].id = EntityId(0);
+        assert!(matches!(
+            invalid_entity.write_bundle(tempdir().unwrap().path()),
+            Err(Error::InvalidModel(_))
+        ));
+
+        let mut invalid_point = workload;
+        invalid_point.points[0].series_id = u64::MAX;
+        let encoded = postcard::to_stdvec(&invalid_point).unwrap();
+        let crc32 = crc32fast::hash(&encoded);
+        assert!(matches!(
+            read_workload_from_reader(std::io::Cursor::new(encoded), crc32),
+            Err(Error::Serialization(_))
+        ));
+    }
+
+    #[test]
+    fn generator_rejects_each_config_limit_and_large_combinations() {
+        for config in [
+            WorkloadConfig {
+                sites: super::MAX_WORKLOAD_SITES + 1,
+                ..WorkloadConfig::default()
+            },
+            WorkloadConfig {
+                days: MAX_WORKLOAD_DAYS + 1,
+                ..WorkloadConfig::default()
+            },
+            WorkloadConfig {
+                cadence_seconds: 86_401,
+                ..WorkloadConfig::default()
+            },
+            WorkloadConfig {
+                sites: 2,
+                days: MAX_WORKLOAD_DAYS,
+                cadence_seconds: 60,
+                ..WorkloadConfig::default()
+            },
+        ] {
+            assert!(matches!(
+                EnergyWorkload::generate(config),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn trailing_and_checksum_corrupt_bundle_data_are_rejected() {
+        let workload = EnergyWorkload::generate(WorkloadConfig {
+            days: 1,
+            cadence_seconds: 3_600,
+            ..WorkloadConfig::default()
+        })
+        .unwrap();
+
+        let trailing = tempdir().unwrap();
+        workload.write_bundle(trailing.path()).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(trailing.path().join("workload.postcard"))
+            .unwrap();
+        file.write_all(&[0]).unwrap();
+        file.sync_all().unwrap();
+        assert!(matches!(
+            EnergyWorkload::read_bundle(trailing.path()),
+            Err(Error::Serialization(_))
+        ));
+
+        let corrupt = tempdir().unwrap();
+        workload.write_bundle(corrupt.path()).unwrap();
+        let path = corrupt.path().join("workload.postcard");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::End(-1)).unwrap();
+        let mut last = [0_u8; 1];
+        file.read_exact(&mut last).unwrap();
+        file.seek(SeekFrom::End(-1)).unwrap();
+        file.write_all(&[last[0] ^ 0xff]).unwrap();
+        file.sync_all().unwrap();
+        assert!(matches!(
+            EnergyWorkload::read_bundle(corrupt.path()),
+            Err(Error::Serialization(_))
+        ));
+    }
+
+    #[test]
+    fn maximum_day_contract_generates_writes_and_reads() {
+        let workload = EnergyWorkload::generate(WorkloadConfig {
+            days: MAX_WORKLOAD_DAYS,
+            cadence_seconds: 86_400,
+            ..WorkloadConfig::default()
+        })
+        .unwrap();
+        let directory = tempdir().unwrap();
+        let written = workload.write_bundle(directory.path()).unwrap();
+        let decoded = EnergyWorkload::read_bundle(directory.path()).unwrap();
+
+        assert_eq!(decoded.summary(), written);
     }
 }

@@ -1,7 +1,7 @@
 use flate2::read::GzDecoder;
 use ftwdb::{
-    Config, Database, Durability, EnergyWorkload, Error, Result, RollupResolution, Store,
-    Transaction, WorkloadConfig, gauge_bucket_checksum, load_real_fixture, load_tsbs_iot,
+    BackupReport, Config, Database, Durability, EnergyWorkload, Error, Result, RollupResolution,
+    Store, Transaction, WorkloadConfig, gauge_bucket_checksum, load_real_fixture, load_tsbs_iot,
 };
 use std::env;
 use std::fs::File;
@@ -255,11 +255,47 @@ fn backup(arguments: &[String]) -> Result<()> {
     // Read-only: backing up must never alter (or create) the source store.
     let mut store = Store::open_read_only(&arguments[0])?;
     let report = store.backup_to(&arguments[1])?;
-    println!(
-        "{{\"format\":\"ftwdb-backup-v1\",\"files\":{},\"bytes\":{},\"manifest_generation\":{}}}",
-        report.files, report.bytes, report.manifest_generation
-    );
+    println!("{}", backup_report_json(&report));
     Ok(())
+}
+
+fn backup_report_json(report: &BackupReport) -> String {
+    let fallback_error_kinds = report
+        .hard_link_fallback_error_kinds
+        .iter()
+        .map(|kind| format!("\"{}\"", io_error_kind_name(*kind)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"format\":\"ftwdb-backup-v1\",\"files\":{},\"bytes\":{},\"manifest_generation\":{},\"linked_files\":{},\"copied_files\":{},\"hard_link_fallbacks\":{},\"hard_link_fallback_error_kinds\":[{}]}}",
+        report.files,
+        report.bytes,
+        report.manifest_generation,
+        report.linked_files,
+        report.copied_files,
+        report.hard_link_fallbacks,
+        fallback_error_kinds
+    )
+}
+
+fn io_error_kind_name(kind: std::io::ErrorKind) -> &'static str {
+    use std::io::ErrorKind;
+
+    match kind {
+        ErrorKind::NotFound => "not-found",
+        ErrorKind::PermissionDenied => "permission-denied",
+        ErrorKind::AlreadyExists => "already-exists",
+        ErrorKind::CrossesDevices => "crosses-devices",
+        ErrorKind::ReadOnlyFilesystem => "read-only-filesystem",
+        ErrorKind::StorageFull => "storage-full",
+        ErrorKind::QuotaExceeded => "quota-exceeded",
+        ErrorKind::Unsupported => "unsupported",
+        ErrorKind::InvalidInput => "invalid-input",
+        ErrorKind::InvalidData => "invalid-data",
+        ErrorKind::FileTooLarge => "file-too-large",
+        ErrorKind::ResourceBusy => "resource-busy",
+        _ => "other",
+    }
 }
 
 fn inspect(arguments: &[String]) -> Result<()> {
@@ -450,4 +486,28 @@ fn usage(program: &str) {
     eprintln!(
         "usage:\n  {program} inspect <database-file>\n  {program} check-store <store-directory>\n  {program} backup <store-directory> <absent-destination>\n  {program} generate <output-directory> [--seed N] [--sites N] [--days N] [--cadence-seconds N] [--start-micros N]\n  {program} bench-ftwdb <workload-directory> <empty-database-directory> [--durability always|manual] [--batch-points N]\n  {program} bench-real-fixture <points.csv.gz> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-points N]\n  {program} bench-tsbs-iot <influx-line-file|-> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-rows N]"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::backup_report_json;
+    use ftwdb::BackupReport;
+
+    #[test]
+    fn backup_json_uses_fixed_error_kind_names() {
+        let report = BackupReport {
+            files: 4,
+            bytes: 123,
+            manifest_generation: 7,
+            linked_files: 2,
+            copied_files: 2,
+            hard_link_fallbacks: 1,
+            hard_link_fallback_error_kinds: vec![std::io::ErrorKind::CrossesDevices],
+        };
+
+        assert_eq!(
+            backup_report_json(&report),
+            "{\"format\":\"ftwdb-backup-v1\",\"files\":4,\"bytes\":123,\"manifest_generation\":7,\"linked_files\":2,\"copied_files\":2,\"hard_link_fallbacks\":1,\"hard_link_fallback_error_kinds\":[\"crosses-devices\"]}"
+        );
+    }
 }
