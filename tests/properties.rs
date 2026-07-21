@@ -1,7 +1,7 @@
 use proptest::prelude::*;
 use std::fs::OpenOptions;
 use tempfile::tempdir;
-use wattdb::{Config, Database, Durability, Point};
+use wattdb::{Config, Database, Durability, Point, Segment};
 
 fn point(series_id: u64, index: usize, value: f64) -> Point {
     Point {
@@ -78,5 +78,29 @@ proptest! {
         prop_assert_eq!(recovered.query_latest(1, i64::MIN, i64::MAX), vec![first]);
         prop_assert!(recovered.query_latest(2, i64::MIN, i64::MAX).is_empty());
         prop_assert_eq!(recovered.stats().unwrap().file_bytes, first_length);
+    }
+
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+    #[test]
+    fn immutable_segments_round_trip_arbitrary_finite_values(
+        values in proptest::collection::vec(-1.0e12_f64..1.0e12_f64, 1..512),
+        block_points in 1_usize..64,
+    ) {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("property.seg");
+        let expected: Vec<_> = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| point(3, index, *value))
+            .collect();
+        Segment::create(&path, &expected, block_points).unwrap();
+        let mut segment = Segment::open(&path).unwrap();
+        prop_assert_eq!(
+            segment.query(3, i64::MIN, i64::MAX).unwrap(),
+            expected,
+        );
     }
 }

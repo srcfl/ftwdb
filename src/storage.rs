@@ -1,6 +1,7 @@
 use crate::FixedGaugeRollup;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
+use crate::segment::{Segment, SegmentStats};
 use crate::transaction::{Record, Transaction};
 use crc32fast::hash;
 use std::collections::{BTreeMap, HashMap};
@@ -511,6 +512,18 @@ impl Database {
             resolution_micros,
             max_gap_micros,
         )
+    }
+
+    /// Writes the current raw point snapshot as an immutable compressed
+    /// segment. Log reclamation is intentionally separate and requires a
+    /// durable manifest in M3.
+    pub fn create_segment(
+        &self,
+        path: impl AsRef<Path>,
+        block_points: usize,
+    ) -> Result<SegmentStats> {
+        let points: Vec<_> = self.index.values().flatten().copied().collect();
+        Segment::create(path, &points, block_points)
     }
 
     pub fn stats(&self) -> Result<Stats> {

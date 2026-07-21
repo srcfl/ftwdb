@@ -24,7 +24,7 @@ Exit met: an optimization run, plan metadata, scheduled points, and subsequent
 actuals round-trip; torn mixed frames expose neither partial catalog state nor
 partial points.
 
-## M2: immutable compressed raw segments
+## M2: immutable compressed raw segments — initial format complete
 
 - seal append logs;
 - sort by series and temporal dimensions;
@@ -33,7 +33,10 @@ partial points.
   LZ4/Zstd);
 - bounded memory and segment cache.
 
-Exit: faster/smaller than prototype with measured write amplification.
+Initial exit met: v1 segments are indexed, checksummed, no-replace published,
+property-tested, and roughly 10.3x smaller than the logical point layout on the
+bootstrap energy waveform. External merge sorting and the broader codec bake-off
+remain hardening work rather than format blockers.
 
 ## M3: automatic rollup pyramid
 

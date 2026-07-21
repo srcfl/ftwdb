@@ -10,6 +10,7 @@ mod catalog;
 mod error;
 mod model;
 mod rollup;
+mod segment;
 mod storage;
 mod transaction;
 
@@ -22,5 +23,6 @@ pub use model::{
     SeriesDefinition, SeriesSemantics,
 };
 pub use rollup::{FixedGaugeRollup, GaugeBucket};
+pub use segment::{Segment, SegmentStats};
 pub use storage::{Commit, Config, Database, Durability, PlanOutcome, Point, Stats};
 pub use transaction::Transaction;

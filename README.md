@@ -40,6 +40,7 @@ cargo run --release -- inspect ./data.wattdb
 - [Architecture and invariants](docs/architecture.md)
 - [Energy model, plans, and rollups](docs/energy-model.md)
 - [Storage format v1](docs/format.md)
+- [Immutable segment format](docs/segment-format.md)
 - [OSS database research](docs/research.md)
 - [Benchmark protocol](docs/benchmarking.md)
 - [Bootstrap benchmark result](docs/results/2026-07-21-macos-arm64.md)
