@@ -1,5 +1,6 @@
 use crate::manifest::{self, Manifest, RollupDescriptor};
 use crate::rollup::calendar_bucket_bounds;
+use crate::storage::{sync_directory, sync_parent_directory};
 use crate::transaction::Record;
 use crate::{
     CalendarGaugeRollup, Commit, Config, Database, Error, FixedGaugeRollup, GaugeBucket, Point,
@@ -89,12 +90,22 @@ impl Store {
 
     pub fn open_with(path: impl AsRef<Path>, config: Config) -> Result<Self> {
         let root = path.as_ref().to_path_buf();
+        let root_created = !root.exists();
         std::fs::create_dir_all(&root)?;
         let manifest_directory = root.join(MANIFEST_DIRECTORY);
         let rollup_directory = root.join(ROLLUP_DIRECTORY);
         std::fs::create_dir_all(&manifest_directory)?;
         std::fs::create_dir_all(&rollup_directory)?;
+        // Make the manifests/ and rollups/ entries durable in the root, then
+        // make a freshly created root's own entry durable in its parent —
+        // the same order segment publication uses: contents first, then the
+        // directory entry that names them. `Database::open_with` below syncs
+        // the root again after it creates the active log, so the log's entry
+        // is covered even though the file does not exist yet here.
         sync_directory(&root)?;
+        if root_created {
+            sync_parent_directory(&root)?;
+        }
 
         // The exclusive advisory lock that `Database::open_with` takes on the
         // active log also guards the whole store directory: every mutation —
@@ -1033,11 +1044,6 @@ fn rollup_file_name(
     format!("g{generation}-s{series_id}-{tag}-{ordinal}-{nonce}.rseg")
 }
 
-fn sync_directory(path: &Path) -> Result<()> {
-    std::fs::File::open(path)?.sync_all()?;
-    Ok(())
-}
-
 fn copy_and_sync(source: &Path, destination: &Path) -> Result<u64> {
     let bytes = std::fs::copy(source, destination)?;
     std::fs::File::open(destination)?.sync_all()?;
@@ -1140,6 +1146,22 @@ mod tests {
         (0..=20)
             .map(|second| Point::actual(1, second * SECOND, second as f64))
             .collect()
+    }
+
+    #[test]
+    fn open_creates_and_reopens_a_nested_root() {
+        let directory = tempdir().unwrap();
+        // A root whose own directory entry did not exist before the open
+        // exercises the created-root publication path (root sync plus the
+        // parent entry sync) alongside the active log creation sync.
+        let root = directory.path().join("nested").join("store");
+        {
+            let mut store = Store::open(&root).unwrap();
+            initialize(&mut store, Vec::new(), None);
+            store.close().unwrap();
+        }
+        let store = Store::open(&root).unwrap();
+        assert_eq!(store.database().stats().unwrap().catalog_records, 2);
     }
 
     #[test]

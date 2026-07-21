@@ -205,6 +205,13 @@ impl Database {
             }
         } else if file.metadata()?.len() == 0 {
             write_database_header(&mut file)?;
+            // The header is durable inside the file, but a freshly created
+            // file only survives power loss once its parent directory entry
+            // is synced as well — otherwise a database that acknowledged
+            // durable commits can vanish wholesale. A pre-existing empty
+            // file takes the same path, which at worst repeats a directory
+            // sync that was already durable.
+            sync_parent_directory(path)?;
         }
 
         let scan = scan_and_recover(
@@ -805,6 +812,30 @@ fn scan_and_recover(
     })
 }
 
+/// Makes a directory's entries durable, exactly like segment and manifest
+/// publication do for their parents. Opening the directory and syncing it is
+/// Unix semantics; Windows support is tracked separately (issue #15).
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+/// Syncs the directory whose entry makes `path` durable. Only this one level
+/// is synced, matching what segment and manifest publication guarantee.
+pub(crate) fn sync_parent_directory(path: &Path) -> Result<()> {
+    sync_directory(parent_directory(path))
+}
+
+/// The directory that holds `path`'s entry. A bare file name lives in the
+/// current directory, which `Path::parent` reports as an empty path that
+/// cannot be opened.
+fn parent_directory(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
 fn truncate_recovered_tail(file: &mut File, length: u64) -> Result<()> {
     file.set_len(length)?;
     file.sync_data()?;
@@ -1118,6 +1149,39 @@ mod tests {
         assert_eq!(latest.len(), 2);
         assert_eq!(latest[0].value, 3.0);
         assert_eq!(database.query_as_of(7, 0, 1_000, 15)[0].value, 1.0);
+    }
+
+    #[test]
+    fn parent_directory_resolves_nested_and_bare_paths() {
+        use super::parent_directory;
+        use std::path::Path;
+        assert_eq!(
+            parent_directory(Path::new("/store/active.wlog")),
+            Path::new("/store")
+        );
+        assert_eq!(
+            parent_directory(Path::new("relative/active.wlog")),
+            Path::new("relative")
+        );
+        // `Path::parent` reports an unopenable empty parent for a bare file
+        // name; the creation sync must target the current directory instead.
+        assert_eq!(parent_directory(Path::new("active.wlog")), Path::new("."));
+    }
+
+    #[test]
+    fn pre_created_empty_file_is_initialized_like_a_new_database() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("pre-created.ftwdb");
+        drop(std::fs::File::create(&path).unwrap());
+        // A zero-length file takes the same creation path as a brand-new
+        // database: header write, then the parent directory entry sync.
+        {
+            let mut database = Database::open(&path).unwrap();
+            database.append(&[point(1, 1, 1, 1.0)]).unwrap();
+            database.close().unwrap();
+        }
+        let database = Database::open(&path).unwrap();
+        assert_eq!(database.stats().unwrap().points, 1);
     }
 
     #[test]
