@@ -26,6 +26,7 @@ First public evaluation release.
 ### Verified
 
 - CI passes on Ubuntu Linux and macOS with Rust 1.97.1.
+- CI and release actions use verified full commit SHA pins.
 - Process-kill, full-disk, sync-failure, corruption, recovery, CLI, backup,
   restore, and salvage checks pass.
 - The crate packages and verifies from its release source.
