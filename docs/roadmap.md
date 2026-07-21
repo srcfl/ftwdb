@@ -81,7 +81,11 @@ Linux/ext4 smoke run add repeatable media-cache and power-loss checks, but the
 recorded cut happened after the load and host sync. A repeatable 64 MiB
 Linux/NBD/ext4 run reached `ENOSPC` after 770,000 durable points in 77 commits;
 `check-store` and `inspect` passed on that prefix. Local snapshot backup plus
-post-publication integrity verification is implemented. Tests on the target
-board and SD cards, power cuts during commits, soak runs, remote backup policy,
-restore drills, corruption salvage, and the remaining result-verified adapters
-stay open and are required for the M4 exit.
+post-publication integrity verification is implemented. Process-level CLI
+tests now cover usage errors, generated and sanitized input paths, integrity
+checks, inspection, backup JSON, and byte-for-byte read-only behavior. Together
+with the process-lock, sync-failure, `/dev/full`, and NBD tests, this closes the
+robustness gaps tracked in issue #17. Tests on the target board and SD cards,
+power cuts during commits, soak runs, remote backup policy, restore drills,
+corruption salvage, and the remaining result-verified adapters stay open and
+are required for the M4 exit.

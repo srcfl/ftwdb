@@ -1,7 +1,7 @@
 use flate2::read::GzDecoder;
 use ftwdb::{
-    BackupReport, Config, Database, Durability, EnergyWorkload, Error, Result, RollupResolution,
-    Store, Transaction, WorkloadConfig, gauge_bucket_checksum, load_real_fixture, load_tsbs_iot,
+    BackupReport, Config, Database, Durability, EnergyWorkload, Error, RollupResolution, Store,
+    Transaction, WorkloadConfig, gauge_bucket_checksum, load_real_fixture, load_tsbs_iot,
 };
 use std::env;
 use std::fs::File;
@@ -13,6 +13,26 @@ use std::time::Instant;
 const SECOND: i64 = 1_000_000;
 const DAY: i64 = 86_400 * SECOND;
 const FIVE_MINUTES: i64 = 300 * SECOND;
+const TSBS_MAX_FIELDS_PER_ROW: usize = 10;
+
+type CliResult<T> = std::result::Result<T, CliError>;
+
+enum CliError {
+    Usage(String),
+    Runtime(Error),
+}
+
+impl From<Error> for CliError {
+    fn from(error: Error) -> Self {
+        Self::Runtime(error)
+    }
+}
+
+impl From<std::io::Error> for CliError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Runtime(Error::Io(error))
+    }
+}
 
 fn main() -> ExitCode {
     let arguments: Vec<_> = env::args().collect();
@@ -31,26 +51,26 @@ fn main() -> ExitCode {
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
+        Err(CliError::Usage(reason)) => {
+            eprintln!("error: {reason}");
+            usage(arguments.first().map_or("ftwdb", String::as_str));
+            ExitCode::from(2)
+        }
+        Err(CliError::Runtime(error)) => {
             eprintln!("error: {error}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn bench_real_fixture(arguments: &[String]) -> Result<()> {
+fn bench_real_fixture(arguments: &[String]) -> CliResult<()> {
     if arguments.len() < 2 {
-        return Err(invalid(
+        return Err(usage_error(
             "bench-real-fixture requires a points.csv.gz file and empty database directory",
         ));
     }
     let input = &arguments[0];
     let database_directory = Path::new(&arguments[1]);
-    if database_directory.exists() && std::fs::read_dir(database_directory)?.next().is_some() {
-        return Err(invalid(
-            "benchmark database directory must be absent or empty",
-        ));
-    }
 
     let mut durability = Durability::Always;
     let mut durability_name = "always".to_owned();
@@ -60,7 +80,7 @@ fn bench_real_fixture(arguments: &[String]) -> Result<()> {
         let option = &arguments[index];
         let value = arguments
             .get(index + 1)
-            .ok_or_else(|| invalid(format!("missing value for {option}")))?;
+            .ok_or_else(|| usage_error(format!("missing value for {option}")))?;
         match option.as_str() {
             "--batch-points" => batch_points = parse(value, option)?,
             "--durability" if value == "always" => {
@@ -72,19 +92,28 @@ fn bench_real_fixture(arguments: &[String]) -> Result<()> {
                 durability_name = value.clone();
             }
             "--durability" if value.starts_with("every-bytes:") => {
-                let encoded = value.trim_start_matches("every-bytes:");
-                let bytes = parse(encoded, "--durability every-bytes")?;
+                let bytes = parse_every_bytes(value)?;
                 durability = Durability::EveryBytes(bytes);
                 durability_name = format!("every-bytes:{bytes}");
             }
             "--durability" => {
-                return Err(invalid(
+                return Err(usage_error(
                     "durability must be always, manual, or every-bytes:N",
                 ));
             }
-            _ => return Err(invalid(format!("unknown benchmark option {option}"))),
+            _ => return Err(usage_error(format!("unknown benchmark option {option}"))),
         }
         index += 2;
+    }
+    validate_batch_size(
+        batch_points,
+        Config::default().max_batch_points,
+        "batch-points",
+    )?;
+    if database_directory.exists() && std::fs::read_dir(database_directory)?.next().is_some() {
+        return Err(runtime_invalid(
+            "benchmark database directory must be absent or empty",
+        ));
     }
 
     let mut store = Store::open_with(
@@ -129,19 +158,14 @@ fn bench_real_fixture(arguments: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn bench_tsbs_iot(arguments: &[String]) -> Result<()> {
+fn bench_tsbs_iot(arguments: &[String]) -> CliResult<()> {
     if arguments.len() < 2 {
-        return Err(invalid(
+        return Err(usage_error(
             "bench-tsbs-iot requires an input file (or -) and empty database directory",
         ));
     }
     let input = &arguments[0];
     let database_directory = Path::new(&arguments[1]);
-    if database_directory.exists() && std::fs::read_dir(database_directory)?.next().is_some() {
-        return Err(invalid(
-            "benchmark database directory must be absent or empty",
-        ));
-    }
 
     let mut durability = Durability::Always;
     let mut durability_name = "always".to_owned();
@@ -151,7 +175,7 @@ fn bench_tsbs_iot(arguments: &[String]) -> Result<()> {
         let option = &arguments[index];
         let value = arguments
             .get(index + 1)
-            .ok_or_else(|| invalid(format!("missing value for {option}")))?;
+            .ok_or_else(|| usage_error(format!("missing value for {option}")))?;
         match option.as_str() {
             "--batch-rows" => batch_rows = parse(value, option)?,
             "--durability" if value == "always" => {
@@ -163,19 +187,28 @@ fn bench_tsbs_iot(arguments: &[String]) -> Result<()> {
                 durability_name = value.clone();
             }
             "--durability" if value.starts_with("every-bytes:") => {
-                let encoded = value.trim_start_matches("every-bytes:");
-                let bytes = parse(encoded, "--durability every-bytes")?;
+                let bytes = parse_every_bytes(value)?;
                 durability = Durability::EveryBytes(bytes);
                 durability_name = format!("every-bytes:{bytes}");
             }
             "--durability" => {
-                return Err(invalid(
+                return Err(usage_error(
                     "durability must be always, manual, or every-bytes:N",
                 ));
             }
-            _ => return Err(invalid(format!("unknown benchmark option {option}"))),
+            _ => return Err(usage_error(format!("unknown benchmark option {option}"))),
         }
         index += 2;
+    }
+    validate_batch_size(
+        batch_rows,
+        Config::default().max_batch_points / TSBS_MAX_FIELDS_PER_ROW,
+        "batch-rows",
+    )?;
+    if database_directory.exists() && std::fs::read_dir(database_directory)?.next().is_some() {
+        return Err(runtime_invalid(
+            "benchmark database directory must be absent or empty",
+        ));
     }
 
     let mut store = Store::open_with(
@@ -224,9 +257,9 @@ fn bench_tsbs_iot(arguments: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn check_store(arguments: &[String]) -> Result<()> {
+fn check_store(arguments: &[String]) -> CliResult<()> {
     if arguments.len() != 1 {
-        return Err(invalid("check-store requires one store directory"));
+        return Err(usage_error("check-store requires one store directory"));
     }
     // Read-only: a check may not publish, prune, sweep, or recover in place.
     let store = Store::open_read_only(&arguments[0])?;
@@ -246,9 +279,9 @@ fn check_store(arguments: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn backup(arguments: &[String]) -> Result<()> {
+fn backup(arguments: &[String]) -> CliResult<()> {
     if arguments.len() != 2 {
-        return Err(invalid(
+        return Err(usage_error(
             "backup requires source and absent destination directories",
         ));
     }
@@ -298,9 +331,9 @@ fn io_error_kind_name(kind: std::io::ErrorKind) -> &'static str {
     }
 }
 
-fn inspect(arguments: &[String]) -> Result<()> {
+fn inspect(arguments: &[String]) -> CliResult<()> {
     if arguments.len() != 1 {
-        return Err(invalid("inspect requires one database file"));
+        return Err(usage_error("inspect requires one database file"));
     }
     // Read-only: inspection must not create a missing file or truncate a torn
     // tail in the file being examined; recovery is simulated in memory.
@@ -316,9 +349,9 @@ fn inspect(arguments: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn generate(arguments: &[String]) -> Result<()> {
+fn generate(arguments: &[String]) -> CliResult<()> {
     let Some(output) = arguments.first() else {
-        return Err(invalid("generate requires an output directory"));
+        return Err(usage_error("generate requires an output directory"));
     };
     let mut config = WorkloadConfig::default();
     let mut index = 1;
@@ -326,17 +359,20 @@ fn generate(arguments: &[String]) -> Result<()> {
         let option = &arguments[index];
         let value = arguments
             .get(index + 1)
-            .ok_or_else(|| invalid(format!("missing value for {option}")))?;
+            .ok_or_else(|| usage_error(format!("missing value for {option}")))?;
         match option.as_str() {
             "--seed" => config.seed = parse(value, option)?,
             "--sites" => config.sites = parse(value, option)?,
             "--days" => config.days = parse(value, option)?,
             "--cadence-seconds" => config.cadence_seconds = parse(value, option)?,
             "--start-micros" => config.start_micros = parse(value, option)?,
-            _ => return Err(invalid(format!("unknown generate option {option}"))),
+            _ => return Err(usage_error(format!("unknown generate option {option}"))),
         }
         index += 2;
     }
+    config
+        .validate()
+        .map_err(|error| usage_error(error.to_string()))?;
     let workload = EnergyWorkload::generate(config)?;
     let summary = workload.write_bundle(output)?;
     println!(
@@ -352,19 +388,14 @@ fn generate(arguments: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn bench_ftwdb(arguments: &[String]) -> Result<()> {
+fn bench_ftwdb(arguments: &[String]) -> CliResult<()> {
     if arguments.len() < 2 {
-        return Err(invalid(
+        return Err(usage_error(
             "bench-ftwdb requires workload and empty database directories",
         ));
     }
     let workload_directory = Path::new(&arguments[0]);
     let database_directory = Path::new(&arguments[1]);
-    if database_directory.exists() && std::fs::read_dir(database_directory)?.next().is_some() {
-        return Err(invalid(
-            "benchmark database directory must be absent or empty",
-        ));
-    }
     let mut durability = Durability::Always;
     let mut durability_name = "always";
     let mut batch_points = 10_000_usize;
@@ -373,7 +404,7 @@ fn bench_ftwdb(arguments: &[String]) -> Result<()> {
         let option = &arguments[index];
         let value = arguments
             .get(index + 1)
-            .ok_or_else(|| invalid(format!("missing value for {option}")))?;
+            .ok_or_else(|| usage_error(format!("missing value for {option}")))?;
         match option.as_str() {
             "--durability" if value == "always" => {
                 durability = Durability::Always;
@@ -384,15 +415,22 @@ fn bench_ftwdb(arguments: &[String]) -> Result<()> {
                 durability_name = "manual";
             }
             "--durability" => {
-                return Err(invalid("durability must be always or manual"));
+                return Err(usage_error("durability must be always or manual"));
             }
             "--batch-points" => batch_points = parse(value, option)?,
-            _ => return Err(invalid(format!("unknown benchmark option {option}"))),
+            _ => return Err(usage_error(format!("unknown benchmark option {option}"))),
         }
         index += 2;
     }
-    if batch_points == 0 || batch_points > Config::default().max_batch_points {
-        return Err(invalid("batch-points is outside the configured limit"));
+    validate_batch_size(
+        batch_points,
+        Config::default().max_batch_points,
+        "batch-points",
+    )?;
+    if database_directory.exists() && std::fs::read_dir(database_directory)?.next().is_some() {
+        return Err(runtime_invalid(
+            "benchmark database directory must be absent or empty",
+        ));
     }
 
     let workload = EnergyWorkload::read_bundle(workload_directory)?;
@@ -418,7 +456,7 @@ fn bench_ftwdb(arguments: &[String]) -> Result<()> {
         .config
         .start_micros
         .checked_add(i64::from(workload.config.days) * DAY)
-        .ok_or_else(|| invalid("workload end timestamp overflow"))?;
+        .ok_or_else(|| runtime_invalid("workload end timestamp overflow"))?;
     let maintenance_started = Instant::now();
     let maintenance = store.maintain(end)?;
     let maintenance_seconds = maintenance_started.elapsed().as_secs_f64();
@@ -431,7 +469,7 @@ fn bench_ftwdb(arguments: &[String]) -> Result<()> {
     let warm_query = store.query_gauge(1, workload.config.start_micros, end, &resolution)?;
     let warm_query_seconds = warm_query_started.elapsed().as_secs_f64();
     if gauge_bucket_checksum(&warm_query.buckets) != result_crc {
-        return Err(invalid("cold and warm rollup query results differ"));
+        return Err(runtime_invalid("cold and warm rollup query results differ"));
     }
     let stored_bytes = directory_bytes(database_directory)?;
     let points_per_second = summary.points as f64 / ingest_seconds;
@@ -455,7 +493,7 @@ fn bench_ftwdb(arguments: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn directory_bytes(path: &Path) -> Result<u64> {
+fn directory_bytes(path: &Path) -> CliResult<u64> {
     let mut total = 0_u64;
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
@@ -469,17 +507,43 @@ fn directory_bytes(path: &Path) -> Result<u64> {
     Ok(total)
 }
 
-fn parse<T>(value: &str, option: &str) -> Result<T>
+fn parse<T>(value: &str, option: &str) -> CliResult<T>
 where
     T: std::str::FromStr,
 {
     value
         .parse()
-        .map_err(|_| invalid(format!("invalid value for {option}: {value}")))
+        .map_err(|_| usage_error(format!("invalid value for {option}: {value}")))
 }
 
-fn invalid(reason: impl Into<String>) -> Error {
-    Error::InvalidModel(reason.into())
+fn parse_every_bytes(value: &str) -> CliResult<u64> {
+    let bytes = parse(
+        value.trim_start_matches("every-bytes:"),
+        "--durability every-bytes",
+    )?;
+    if bytes == 0 {
+        return Err(usage_error(
+            "--durability every-bytes threshold must be positive",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn validate_batch_size(value: usize, maximum: usize, option: &str) -> CliResult<()> {
+    if value == 0 || value > maximum {
+        return Err(usage_error(format!(
+            "{option} must be between 1 and {maximum}"
+        )));
+    }
+    Ok(())
+}
+
+fn usage_error(reason: impl Into<String>) -> CliError {
+    CliError::Usage(reason.into())
+}
+
+fn runtime_invalid(reason: impl Into<String>) -> CliError {
+    CliError::Runtime(Error::InvalidModel(reason.into()))
 }
 
 fn usage(program: &str) {
