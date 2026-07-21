@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 const DATABASE_MAGIC: &[u8; 8] = b"FTWDB001";
@@ -232,7 +233,7 @@ impl Database {
     fn open_mode(path: &Path, config: Config, read_only: bool) -> Result<Self> {
         validate_config(config)?;
         let mut file = if read_only {
-            OpenOptions::new().read(true).open(path)?
+            open_regular_file_read_only(path)?
         } else {
             OpenOptions::new()
                 .create(true)
@@ -963,6 +964,39 @@ fn scan_and_recover(
         recovered_tail_bytes,
         recovered_tail,
     })
+}
+
+/// Opens one existing regular file without following a final symlink or
+/// blocking on a FIFO or device. The identity check closes the metadata/open
+/// race for the final path component.
+pub(crate) fn open_regular_file_read_only(path: &Path) -> Result<File> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let path_metadata = std::fs::symlink_metadata(path)?;
+    if !path_metadata.file_type().is_file() {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("read-only path is not a regular file: {}", path.display()),
+        )));
+    }
+    let descriptor = open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|error| Error::Io(error.into()))?;
+    let file = File::from(descriptor);
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.file_type().is_file()
+        || opened_metadata.dev() != path_metadata.dev()
+        || opened_metadata.ino() != path_metadata.ino()
+    {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("read-only path changed while opening: {}", path.display()),
+        )));
+    }
+    Ok(file)
 }
 
 /// Makes a directory's entries durable after creating, linking, renaming, or

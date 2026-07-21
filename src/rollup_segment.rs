@@ -1,4 +1,4 @@
-use crate::storage::sync_parent_directory;
+use crate::storage::{open_regular_file_read_only, sync_parent_directory};
 use crate::{Error, GaugeBucket, Result, Sample};
 use crc32fast::hash;
 use lz4_flex::block::{compress_prepend_size, decompress};
@@ -70,7 +70,7 @@ impl RollupSegment {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let mut file = OpenOptions::new().read(true).open(path)?;
+        let mut file = open_regular_file_read_only(path.as_ref())?;
         let file_len = file.metadata()?.len();
         if file_len < HEADER_BYTES as u64 {
             return corruption(0, "rollup segment is too small");

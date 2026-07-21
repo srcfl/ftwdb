@@ -9,8 +9,11 @@ fn committed_real_fixture_loads_with_stable_identity() {
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bench/fixtures/ftw-real-v1/points.csv.gz");
     let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source");
+    let backup = directory.path().join("backup");
+    let restored = directory.path().join("restored");
     let mut store = Store::open_with(
-        directory.path(),
+        &source,
         Config {
             durability: Durability::Manual,
             ..Config::default()
@@ -33,4 +36,20 @@ fn committed_real_fixture_loads_with_stable_identity() {
     let integrity = store.check_integrity().unwrap();
     assert_eq!(integrity.raw_points, 889_978);
     assert_eq!(integrity.raw_commits, 89);
+
+    store.backup_to(&backup).unwrap();
+    let restore = Store::restore_from(&backup, &restored).unwrap();
+    assert_eq!(restore.raw_points, 889_978);
+    assert_eq!(restore.raw_commits, 89);
+    assert_eq!(restore.source_snapshot_crc32, 0x9ff1_a95b);
+    assert_eq!(
+        restore.source_snapshot_crc32,
+        restore.destination_snapshot_crc32
+    );
+    let restored_integrity = Store::open_read_only(&restored)
+        .unwrap()
+        .check_integrity()
+        .unwrap();
+    assert_eq!(restored_integrity.raw_points, 889_978);
+    assert_eq!(restored_integrity.raw_commits, 89);
 }

@@ -80,12 +80,17 @@ workload and failure surface. A deterministic NBD SD-card emulator and one ARM64
 Linux/ext4 smoke run add repeatable media-cache and power-loss checks, but the
 recorded cut happened after the load and host sync. A repeatable 64 MiB
 Linux/NBD/ext4 run reached `ENOSPC` after 770,000 durable points in 77 commits;
-`check-store` and `inspect` passed on that prefix. Local snapshot backup plus
-post-publication integrity verification is implemented. Process-level CLI
-tests now cover usage errors, generated and sanitized input paths, integrity
-checks, inspection, backup JSON, and byte-for-byte read-only behavior. Together
-with the process-lock, sync-failure, `/dev/full`, and NBD tests, this closes the
+`check-store` and `inspect` passed on that prefix. Local snapshot backup and
+strict restore now use atomic no-clobber publication, read-only checks, selected
+file CRCs, and tested rollback after final sync or post-check errors.
+Process-level CLI tests cover usage errors, generated and sanitized input paths,
+integrity checks, inspection, backup and restore JSON, exact restored bytes,
+and byte-for-byte read-only behavior. The sanitized fixture restore fixes the
+expected result at 889,978 points, 89 commits, and snapshot CRC32 `9ff1a95b`.
+The Linux NBD power-loss run now follows recovery with an off-card backup and a
+verified restore to a new target on the emulated card. Together with the
+process-lock, sync-failure, `/dev/full`, and NBD tests, this closes the
 robustness gaps tracked in issue #17. Tests on the target board and SD cards,
-power cuts during commits, soak runs, remote backup policy, restore drills,
-corruption salvage, and the remaining result-verified adapters stay open and
-are required for the M4 exit.
+power cuts during commits, soak runs, remote backup policy, corruption salvage,
+and the remaining result-verified adapters stay open and are required for the
+M4 exit.

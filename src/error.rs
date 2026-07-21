@@ -31,6 +31,12 @@ pub enum Error {
         path: PathBuf,
     },
     ReadOnly,
+    /// A no-clobber rename succeeded, but a later durability or verification
+    /// step failed and the process could not fully roll its own directory back.
+    SnapshotPublication {
+        path: PathBuf,
+        reason: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -63,6 +69,11 @@ impl fmt::Display for Error {
             Self::ReadOnly => write!(
                 f,
                 "database is open read-only; reopen it writable to modify it"
+            ),
+            Self::SnapshotPublication { path, reason } => write!(
+                f,
+                "snapshot publication at {} could not be rolled back cleanly: {reason}",
+                path.display()
             ),
         }
     }

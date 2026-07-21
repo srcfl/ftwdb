@@ -1,4 +1,4 @@
-use crate::storage::sync_directory;
+use crate::storage::{open_regular_file_read_only, sync_directory};
 use crate::{Error, Result, RollupResolution};
 use crc32fast::hash;
 use serde::{Deserialize, Serialize};
@@ -178,7 +178,7 @@ pub(crate) fn referenced_rollup_files(
 }
 
 fn read_manifest(path: &Path, expected_generation: u64) -> Result<Manifest> {
-    let mut file = OpenOptions::new().read(true).open(path)?;
+    let mut file = open_regular_file_read_only(path)?;
     let file_len = file.metadata()?.len();
     if file_len < HEADER_BYTES as u64 {
         return corruption("manifest is too small");
