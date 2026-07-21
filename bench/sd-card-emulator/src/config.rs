@@ -239,6 +239,7 @@ mod tests {
             include_str!("../profiles/cheap-consumer.json"),
             include_str!("../profiles/nearly-worn.json"),
             include_str!("../profiles/sudden-power-loss.json"),
+            include_str!("../profiles/full-disk-64m.json"),
         ] {
             let profile: Profile = serde_json::from_str(contents).unwrap();
             profile.validate().unwrap();

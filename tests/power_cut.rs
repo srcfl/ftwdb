@@ -29,6 +29,100 @@ fn numbered_batch(batch: usize, points: usize) -> Vec<Point> {
         .collect()
 }
 
+#[test]
+fn writer_lock_holder_process() {
+    if std::env::var_os("FTWDB_LOCK_HOLDER").is_none() {
+        return;
+    }
+
+    let path = PathBuf::from(
+        std::env::var_os("FTWDB_LOCK_DATABASE")
+            .expect("FTWDB_LOCK_DATABASE must be set for the lock holder"),
+    );
+    let _database = Database::open(path).unwrap();
+    println!("WRITER_LOCK_HELD");
+    std::io::stdout().flush().unwrap();
+    let mut release = [0_u8; 1];
+    std::io::stdin().read_exact(&mut release).unwrap();
+}
+
+#[test]
+fn writer_lock_blocks_another_process_until_holder_exits() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("process-lock.ftwdb");
+    let executable = std::env::current_exe().unwrap();
+    let mut child = Command::new(executable)
+        .args([
+            "--exact",
+            "writer_lock_holder_process",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("FTWDB_LOCK_HOLDER", "1")
+        .env("FTWDB_LOCK_DATABASE", &path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+
+    let stdout = child.stdout.take().unwrap();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut ready_sent = false;
+        for line in BufReader::new(stdout).lines() {
+            match line {
+                Ok(line) if !ready_sent && line.contains("WRITER_LOCK_HELD") => {
+                    let _ = ready_tx.send(Ok(()));
+                    ready_sent = true;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    if !ready_sent {
+                        let _ = ready_tx.send(Err(error.to_string()));
+                    }
+                    return;
+                }
+            }
+        }
+        if !ready_sent {
+            let _ = ready_tx.send(Err("lock holder exited before readiness".to_owned()));
+        }
+    });
+
+    match ready_rx.recv_timeout(Duration::from_secs(15)) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            reader.join().unwrap();
+            panic!("lock holder failed before readiness: {error}");
+        }
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            reader.join().unwrap();
+            panic!("lock holder readiness timed out: {error}");
+        }
+    }
+
+    let second_open = Database::open(&path);
+    let release = child.stdin.take().unwrap().write_all(&[1]);
+    let status = child.wait().unwrap();
+    reader.join().unwrap();
+    release.unwrap();
+    assert!(status.success());
+    match second_open {
+        Err(Error::Locked { path: reported }) => assert_eq!(reported, path),
+        Err(other) => panic!("expected Error::Locked across processes, got {other:?}"),
+        Ok(_) => panic!("second process opened the writer-locked file"),
+    }
+
+    let mut reopened = Database::open(&path).unwrap();
+    reopened.append(&numbered_batch(0, 1)).unwrap();
+    reopened.close().unwrap();
+}
+
 /// The ignored controller starts this test in a child process. Each ACK is
 /// emitted only after an `Always` commit has returned as durable.
 #[test]

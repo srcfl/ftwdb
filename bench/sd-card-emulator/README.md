@@ -47,6 +47,8 @@ The profiles are starting points, not measured claims about a named SD card:
 - `nearly-worn.json` raises fault rates and reaches bad blocks sooner.
 - `sudden-power-loss.json` cuts the device at operation 1,000. Override that
   point with `--power-loss-after-ops N` for a seeded test matrix.
+- `full-disk-64m.json` is a fast 64 MiB device with no injected media faults.
+  The full-disk script uses it to reach a real ext4 `ENOSPC` result quickly.
 
 ## Linux NBD smoke test
 
@@ -97,6 +99,41 @@ bench/sd-card-emulator/target/release/ftw-sd-emulator ctl status
 Use the fixed TSBS smoke data from the benchmark task for a shared baseline:
 seed 42, IoT, 100 trucks, one hour, ten-second cadence. It has 64,941 rows,
 513,478 FTWDB points, input CRC32 `0fc89c22`, and point CRC32 `965c6ea9`.
+
+## Linux full-disk gate
+
+The full-disk gate uses the same Linux/NBD setup and cleanup as the power-loss
+smoke test. It writes the real fixture with `Durability::Always` to a 64 MiB
+ext4 filesystem until the kernel returns `ENOSPC`, then opens the store
+read-only and runs both `check-store` and `inspect` on the durable prefix.
+
+Run it from the repository root on Linux, or in the same privileged container
+used by the smoke test:
+
+```sh
+docker run --rm --privileged \
+  -e FTW_SD_EMULATOR_COMMIT="$(git rev-parse --short=12 HEAD)" \
+  -e FTW_NBD_FULL_OUTPUT=/work/bench-results/linux-nbd-full-disk \
+  -v "$PWD":/work -w /work rust:1.97-slim-bookworm \
+  bash bench/sd-card-emulator/linux-full-disk.sh
+```
+
+`FTW_NBD_FULL_OUTPUT` must name an absent or empty directory. A passing run
+exits zero and saves the writer output, store check, inspect output, emulator
+status, and shutdown result there. Stdout ends with these three lines followed
+by one JSON line:
+
+```text
+linux_nbd_full_disk=passed
+writer_exit=1
+writer_error=ENOSPC
+```
+
+The final JSON line must report positive `raw_points` and `raw_commits`.
+The script exits nonzero if the writer does not return `ENOSPC`, returns a
+different exit code, or either store check fails. This privileged script stays
+outside normal CI. The quick emulator result covers the #17 disk-full gate;
+physical SD-card power cuts remain a separate M4 release gate.
 
 ## Power-loss run
 
