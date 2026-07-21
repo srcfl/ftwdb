@@ -37,16 +37,18 @@ fn check_store(arguments: &[String]) -> Result<()> {
     if arguments.len() != 1 {
         return Err(invalid("check-store requires one store directory"));
     }
-    let store = Store::open(&arguments[0])?;
+    // Read-only: a check may not publish, prune, sweep, or recover in place.
+    let store = Store::open_read_only(&arguments[0])?;
     let report = store.check_integrity()?;
     println!(
-        "{{\"format\":\"ftwdb-integrity-v1\",\"manifest_generation\":{},\"raw_points\":{},\"raw_commits\":{},\"active_rollup_files\":{},\"active_rollup_buckets\":{},\"active_rollup_bytes\":{}}}",
+        "{{\"format\":\"ftwdb-integrity-v1\",\"manifest_generation\":{},\"raw_points\":{},\"raw_commits\":{},\"active_rollup_files\":{},\"active_rollup_buckets\":{},\"active_rollup_bytes\":{},\"stale_rollup_files\":{}}}",
         report.manifest_generation,
         report.raw_points,
         report.raw_commits,
         report.active_rollup_files,
         report.active_rollup_buckets,
-        report.active_rollup_bytes
+        report.active_rollup_bytes,
+        report.stale_rollup_files
     );
     Ok(())
 }
@@ -57,7 +59,8 @@ fn backup(arguments: &[String]) -> Result<()> {
             "backup requires source and absent destination directories",
         ));
     }
-    let mut store = Store::open(&arguments[0])?;
+    // Read-only: backing up must never alter (or create) the source store.
+    let mut store = Store::open_read_only(&arguments[0])?;
     let report = store.backup_to(&arguments[1])?;
     println!(
         "{{\"format\":\"ftwdb-backup-v1\",\"files\":{},\"bytes\":{},\"manifest_generation\":{}}}",
@@ -70,7 +73,9 @@ fn inspect(arguments: &[String]) -> Result<()> {
     if arguments.len() != 1 {
         return Err(invalid("inspect requires one database file"));
     }
-    let stats = Database::open(&arguments[0]).and_then(|database| database.stats())?;
+    // Read-only: inspection must not create a missing file or truncate a torn
+    // tail in the file being examined; recovery is simulated in memory.
+    let stats = Database::open_read_only(&arguments[0]).and_then(|database| database.stats())?;
     println!("format: ftwdb-v1");
     println!("points: {}", stats.points);
     println!("commits: {}", stats.commits);

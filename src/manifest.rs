@@ -12,6 +12,13 @@ const HEADER_BYTES: usize = 24;
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 const PREFIX: &str = "MANIFEST.";
 
+/// Older generations retained beside the newest published file so `load` can
+/// still fall back past a torn or otherwise corrupt newest manifest. Two
+/// fallbacks survive both an interrupted publish and one additional latent bad
+/// generation without unbounded growth; pruning never removes the newest file
+/// or this window, so the recovery scan in `load` keeps working.
+pub(crate) const RETAINED_FALLBACK_GENERATIONS: usize = 2;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RollupDescriptor {
     pub file: String,
@@ -32,20 +39,7 @@ pub(crate) struct Manifest {
 
 impl Manifest {
     pub fn load(directory: &Path) -> Result<Self> {
-        let mut candidates = Vec::new();
-        for entry in std::fs::read_dir(directory)? {
-            let entry = entry?;
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            let Some(raw_generation) = name.strip_prefix(PREFIX) else {
-                continue;
-            };
-            if let Ok(generation) = raw_generation.parse::<u64>() {
-                candidates.push((generation, entry.path()));
-            }
-        }
-        candidates.sort_by_key(|(generation, _)| std::cmp::Reverse(*generation));
+        let candidates = generation_candidates(directory)?;
         if candidates.is_empty() {
             return Ok(Self::default());
         }
@@ -111,6 +105,77 @@ impl Manifest {
         File::open(directory)?.sync_all()?;
         Ok(())
     }
+}
+
+/// Every `MANIFEST.<generation>` file in the directory, newest first. Entries
+/// are selected by filename only, so a corrupt generation still appears here
+/// and still counts toward the retained fallback window.
+fn generation_candidates(directory: &Path) -> Result<Vec<(u64, PathBuf)>> {
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(raw_generation) = name.strip_prefix(PREFIX) else {
+            continue;
+        };
+        if let Ok(generation) = raw_generation.parse::<u64>() {
+            candidates.push((generation, entry.path()));
+        }
+    }
+    candidates.sort_by_key(|(generation, _)| std::cmp::Reverse(*generation));
+    Ok(candidates)
+}
+
+/// Best-effort removal of manifest generations beyond the newest file plus
+/// `RETAINED_FALLBACK_GENERATIONS` fallbacks, returning the retained
+/// generations newest first. The newest file is never a deletion candidate,
+/// so the generation a caller just published always survives, and the
+/// retained fallbacks preserve the corruption recovery in `load`. The
+/// `loaded_generation` — whichever generation `load` actually returned — is
+/// also never removed even when it sits below the filename window: `load` may
+/// have skipped past that many corrupt newer files to reach it, and deleting
+/// the only proven-readable generation would make the store unrecoverable.
+/// Unlink failures are ignored: the publish that preceded this call already
+/// succeeded, and a surviving file is simply retried by the next prune.
+pub(crate) fn prune_generations(
+    directory: &Path,
+    loaded_generation: u64,
+) -> Result<Vec<(u64, PathBuf)>> {
+    let mut retained = generation_candidates(directory)?;
+    let window = (1 + RETAINED_FALLBACK_GENERATIONS).min(retained.len());
+    for (generation, path) in retained.split_off(window) {
+        if generation == loaded_generation {
+            // Candidates are sorted newest first, and this generation is
+            // older than everything already retained.
+            retained.push((generation, path));
+        } else {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    if let Ok(file) = File::open(directory) {
+        let _ = file.sync_all();
+    }
+    Ok(retained)
+}
+
+/// Every rollup filename referenced by the given retained generations,
+/// including inactive descriptors. An error means one retained generation
+/// could not be proven readable right now, so a caller must not treat any
+/// rollup file as unreferenced: a transient read failure is not proof of
+/// corruption, and `load` may still fall back to that generation later.
+pub(crate) fn referenced_rollup_files(
+    retained: &[(u64, PathBuf)],
+) -> Result<std::collections::HashSet<String>> {
+    let mut referenced = std::collections::HashSet::new();
+    for (generation, path) in retained {
+        let manifest = read_manifest(path, *generation)?;
+        for rollup in manifest.rollups {
+            referenced.insert(rollup.file);
+        }
+    }
+    Ok(referenced)
 }
 
 fn read_manifest(path: &Path, expected_generation: u64) -> Result<Manifest> {
@@ -233,5 +298,69 @@ mod tests {
         file.sync_all().unwrap();
 
         assert_eq!(Manifest::load(directory.path()).unwrap().generation, 1);
+    }
+
+    #[test]
+    fn pruning_keeps_the_newest_generation_and_its_fallback_window() {
+        let directory = tempdir().unwrap();
+        for generation in 1..=5 {
+            manifest(generation).publish(directory.path()).unwrap();
+        }
+        let retained = super::prune_generations(directory.path(), 5).unwrap();
+        let generations: Vec<u64> = retained.iter().map(|(generation, _)| *generation).collect();
+        assert_eq!(generations, vec![5, 4, 3]);
+        let on_disk = super::generation_candidates(directory.path()).unwrap();
+        assert_eq!(on_disk.len(), 1 + super::RETAINED_FALLBACK_GENERATIONS);
+        assert_eq!(
+            super::referenced_rollup_files(&retained).unwrap(),
+            std::collections::HashSet::from(["one.rseg".to_owned()])
+        );
+    }
+
+    #[test]
+    fn pruning_never_removes_the_loaded_generation() {
+        let directory = tempdir().unwrap();
+        for generation in 1..=5 {
+            manifest(generation).publish(directory.path()).unwrap();
+        }
+        // As if generations 3..=5 were corrupt and `load` fell back to 1: the
+        // loaded generation must survive alongside the filename window while
+        // everything else below it is still pruned.
+        let retained = super::prune_generations(directory.path(), 1).unwrap();
+        let generations: Vec<u64> = retained.iter().map(|(generation, _)| *generation).collect();
+        assert_eq!(generations, vec![5, 4, 3, 1]);
+        let on_disk: Vec<u64> = super::generation_candidates(directory.path())
+            .unwrap()
+            .iter()
+            .map(|(generation, _)| *generation)
+            .collect();
+        assert_eq!(on_disk, vec![5, 4, 3, 1]);
+        // The loaded generation's rollup references stay protected.
+        assert_eq!(
+            super::referenced_rollup_files(&retained).unwrap(),
+            std::collections::HashSet::from(["one.rseg".to_owned()])
+        );
+    }
+
+    #[test]
+    fn corruption_fallback_survives_pruning() {
+        let directory = tempdir().unwrap();
+        for generation in 1..=5 {
+            manifest(generation).publish(directory.path()).unwrap();
+        }
+        let retained = super::prune_generations(directory.path(), 5).unwrap();
+        let newest = &retained[0].1;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(newest)
+            .unwrap();
+        file.seek(SeekFrom::Start(30)).unwrap();
+        file.write_all(&[0xFF]).unwrap();
+        file.sync_all().unwrap();
+
+        assert_eq!(Manifest::load(directory.path()).unwrap().generation, 4);
+        // A retained generation that cannot be read back must abort any
+        // unreferenced-file computation rather than under-count references.
+        assert!(super::referenced_rollup_files(&retained).is_err());
     }
 }

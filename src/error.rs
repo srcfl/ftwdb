@@ -17,6 +17,7 @@ pub enum Error {
     Serialization(String),
     Poisoned,
     Locked { path: PathBuf },
+    ReadOnly,
 }
 
 impl fmt::Display for Error {
@@ -44,6 +45,10 @@ impl fmt::Display for Error {
                 f,
                 "database file {} is locked by another process; close the other opener first",
                 path.display()
+            ),
+            Self::ReadOnly => write!(
+                f,
+                "database is open read-only; reopen it writable to modify it"
             ),
         }
     }
