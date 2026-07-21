@@ -54,8 +54,9 @@ Initial exit met: fixed and DST-correct calendar aggregate states are persisted
 in checksummed immutable files, generations recover from a corrupt newest
 manifest, late revisions invalidate and rebuild materializations, cached query
 cost scales with returned buckets, and retention remains a non-destructive gate.
-Partial raw/rollup edge merging, background scheduling, bounded cache eviction,
-and physical log reclamation remain hardening work.
+Stable time shards bound rewrite amplification, and the planner combines
+adjacent rollups with raw invalid/current edges. Background scheduling, bounded
+cache eviction, and physical log reclamation remain hardening work.
 
 ## M4: comparative benchmark and edge hardening
 

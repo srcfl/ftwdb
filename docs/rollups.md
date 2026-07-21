@@ -36,6 +36,13 @@ calculation on the hot materialized path.
 5. sync the rollup directory;
 6. publish and sync a new `MANIFEST.<generation>` file.
 
+Fixed 5-minute, 30-minute, and hourly buckets are grouped into stable completed
+UTC-day segments. Calendar day/month buckets are each an independent segment.
+Consequently a normal new day appends files without rewriting historical
+rollups, and a late correction invalidates only the segment whose coverage can
+change. Unusual fixed resolutions that do not divide a UTC day use one bucket
+per file rather than a moving tail chunk.
+
 Manifest files are append-only generations. Startup scans newest to oldest and
 uses the highest fully valid generation, so a torn newest file does not require
 an independently mutable `CURRENT` pointer. Old rollup files and old manifests
@@ -56,10 +63,11 @@ then rebuilds it from the winning revisions.
 
 ## Query and retention behavior
 
-The planner uses an in-memory cache of verified immutable rollup segments when
-one current descriptor covers the full requested bucket envelope. Otherwise it
-falls back to the latest raw revisions. It never combines an invalidated or
-partially covering rollup with raw data in this milestone.
+The planner uses an in-memory cache of verified immutable rollup segments. It
+can cover one query with many adjacent descriptors and reads raw points only
+for an uncovered current edge or invalidated time shard. The response reports
+`Materialized`, `Hybrid`, or `Raw`. Raw edge construction reads only the bucket
+range plus the series maximum-gap context, rather than rescanning all history.
 
 Raw retention is currently a safety report, not a deletion operation. A series
 is eligible only when every configured tier is current and covers all raw data

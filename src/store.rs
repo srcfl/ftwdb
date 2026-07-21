@@ -5,7 +5,7 @@ use crate::{
     CalendarGaugeRollup, Commit, Config, Database, Error, FixedGaugeRollup, GaugeBucket, Point,
     Result, RollupResolution, RollupSegment, SeriesSemantics, Transaction,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,10 +13,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const ACTIVE_LOG: &str = "active.wlog";
 const MANIFEST_DIRECTORY: &str = "manifests";
 const ROLLUP_DIRECTORY: &str = "rollups";
+const UTC_DAY_MICROS: i64 = 86_400_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RollupSource {
     Materialized,
+    Hybrid,
     Raw,
 }
 
@@ -171,58 +173,68 @@ impl Store {
             let max_gap = definition.maximum_gap_micros.unwrap_or(0);
             for tier in &definition.rollup_policy.tiers {
                 let mut buckets = materialize(&points, &tier.resolution, max_gap)?;
-                buckets.retain(|bucket| {
-                    bucket.end <= now_micros
-                        && tier.retain_for_micros.is_none_or(|retention| {
-                            bucket.end >= now_micros.saturating_sub(retention)
-                        })
-                });
-                let Some(first) = buckets.first() else {
-                    continue;
-                };
-                let last = buckets.last().unwrap();
-                let already_current = next.rollups.iter().any(|rollup| {
-                    rollup.active
-                        && rollup.series_id == definition.id
-                        && rollup.resolution == tier.resolution
-                        && rollup.start == first.start
-                        && rollup.end == last.end
-                        && rollup.source_points == stats.points
-                });
-                if already_current {
-                    continue;
-                }
-
+                buckets.retain(|bucket| bucket.end <= now_micros);
+                let retention_cutoff = tier
+                    .retain_for_micros
+                    .map(|retention| now_micros.saturating_sub(retention));
                 for rollup in &mut next.rollups {
                     if rollup.active
                         && rollup.series_id == definition.id
                         && rollup.resolution == tier.resolution
+                        && retention_cutoff.is_some_and(|cutoff| rollup.end < cutoff)
                     {
                         rollup.active = false;
+                        changed = true;
                     }
                 }
-                let file = rollup_file_name(
-                    next_generation,
-                    definition.id,
-                    files_written,
-                    &tier.resolution,
-                );
-                let segment_stats =
-                    RollupSegment::create(self.rollup_directory.join(&file), &buckets)?;
-                next.rollups.push(RollupDescriptor {
-                    file,
-                    series_id: definition.id,
-                    resolution: tier.resolution.clone(),
-                    start: first.start,
-                    end: last.end,
-                    source_commit: stats.commits,
-                    source_points: stats.points,
-                    active: true,
-                });
-                files_written += 1;
-                buckets_written += u64::from(segment_stats.buckets);
-                bytes_written += segment_stats.stored_bytes;
-                changed = true;
+                let shards = rollup_shards(&buckets, &tier.resolution, now_micros)?;
+                for shard in shards
+                    .into_iter()
+                    .filter(|shard| retention_cutoff.is_none_or(|cutoff| shard.end >= cutoff))
+                {
+                    let already_current = next.rollups.iter().any(|rollup| {
+                        rollup.active
+                            && rollup.series_id == definition.id
+                            && rollup.resolution == tier.resolution
+                            && rollup.start == shard.start
+                            && rollup.end == shard.end
+                            && rollup.source_points == stats.points
+                    });
+                    if already_current {
+                        continue;
+                    }
+                    for rollup in &mut next.rollups {
+                        if rollup.active
+                            && rollup.series_id == definition.id
+                            && rollup.resolution == tier.resolution
+                            && ranges_overlap(rollup.start, rollup.end, shard.start, shard.end)
+                        {
+                            rollup.active = false;
+                        }
+                    }
+                    let file = rollup_file_name(
+                        next_generation,
+                        definition.id,
+                        files_written,
+                        &tier.resolution,
+                    );
+                    let segment_stats =
+                        RollupSegment::create(self.rollup_directory.join(&file), &shard.buckets)?;
+                    next.rollups.push(RollupDescriptor {
+                        file,
+                        series_id: definition.id,
+                        resolution: tier.resolution.clone(),
+                        start: shard.start,
+                        end: shard.end,
+                        source_commit: stats.commits,
+                        source_points: stats.points,
+                        active: true,
+                    });
+                    files_written += 1;
+                    buckets_written += u64::from(segment_stats.buckets);
+                    bytes_written += segment_stats.stored_bytes;
+                    changed = true;
+                }
             }
         }
 
@@ -267,39 +279,67 @@ impl Store {
         }
         let (required_start, required_end) = query_envelope(start, end, resolution)?;
         let current_points = self.database.stats()?.points;
-        if let Some(descriptor) = self.manifest.rollups.iter().find(|rollup| {
-            rollup.active
-                && rollup.series_id == series_id
-                && &rollup.resolution == resolution
-                && rollup.source_points == current_points
-                && rollup.start <= required_start
-                && rollup.end >= required_end
-        }) {
+        let candidates: Vec<_> = self
+            .manifest
+            .rollups
+            .iter()
+            .filter(|rollup| {
+                rollup.active
+                    && rollup.series_id == series_id
+                    && &rollup.resolution == resolution
+                    && rollup.source_points == current_points
+                    && ranges_overlap(rollup.start, rollup.end, required_start, required_end)
+            })
+            .collect();
+        let coverage = coverage_plan(candidates, required_start, required_end);
+        if !coverage.descriptors.is_empty() {
             let mut cache = self.rollup_cache.write().map_err(|_| Error::Poisoned)?;
-            if !cache.contains_key(&descriptor.file) {
-                cache.insert(
-                    descriptor.file.clone(),
-                    RollupSegment::open(self.rollup_directory.join(&descriptor.file))?,
+            for descriptor in &coverage.descriptors {
+                if !cache.contains_key(&descriptor.file) {
+                    cache.insert(
+                        descriptor.file.clone(),
+                        RollupSegment::open(self.rollup_directory.join(&descriptor.file))?,
+                    );
+                }
+            }
+            let mut buckets = Vec::new();
+            for descriptor in coverage.descriptors {
+                buckets.extend(
+                    cache
+                        .get(&descriptor.file)
+                        .expect("rollup was inserted")
+                        .query(start, end),
                 );
             }
-            let buckets = cache
-                .get(&descriptor.file)
-                .expect("rollup was inserted")
-                .query(start, end);
+            drop(cache);
+            for (gap_start, gap_end) in &coverage.gaps {
+                buckets.extend(self.materialize_raw_range(
+                    series_id,
+                    *gap_start,
+                    *gap_end,
+                    resolution,
+                    definition.maximum_gap_micros.unwrap_or(0),
+                )?);
+            }
+            buckets.sort_by_key(|bucket| bucket.start);
             return Ok(RollupQuery {
                 buckets,
-                source: RollupSource::Materialized,
+                source: if coverage.gaps.is_empty() {
+                    RollupSource::Materialized
+                } else {
+                    RollupSource::Hybrid
+                },
                 manifest_generation: self.manifest.generation,
             });
         }
 
-        let points = self.database.query_latest(series_id, i64::MIN, i64::MAX);
-        let mut buckets = materialize(
-            &points,
+        let buckets = self.materialize_raw_range(
+            series_id,
+            required_start,
+            required_end,
             resolution,
             definition.maximum_gap_micros.unwrap_or(0),
         )?;
-        buckets.retain(|bucket| bucket.end > start && bucket.start < end);
         Ok(RollupQuery {
             buckets,
             source: RollupSource::Raw,
@@ -340,14 +380,18 @@ impl Store {
                 continue;
             }
             let missing = definition.rollup_policy.tiers.iter().find(|tier| {
-                !self.manifest.rollups.iter().any(|rollup| {
-                    rollup.active
-                        && rollup.series_id == definition.id
-                        && rollup.resolution == tier.resolution
-                        && rollup.source_points == source_points
-                        && rollup.start <= oldest
-                        && rollup.end >= cutoff
-                })
+                let candidates = self
+                    .manifest
+                    .rollups
+                    .iter()
+                    .filter(|rollup| {
+                        rollup.active
+                            && rollup.series_id == definition.id
+                            && rollup.resolution == tier.resolution
+                            && rollup.source_points == source_points
+                    })
+                    .collect();
+                covering_descriptors(candidates, oldest, cutoff).is_none()
             });
             gates.push(match missing {
                 Some(tier) => RetentionGate {
@@ -427,6 +471,24 @@ impl Store {
         Ok(())
     }
 
+    fn materialize_raw_range(
+        &self,
+        series_id: u64,
+        start: i64,
+        end: i64,
+        resolution: &RollupResolution,
+        max_gap_micros: i64,
+    ) -> Result<Vec<GaugeBucket>> {
+        let context_start = start.saturating_sub(max_gap_micros);
+        let context_end = end.saturating_add(max_gap_micros.max(1));
+        let points = self
+            .database
+            .query_latest(series_id, context_start, context_end);
+        let mut buckets = materialize(&points, resolution, max_gap_micros)?;
+        buckets.retain(|bucket| bucket.start >= start && bucket.end <= end);
+        Ok(buckets)
+    }
+
     fn verify_and_reconcile_manifest(&mut self) -> Result<()> {
         let stats = self.database.stats()?;
         let mut next = self.manifest.clone();
@@ -443,8 +505,10 @@ impl Store {
             }
             let segment = RollupSegment::open(self.rollup_directory.join(&descriptor.file))?;
             let segment_stats = segment.stats();
-            if segment_stats.min_start != Some(descriptor.start)
-                || segment_stats.max_end != Some(descriptor.end)
+            if segment_stats
+                .min_start
+                .is_none_or(|start| start < descriptor.start)
+                || segment_stats.max_end.is_none_or(|end| end > descriptor.end)
             {
                 return Err(Error::Corruption {
                     offset: 0,
@@ -529,6 +593,119 @@ fn materialize(
     }
 }
 
+struct RollupShard {
+    start: i64,
+    end: i64,
+    buckets: Vec<GaugeBucket>,
+}
+
+fn rollup_shards(
+    buckets: &[GaugeBucket],
+    resolution: &RollupResolution,
+    now_micros: i64,
+) -> Result<Vec<RollupShard>> {
+    match resolution {
+        RollupResolution::FixedMicros(micros) if *micros > 0 => {
+            // The common 5m/30m/hour tiers get stable UTC-day files. An
+            // unusual resolution that does not divide a day gets one bucket
+            // per file rather than a moving, rewrite-heavy tail chunk.
+            let width = if *micros <= UTC_DAY_MICROS && UTC_DAY_MICROS % *micros == 0 {
+                UTC_DAY_MICROS
+            } else {
+                *micros
+            };
+            let mut grouped = BTreeMap::<i64, Vec<GaugeBucket>>::new();
+            for bucket in buckets {
+                let start = bucket.start.div_euclid(width) * width;
+                let end = start.saturating_add(width);
+                if end <= now_micros {
+                    grouped.entry(start).or_default().push(*bucket);
+                }
+            }
+            Ok(grouped
+                .into_iter()
+                .map(|(start, buckets)| RollupShard {
+                    start,
+                    end: start.saturating_add(width),
+                    buckets,
+                })
+                .collect())
+        }
+        RollupResolution::FixedMicros(_) => Err(Error::InvalidModel(
+            "fixed rollup resolution must be positive".to_owned(),
+        )),
+        RollupResolution::Calendar { .. } => Ok(buckets
+            .iter()
+            .filter(|bucket| bucket.end <= now_micros)
+            .map(|bucket| RollupShard {
+                start: bucket.start,
+                end: bucket.end,
+                buckets: vec![*bucket],
+            })
+            .collect()),
+    }
+}
+
+struct CoveragePlan<'a> {
+    descriptors: Vec<&'a RollupDescriptor>,
+    gaps: Vec<(i64, i64)>,
+}
+
+fn coverage_plan<'a>(
+    mut candidates: Vec<&'a RollupDescriptor>,
+    start: i64,
+    end: i64,
+) -> CoveragePlan<'a> {
+    if end <= start {
+        return CoveragePlan {
+            descriptors: Vec::new(),
+            gaps: Vec::new(),
+        };
+    }
+    candidates.sort_by_key(|descriptor| (descriptor.start, descriptor.end));
+    let mut selected = Vec::new();
+    let mut gaps = Vec::new();
+    let mut cursor = start;
+    while cursor < end {
+        let best = candidates
+            .iter()
+            .copied()
+            .filter(|descriptor| descriptor.start <= cursor && descriptor.end > cursor)
+            .max_by_key(|descriptor| descriptor.end);
+        if let Some(descriptor) = best {
+            cursor = descriptor.end.min(end);
+            selected.push(descriptor);
+            continue;
+        }
+        let gap_end = candidates
+            .iter()
+            .filter(|descriptor| descriptor.start > cursor)
+            .map(|descriptor| descriptor.start)
+            .min()
+            .unwrap_or(end)
+            .min(end);
+        gaps.push((cursor, gap_end));
+        cursor = gap_end;
+    }
+    CoveragePlan {
+        descriptors: selected,
+        gaps,
+    }
+}
+
+fn covering_descriptors(
+    candidates: Vec<&RollupDescriptor>,
+    start: i64,
+    end: i64,
+) -> Option<Vec<&RollupDescriptor>> {
+    let plan = coverage_plan(candidates, start, end);
+    plan.gaps.is_empty().then_some(plan.descriptors)
+}
+
+fn ranges_overlap(left_start: i64, left_end: i64, right_start: i64, right_end: i64) -> bool {
+    left_start < right_end && right_start < left_end
+}
+
 fn query_envelope(start: i64, end: i64, resolution: &RollupResolution) -> Result<(i64, i64)> {
     match resolution {
         RollupResolution::FixedMicros(micros) if *micros > 0 => {
@@ -584,6 +761,7 @@ mod tests {
     use tempfile::tempdir;
 
     const SECOND: i64 = 1_000_000;
+    const DAY: i64 = 86_400 * SECOND;
 
     fn initialize(store: &mut Store, tiers: Vec<RollupTier>, raw_retention: Option<i64>) {
         let mut transaction = Transaction::new();
@@ -637,7 +815,7 @@ mod tests {
             let mut transaction = Transaction::new();
             transaction.append_points(points());
             store.commit(transaction).unwrap();
-            let report = store.maintain(20 * SECOND).unwrap();
+            let report = store.maintain(DAY).unwrap();
             assert_eq!(report.rollup_files_written, 1);
         }
         let store = Store::open(directory.path()).unwrap();
@@ -662,7 +840,7 @@ mod tests {
         let mut transaction = Transaction::new();
         transaction.append_points(points());
         store.commit(transaction).unwrap();
-        store.maintain(20 * SECOND).unwrap();
+        store.maintain(DAY).unwrap();
 
         let mut correction = Point::actual(1, 6 * SECOND, 100.0);
         correction.change_time = 30 * SECOND;
@@ -677,7 +855,7 @@ mod tests {
             RollupSource::Raw
         );
 
-        store.maintain(20 * SECOND).unwrap();
+        store.maintain(DAY).unwrap();
         assert_eq!(
             store
                 .query_gauge(1, 0, 20 * SECOND, &resolution)
@@ -736,7 +914,7 @@ mod tests {
             let mut transaction = Transaction::new();
             transaction.append_points(points());
             store.commit(transaction).unwrap();
-            store.maintain(20 * SECOND).unwrap();
+            store.maintain(DAY).unwrap();
         }
         // Simulate power loss after the raw frame became durable and before a
         // new manifest generation could invalidate the old rollup.
@@ -756,6 +934,62 @@ mod tests {
                 .unwrap()
                 .source,
             RollupSource::Raw
+        );
+    }
+
+    #[test]
+    fn new_days_append_rollups_without_rewriting_history() {
+        let directory = tempdir().unwrap();
+        let resolution = RollupResolution::FixedMicros(5 * SECOND);
+        let mut store = Store::open(directory.path()).unwrap();
+        initialize(
+            &mut store,
+            vec![RollupTier {
+                resolution: resolution.clone(),
+                retain_for_micros: None,
+            }],
+            None,
+        );
+        let mut transaction = Transaction::new();
+        transaction.append_points(vec![
+            Point::actual(1, 0, 1.0),
+            Point::actual(1, 5 * SECOND, 2.0),
+            Point::actual(1, DAY, 3.0),
+            Point::actual(1, DAY + 5 * SECOND, 4.0),
+        ]);
+        store.commit(transaction).unwrap();
+        assert_eq!(store.maintain(2 * DAY).unwrap().rollup_files_written, 2);
+        let historical_files: Vec<_> = store
+            .active_rollups()
+            .map(|rollup| rollup.file.clone())
+            .collect();
+
+        let mut transaction = Transaction::new();
+        transaction.append_points(vec![
+            Point::actual(1, 2 * DAY + 5 * SECOND, 5.0),
+            Point::actual(1, 2 * DAY + 10 * SECOND, 6.0),
+        ]);
+        store.commit(transaction).unwrap();
+        assert_eq!(
+            store
+                .query_gauge(1, 0, 2 * DAY + 15 * SECOND, &resolution)
+                .unwrap()
+                .source,
+            RollupSource::Hybrid
+        );
+        let report = store.maintain(3 * DAY).unwrap();
+        assert_eq!(report.rollup_files_written, 1);
+        assert!(
+            historical_files
+                .iter()
+                .all(|file| { store.active_rollups().any(|rollup| &rollup.file == file) })
+        );
+        assert_eq!(
+            store
+                .query_gauge(1, 0, 3 * DAY, &resolution)
+                .unwrap()
+                .source,
+            RollupSource::Materialized
         );
     }
 }

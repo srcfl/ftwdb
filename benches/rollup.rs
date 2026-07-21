@@ -97,12 +97,18 @@ fn rollup_benchmarks(criterion: &mut Criterion) {
     });
     group.finish();
 
-    let daily_descriptor = store
+    let daily_start = store
         .active_rollups()
-        .find(|rollup| rollup.resolution == calendar)
+        .filter(|rollup| rollup.resolution == calendar)
+        .map(|rollup| rollup.start)
+        .min()
         .unwrap();
-    let daily_start = daily_descriptor.start;
-    let daily_end = daily_descriptor.end;
+    let daily_end = store
+        .active_rollups()
+        .filter(|rollup| rollup.resolution == calendar)
+        .map(|rollup| rollup.end)
+        .max()
+        .unwrap();
     let daily = store
         .query_gauge(1, daily_start, daily_end, &calendar)
         .unwrap();
