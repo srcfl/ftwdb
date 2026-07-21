@@ -90,6 +90,13 @@ impl Store {
         std::fs::create_dir_all(&rollup_directory)?;
         sync_directory(&root)?;
 
+        // The exclusive advisory lock that `Database::open_with` takes on the
+        // active log also guards the whole store directory: every mutation —
+        // commits, maintenance, manifest publication, and backups — flows
+        // through an open `Database`, so a second `Store` opener fails with
+        // `Error::Locked` before it can republish manifests or rewrite
+        // rollups. Backups copy (never hard-link) the active log, so opening
+        // a published backup does not contend with the source's lock.
         let database = Database::open_with(root.join(ACTIVE_LOG), config)?;
         let manifest = Manifest::load(&manifest_directory)?;
         let mut store = Self {
@@ -956,6 +963,22 @@ mod tests {
         (0..=20)
             .map(|second| Point::actual(1, second * SECOND, second as f64))
             .collect()
+    }
+
+    #[test]
+    fn second_store_opener_fails_until_the_first_closes() {
+        let directory = tempdir().unwrap();
+        let first = Store::open(directory.path()).unwrap();
+        match Store::open(directory.path()) {
+            Err(crate::Error::Locked { path }) => {
+                assert_eq!(path, directory.path().join("active.wlog"));
+            }
+            Err(other) => panic!("expected Error::Locked, got {other:?}"),
+            Ok(_) => panic!("expected Error::Locked, got a second open store"),
+        }
+        first.close().unwrap();
+        let mut reopened = Store::open(directory.path()).unwrap();
+        initialize(&mut reopened, Vec::new(), None);
     }
 
     #[test]
