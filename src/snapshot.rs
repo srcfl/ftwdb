@@ -2,7 +2,7 @@ use crate::storage::sync_directory;
 use crate::{Error, Result};
 use crc32fast::Hasher;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -91,6 +91,61 @@ pub(crate) fn snapshot_digest(root: &Path, relative_paths: &[String]) -> Result<
         bytes,
         crc32: hasher.finalize(),
     })
+}
+
+/// Computes the one-file snapshot digest for an exact prefix of an already
+/// opened regular file. Salvage uses this to compare its checked source prefix
+/// with the complete `active.wlog` written to the new store.
+pub(crate) fn snapshot_file_prefix_digest(
+    file: &mut File,
+    relative: &str,
+    prefix_bytes: u64,
+) -> Result<SnapshotDigest> {
+    validate_relative_path(relative)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || metadata.len() < prefix_bytes {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "snapshot prefix is no longer present in the source file",
+        )));
+    }
+    let path_bytes = relative.as_bytes();
+    let path_len = u64::try_from(path_bytes.len())
+        .map_err(|_| Error::Serialization("snapshot path is too long".to_owned()))?;
+    let mut hasher = Hasher::new();
+    hasher.update(SNAPSHOT_CRC32_DOMAIN);
+    hasher.update(&path_len.to_le_bytes());
+    hasher.update(path_bytes);
+    hasher.update(&prefix_bytes.to_le_bytes());
+    file.seek(SeekFrom::Start(0))?;
+    hash_exact_bytes(file, prefix_bytes, relative, &mut hasher)?;
+    Ok(SnapshotDigest {
+        files: 1,
+        bytes: prefix_bytes,
+        crc32: hasher.finalize(),
+    })
+}
+
+fn hash_exact_bytes(
+    file: &mut File,
+    mut remaining: u64,
+    relative: &str,
+    hasher: &mut Hasher,
+) -> Result<()> {
+    let mut buffer = vec![0_u8; CHECKSUM_BUFFER_BYTES];
+    while remaining > 0 {
+        let requested = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+        let read = file.read(&mut buffer[..requested])?;
+        if read == 0 {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("snapshot file changed while reading {relative}"),
+            )));
+        }
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    Ok(())
 }
 
 fn open_snapshot_file(root: &Path, relative: &str) -> Result<File> {

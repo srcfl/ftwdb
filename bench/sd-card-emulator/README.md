@@ -72,7 +72,10 @@ checked-in real-installation fixture and rejects a
 changed active-log checksum or recovered FTWDB watermark. After recovery, it
 backs up the checked store outside the emulated card, restores that backup to a
 new store on the card, and compares checked counts, snapshot CRCs, and active
-log SHA-256 values.
+log SHA-256 values. It then adds a seven-byte short tail to an off-card copy,
+salvages it to another new store on the card, and requires a `partial` result,
+seven discarded bytes, 889,978 points, 89 commits, equal snapshot CRCs, and the
+clean raw-log SHA-256 value.
 
 ```sh
 mkdir -p bench-results/sd-emulator

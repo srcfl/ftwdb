@@ -2,15 +2,17 @@ use crate::manifest::{self, Manifest, RollupDescriptor};
 use crate::rollup::calendar_bucket_bounds;
 use crate::snapshot::{
     PublicationStep, StagedDirectory, inject_checksum_mismatch, publication_checkpoint,
-    snapshot_digest,
+    snapshot_digest, snapshot_file_prefix_digest,
 };
-use crate::storage::{sync_directory, sync_parent_directory};
+use crate::storage::{SalvageSource, sync_directory, sync_parent_directory};
 use crate::transaction::Record;
 use crate::{
     CalendarGaugeRollup, Commit, Config, Database, Error, FixedGaugeRollup, GaugeBucket, Point,
     Result, RollupResolution, RollupSegment, SeriesSemantics, Transaction,
 };
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -86,6 +88,35 @@ pub struct RestoreReport {
     pub raw_commits: u64,
     pub raw_points: u64,
     pub source_snapshot_crc32: u32,
+    pub destination_snapshot_crc32: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SalvageStatus {
+    Clean,
+    Partial,
+}
+
+impl fmt::Display for SalvageStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Clean => "clean",
+            Self::Partial => "partial",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SalvageReport {
+    pub status: SalvageStatus,
+    pub source_bytes: u64,
+    pub recovered_prefix_bytes: u64,
+    pub discarded_bytes: u64,
+    pub stop_offset: u64,
+    pub stop_reason: crate::SalvageStopReason,
+    pub recovered_commits: u64,
+    pub recovered_points: u64,
+    pub source_prefix_crc32: u32,
     pub destination_snapshot_crc32: u32,
 }
 
@@ -746,6 +777,109 @@ impl Store {
         }
     }
 
+    /// Copies the longest raw-log prefix that validates from the first frame
+    /// into a new store. Derived manifests and rollups are never opened.
+    pub fn salvage_from(
+        damaged_store: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> Result<SalvageReport> {
+        let mut source = SalvageSource::open(damaged_store.as_ref(), ACTIVE_LOG)?;
+        let destination = destination.as_ref();
+        let relative_paths = vec![ACTIVE_LOG.to_owned()];
+        let source_digest = snapshot_file_prefix_digest(
+            &mut source.file,
+            ACTIVE_LOG,
+            source.recovered_prefix_bytes,
+        )?;
+        source.ensure_unchanged()?;
+
+        let staged = StagedDirectory::create(destination, "salvage")?;
+        write_salvage_stage(&mut source, staged.path())?;
+        let stage_digest =
+            inject_checksum_mismatch(snapshot_digest(staged.path(), &relative_paths)?);
+        if stage_digest != source_digest {
+            return Err(snapshot_mismatch(
+                "source prefix",
+                source_digest,
+                "stage",
+                stage_digest,
+            ));
+        }
+
+        let stage = Self::open_read_only(staged.path())?;
+        let stage_integrity = stage.check_integrity()?;
+        stage.require_clean_restore_source(&stage_integrity)?;
+        if stage_integrity.raw_commits != source.recovered_commits
+            || stage_integrity.raw_points != source.recovered_points
+        {
+            return Err(Error::Corruption {
+                offset: 0,
+                reason: "salvage stage counts differ from the validated source prefix".to_owned(),
+            });
+        }
+
+        let publication = staged.publish(destination)?;
+        let checked = (|| {
+            publication_checkpoint(PublicationStep::PostCheck)?;
+            let salvaged = Self::open_read_only(destination)?;
+            let destination_integrity = salvaged.check_integrity()?;
+            salvaged.require_clean_restore_source(&destination_integrity)?;
+            let destination_digest = snapshot_digest(destination, &relative_paths)?;
+            if destination_digest != source_digest {
+                return Err(snapshot_mismatch(
+                    "source prefix",
+                    source_digest,
+                    "destination",
+                    destination_digest,
+                ));
+            }
+            if destination_integrity.raw_commits != source.recovered_commits
+                || destination_integrity.raw_points != source.recovered_points
+            {
+                return Err(Error::Corruption {
+                    offset: 0,
+                    reason: "salvaged store counts differ from the validated source prefix"
+                        .to_owned(),
+                });
+            }
+            source.ensure_unchanged()?;
+            let discarded_bytes = source
+                .source_bytes
+                .checked_sub(source.recovered_prefix_bytes)
+                .ok_or(Error::SourceChanged {
+                    path: source.path.clone(),
+                })?;
+            Ok(SalvageReport {
+                status: if source.stop_reason == crate::SalvageStopReason::CleanEof {
+                    SalvageStatus::Clean
+                } else {
+                    SalvageStatus::Partial
+                },
+                source_bytes: source.source_bytes,
+                recovered_prefix_bytes: source.recovered_prefix_bytes,
+                discarded_bytes,
+                stop_offset: source.recovered_prefix_bytes,
+                stop_reason: source.stop_reason,
+                recovered_commits: destination_integrity.raw_commits,
+                recovered_points: destination_integrity.raw_points,
+                source_prefix_crc32: source_digest.crc32,
+                destination_snapshot_crc32: destination_digest.crc32,
+            })
+        })();
+        match checked {
+            Ok(report) => {
+                drop(stage);
+                publication.commit();
+                Ok(report)
+            }
+            Err(error) => {
+                let error = publication.rollback_after(error);
+                drop(stage);
+                Err(error)
+            }
+        }
+    }
+
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
@@ -1244,6 +1378,33 @@ fn copy_and_sync(source: &Path, destination: &Path) -> std::io::Result<u64> {
     Ok(bytes)
 }
 
+fn write_salvage_stage(source: &mut SalvageSource, temporary: &Path) -> Result<()> {
+    let manifests = temporary.join(MANIFEST_DIRECTORY);
+    let rollups = temporary.join(ROLLUP_DIRECTORY);
+    std::fs::create_dir(&manifests)?;
+    std::fs::create_dir(&rollups)?;
+    publication_checkpoint(PublicationStep::Copy)?;
+    source.file.seek(SeekFrom::Start(0))?;
+    let mut active = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(temporary.join(ACTIVE_LOG))?;
+    let mut prefix = std::io::Read::by_ref(&mut source.file).take(source.recovered_prefix_bytes);
+    let copied = std::io::copy(&mut prefix, &mut active)?;
+    if copied != source.recovered_prefix_bytes {
+        return Err(Error::SourceChanged {
+            path: source.path.clone(),
+        });
+    }
+    active.sync_all()?;
+    source.ensure_unchanged()?;
+    publication_checkpoint(PublicationStep::Sync)?;
+    sync_directory(&manifests)?;
+    sync_directory(&rollups)?;
+    sync_directory(temporary)?;
+    Ok(())
+}
+
 #[derive(Debug)]
 enum LinkOrCopy {
     Linked,
@@ -1350,11 +1511,14 @@ fn snapshot_mismatch(
 
 #[cfg(test)]
 mod tests {
-    use super::{BackupReport, LinkOrCopy, RollupSource, Store, hard_link_or_copy_with};
+    use super::{
+        BackupReport, LinkOrCopy, RollupSource, SalvageStatus, Store, hard_link_or_copy_with,
+    };
     use crate::snapshot::{PublicationStep, StagedDirectory, fail_next_publication_step};
+    use crate::storage::mutate_salvage_source_after_identity_checks;
     use crate::{
         CalendarUnit, Entity, EntityId, Point, RollupPolicy, RollupResolution, RollupTier,
-        SeriesDefinition, SeriesSemantics, Transaction,
+        SalvageStopReason, SeriesDefinition, SeriesSemantics, Transaction,
     };
     use std::collections::BTreeMap;
     use std::error::Error as _;
@@ -1611,6 +1775,42 @@ mod tests {
         result
     }
 
+    fn salvage_with_deadline(
+        source: std::path::PathBuf,
+        target: std::path::PathBuf,
+        fifo: &Path,
+    ) -> crate::Result<crate::SalvageReport> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender.send(Store::salvage_from(source, target)).unwrap();
+        });
+        let mut timed_out = false;
+        let result = match receiver.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                timed_out = true;
+                let writer = rustix::fs::open(
+                    fifo,
+                    rustix::fs::OFlags::WRONLY
+                        | rustix::fs::OFlags::CLOEXEC
+                        | rustix::fs::OFlags::NONBLOCK,
+                    rustix::fs::Mode::empty(),
+                )
+                .expect("a blocked FIFO reader must admit a nonblocking writer");
+                drop(writer);
+                receiver
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("salvage worker must exit after its FIFO reader is released")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("salvage worker disconnected without a result")
+            }
+        };
+        worker.join().unwrap();
+        assert!(!timed_out, "salvage blocked while opening active.wlog");
+        result
+    }
+
     fn flip_last_byte(path: &Path) {
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -1634,6 +1834,14 @@ mod tests {
 
     fn restore_stages(parent: &Path, target_name: &str) -> Vec<String> {
         let prefix = format!(".{target_name}.restore-");
+        stored_files(parent)
+            .into_iter()
+            .filter(|name| name.starts_with(&prefix))
+            .collect()
+    }
+
+    fn salvage_stages(parent: &Path, target_name: &str) -> Vec<String> {
+        let prefix = format!(".{target_name}.salvage-");
         stored_files(parent)
             .into_iter()
             .filter(|name| name.starts_with(&prefix))
@@ -2695,6 +2903,376 @@ mod tests {
                     .iter()
                     .all(|name| !name.starts_with(prefix)),
                 "{step:?} failure left a backup stage"
+            );
+        }
+    }
+
+    #[test]
+    fn clean_salvage_ignores_all_derived_files_and_preserves_the_source() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        let target = directory.path().join("salvaged");
+        {
+            let mut store = Store::open(&source).unwrap();
+            initialize(
+                &mut store,
+                vec![RollupTier {
+                    resolution: RollupResolution::FixedMicros(5 * SECOND),
+                    retain_for_micros: None,
+                }],
+                None,
+            );
+            let mut transaction = Transaction::new();
+            transaction.append_points(points());
+            store.commit(transaction).unwrap();
+            store.maintain(DAY).unwrap();
+            store.close().unwrap();
+        }
+        let manifest = active_manifest_path(&source);
+        let rollup = active_rollup_path(&source);
+        flip_last_byte(&manifest);
+        flip_last_byte(&rollup);
+        std::fs::write(source.join("rollups/orphan.rseg"), b"broken orphan").unwrap();
+        let source_before = directory_snapshot(&source);
+
+        let report = Store::salvage_from(&source, &target).unwrap();
+        assert_eq!(report.status, SalvageStatus::Clean);
+        assert_eq!(report.stop_reason, SalvageStopReason::CleanEof);
+        assert_eq!(report.source_bytes, report.recovered_prefix_bytes);
+        assert_eq!(report.discarded_bytes, 0);
+        assert_eq!(report.stop_offset, report.source_bytes);
+        assert_eq!(report.recovered_commits, 2);
+        assert_eq!(report.recovered_points, 21);
+        assert_eq!(
+            report.source_prefix_crc32,
+            report.destination_snapshot_crc32
+        );
+        let integrity = Store::open_read_only(&target)
+            .unwrap()
+            .check_integrity()
+            .unwrap();
+        assert_eq!(integrity.manifest_generation, 0);
+        assert_eq!(integrity.active_rollup_files, 0);
+        assert_eq!(integrity.raw_commits, 2);
+        assert_eq!(integrity.raw_points, 21);
+        let mut appended = Store::open(&target).unwrap();
+        appended.append(&[points()[0]]).unwrap();
+        appended.close().unwrap();
+        assert_eq!(directory_snapshot(&source), source_before);
+    }
+
+    #[test]
+    fn short_tail_salvages_a_verified_partial_prefix_without_mutating_source() {
+        let directory = tempdir().unwrap();
+        let source = create_verified_backup(directory.path(), false);
+        let active = source.join("active.wlog");
+        let clean_bytes = std::fs::metadata(&active).unwrap().len();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&active)
+            .unwrap();
+        file.write_all(b"partial").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let source_before = directory_snapshot(&source);
+        let target = directory.path().join("salvaged");
+
+        let report = Store::salvage_from(&source, &target).unwrap();
+        assert_eq!(report.status, SalvageStatus::Partial);
+        assert_eq!(report.stop_reason, SalvageStopReason::IncompleteFrameHeader);
+        assert_eq!(report.recovered_prefix_bytes, clean_bytes);
+        assert_eq!(report.discarded_bytes, 7);
+        assert_eq!(report.stop_offset, clean_bytes);
+        assert_eq!(report.recovered_commits, 2);
+        assert_eq!(report.recovered_points, 21);
+        assert_eq!(
+            report.source_prefix_crc32,
+            report.destination_snapshot_crc32
+        );
+        assert_eq!(
+            std::fs::metadata(target.join("active.wlog")).unwrap().len(),
+            clean_bytes
+        );
+        assert_eq!(directory_snapshot(&source), source_before);
+    }
+
+    #[test]
+    fn header_only_and_first_frame_damage_publish_checked_zero_count_stores() {
+        let directory = tempdir().unwrap();
+
+        let clean_source = directory.path().join("clean-source");
+        std::fs::create_dir_all(clean_source.join("manifests")).unwrap();
+        std::fs::create_dir(clean_source.join("rollups")).unwrap();
+        crate::Database::open(clean_source.join("active.wlog"))
+            .unwrap()
+            .close()
+            .unwrap();
+        let clean_target = directory.path().join("clean-target");
+        let clean = Store::salvage_from(&clean_source, &clean_target).unwrap();
+        assert_eq!(clean.status, SalvageStatus::Clean);
+        assert_eq!(clean.stop_reason, SalvageStopReason::CleanEof);
+        assert_eq!((clean.recovered_commits, clean.recovered_points), (0, 0));
+
+        let damaged_source = directory.path().join("damaged-source");
+        std::fs::create_dir_all(damaged_source.join("manifests")).unwrap();
+        std::fs::create_dir(damaged_source.join("rollups")).unwrap();
+        let active = damaged_source.join("active.wlog");
+        crate::Database::open(&active).unwrap().close().unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&active)
+            .unwrap();
+        file.write_all(b"partial").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let damaged_before = directory_snapshot(&damaged_source);
+        let damaged_target = directory.path().join("damaged-target");
+        let partial = Store::salvage_from(&damaged_source, &damaged_target).unwrap();
+        assert_eq!(partial.status, SalvageStatus::Partial);
+        assert_eq!(
+            partial.stop_reason,
+            SalvageStopReason::IncompleteFrameHeader
+        );
+        assert_eq!(partial.discarded_bytes, 7);
+        assert_eq!(
+            (partial.recovered_commits, partial.recovered_points),
+            (0, 0)
+        );
+        let checked = Store::open_read_only(&damaged_target)
+            .unwrap()
+            .check_integrity()
+            .unwrap();
+        assert_eq!((checked.raw_commits, checked.raw_points), (0, 0));
+        assert_eq!(directory_snapshot(&damaged_source), damaged_before);
+    }
+
+    #[test]
+    fn invalid_database_header_is_fatal_and_publishes_nothing() {
+        let directory = tempdir().unwrap();
+        let source = create_verified_backup(directory.path(), false);
+        overwrite_byte(&source.join("active.wlog"), 0, 0);
+        let source_before = directory_snapshot(&source);
+        let target = directory.path().join("target");
+
+        assert!(matches!(
+            Store::salvage_from(&source, &target),
+            Err(crate::Error::InvalidHeader)
+        ));
+        assert!(!target.exists());
+        assert!(salvage_stages(directory.path(), "target").is_empty());
+        assert_eq!(directory_snapshot(&source), source_before);
+    }
+
+    #[test]
+    fn unsupported_database_version_and_header_crc_are_fatal_without_publication() {
+        for (kind, offset) in [("version", 8_u64), ("header-crc", 12_u64)] {
+            let directory = tempdir().unwrap();
+            let source = create_verified_backup(directory.path(), false);
+            overwrite_byte(&source.join("active.wlog"), offset, 2);
+            let source_before = directory_snapshot(&source);
+            let target = directory.path().join("target");
+
+            let error = Store::salvage_from(&source, &target).unwrap_err();
+            match kind {
+                "version" => assert!(matches!(error, crate::Error::UnsupportedVersion(2))),
+                "header-crc" => assert!(matches!(error, crate::Error::InvalidHeader)),
+                _ => unreachable!(),
+            }
+            assert!(!target.exists());
+            assert!(salvage_stages(directory.path(), "target").is_empty());
+            assert_eq!(directory_snapshot(&source), source_before);
+        }
+    }
+
+    #[test]
+    fn salvage_source_change_after_staging_is_fatal_and_cleans_everything() {
+        let directory = tempdir().unwrap();
+        let source = create_verified_backup(directory.path(), false);
+        let source_before = directory_snapshot(&source);
+        let target = directory.path().join("target");
+
+        // Pass the first check after scanning and digesting. Mutate the open
+        // source at the second check, after the stage copy has been synced.
+        mutate_salvage_source_after_identity_checks(1);
+        assert!(matches!(
+            Store::salvage_from(&source, &target),
+            Err(crate::Error::SourceChanged { path }) if path == source.join("active.wlog")
+        ));
+        assert_ne!(directory_snapshot(&source), source_before);
+        assert!(!target.exists());
+        assert!(salvage_stages(directory.path(), "target").is_empty());
+    }
+
+    #[test]
+    fn salvage_source_change_during_post_check_rolls_back_the_target() {
+        let directory = tempdir().unwrap();
+        let source = create_verified_backup(directory.path(), false);
+        let source_before = directory_snapshot(&source);
+        let target = directory.path().join("target");
+
+        // Pass the checks after the source digest and stage copy, then mutate
+        // at the final source check after the published target was checked.
+        mutate_salvage_source_after_identity_checks(2);
+        assert!(matches!(
+            Store::salvage_from(&source, &target),
+            Err(crate::Error::SourceChanged { path }) if path == source.join("active.wlog")
+        ));
+        assert_ne!(directory_snapshot(&source), source_before);
+        assert!(!target.exists());
+        assert!(salvage_stages(directory.path(), "target").is_empty());
+    }
+
+    #[test]
+    fn salvage_respects_an_exclusive_writer_lock_then_succeeds_after_close() {
+        let directory = tempdir().unwrap();
+        let source = create_verified_backup(directory.path(), false);
+        let target = directory.path().join("target");
+        let writer = Store::open(&source).unwrap();
+
+        assert!(matches!(
+            Store::salvage_from(&source, &target),
+            Err(crate::Error::Locked { path }) if path == source.join("active.wlog")
+        ));
+        assert!(!target.exists());
+        assert!(salvage_stages(directory.path(), "target").is_empty());
+
+        writer.close().unwrap();
+        let report = Store::salvage_from(&source, &target).unwrap();
+        assert_eq!(report.status, SalvageStatus::Clean);
+        assert_eq!((report.recovered_commits, report.recovered_points), (2, 21));
+    }
+
+    #[test]
+    fn salvage_never_changes_existing_targets() {
+        let directory = tempdir().unwrap();
+        let source = create_verified_backup(directory.path(), false);
+        let empty = directory.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let empty_before = directory_snapshot(&empty);
+        assert_io_kind(
+            Store::salvage_from(&source, &empty).unwrap_err(),
+            std::io::ErrorKind::AlreadyExists,
+        );
+        assert_eq!(directory_snapshot(&empty), empty_before);
+
+        let working = directory.path().join("working");
+        let mut store = Store::open(&working).unwrap();
+        initialize(&mut store, Vec::new(), None);
+        store.close().unwrap();
+        let working_before = directory_snapshot(&working);
+        assert_io_kind(
+            Store::salvage_from(&source, &working).unwrap_err(),
+            std::io::ErrorKind::AlreadyExists,
+        );
+        assert_eq!(directory_snapshot(&working), working_before);
+
+        let dangling = directory.path().join("dangling");
+        std::os::unix::fs::symlink("missing-target", &dangling).unwrap();
+        assert_io_kind(
+            Store::salvage_from(&source, &dangling).unwrap_err(),
+            std::io::ErrorKind::AlreadyExists,
+        );
+        assert_eq!(
+            std::fs::read_link(&dangling).unwrap(),
+            Path::new("missing-target")
+        );
+    }
+
+    #[test]
+    fn simultaneous_salvages_publish_exactly_one_complete_target() {
+        let directory = tempdir().unwrap();
+        let source = create_verified_backup(directory.path(), false);
+        let target = directory.path().join("race-target");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let source = source.clone();
+            let target = target.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                Store::salvage_from(source, target)
+            }));
+        }
+        barrier.wait();
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let loser = results.into_iter().find_map(Result::err).unwrap();
+        assert_io_kind(loser, std::io::ErrorKind::AlreadyExists);
+        let integrity = Store::open_read_only(&target)
+            .unwrap()
+            .check_integrity()
+            .unwrap();
+        assert_eq!(integrity.raw_commits, 2);
+        assert_eq!(integrity.raw_points, 21);
+        assert!(salvage_stages(directory.path(), "race-target").is_empty());
+    }
+
+    #[test]
+    fn salvage_rejects_symlink_fifo_and_non_file_active_log_without_blocking() {
+        for kind in ["symlink", "fifo", "directory"] {
+            let directory = tempdir().unwrap();
+            let source = directory.path().join("source");
+            std::fs::create_dir(&source).unwrap();
+            let active = source.join("active.wlog");
+            match kind {
+                "symlink" => std::os::unix::fs::symlink("outside", &active).unwrap(),
+                "fifo" => create_fifo(&active),
+                "directory" => std::fs::create_dir(&active).unwrap(),
+                _ => unreachable!(),
+            }
+            let target = directory.path().join("target");
+            let error = salvage_with_deadline(source, target.clone(), &active).unwrap_err();
+            assert!(error.to_string().contains("not a regular file"));
+            assert!(!target.exists());
+            assert!(salvage_stages(directory.path(), "target").is_empty());
+        }
+    }
+
+    #[test]
+    fn salvage_rejects_a_symlink_or_non_directory_source_root() {
+        let directory = tempdir().unwrap();
+        let real_source = create_verified_backup(directory.path(), false);
+        let source_before = directory_snapshot(&real_source);
+
+        let linked_source = directory.path().join("linked-source");
+        std::os::unix::fs::symlink(&real_source, &linked_source).unwrap();
+        let linked_target = directory.path().join("linked-target");
+        assert!(Store::salvage_from(&linked_source, &linked_target).is_err());
+        assert!(!linked_target.exists());
+        assert_eq!(directory_snapshot(&real_source), source_before);
+
+        let file_source = directory.path().join("file-source");
+        std::fs::write(&file_source, b"not a directory").unwrap();
+        let file_before = std::fs::read(&file_source).unwrap();
+        let file_target = directory.path().join("file-target");
+        assert!(Store::salvage_from(&file_source, &file_target).is_err());
+        assert!(!file_target.exists());
+        assert_eq!(std::fs::read(&file_source).unwrap(), file_before);
+    }
+
+    #[test]
+    fn salvage_failures_clean_the_stage_and_leave_no_target() {
+        for step in [
+            PublicationStep::Copy,
+            PublicationStep::Sync,
+            PublicationStep::ChecksumMismatch,
+            PublicationStep::Publish,
+            PublicationStep::ParentSync,
+            PublicationStep::PostCheck,
+        ] {
+            let directory = tempdir().unwrap();
+            let source = create_verified_backup(directory.path(), false);
+            let target = directory.path().join("target");
+            fail_next_publication_step(step);
+            assert!(Store::salvage_from(&source, &target).is_err());
+            assert!(!target.exists(), "{step:?} failure left a target");
+            assert!(
+                salvage_stages(directory.path(), "target").is_empty(),
+                "{step:?} failure left a stage"
             );
         }
     }

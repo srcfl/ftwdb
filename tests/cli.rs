@@ -193,6 +193,9 @@ fn usage_errors_exit_two_on_stderr_without_creating_files() {
         &["restore"],
         &["restore", "backup"],
         &["restore", "backup", "target", "extra"],
+        &["salvage"],
+        &["salvage", "damaged-store"],
+        &["salvage", "damaged-store", "target", "extra"],
         &["generate"],
         &["bench-ftwdb"],
         &["bench-ftwdb", "workload"],
@@ -625,6 +628,108 @@ fn restore_corruption_is_a_runtime_error_and_publishes_nothing() {
     );
     assert_runtime_error(&output);
     assert!(!target.exists());
+}
+
+#[test]
+fn salvage_partial_prefix_is_successful_json_and_passes_check_store() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source");
+    let backup = directory.path().join("damaged-backup");
+    let target = directory.path().join("salvaged");
+
+    ftw(
+        directory.path(),
+        &["generate", "workload", "--sites", "1", "--days", "1"],
+    )
+    .assert_success();
+    let loaded = ftw(
+        directory.path(),
+        &["bench-ftwdb", "workload", path_str(&source)],
+    );
+    loaded.assert_success();
+    let loaded_json = json_record(&loaded);
+    let points = json_u64(&loaded_json, "points");
+    let expected_commits = 1 + points.div_ceil(10_000);
+    let checked = check_store(directory.path(), &source, points, expected_commits);
+    let checked_json = json_record(&checked);
+    let commits = json_u64(&checked_json, "raw_commits");
+
+    ftw(
+        directory.path(),
+        &["backup", path_str(&source), path_str(&backup)],
+    )
+    .assert_success();
+    let prefix = fs::read(backup.join("active.wlog")).unwrap();
+    let mut active = fs::OpenOptions::new()
+        .append(true)
+        .open(backup.join("active.wlog"))
+        .unwrap();
+    active.write_all(b"partial").unwrap();
+    active.sync_all().unwrap();
+    drop(active);
+    let source_before = snapshot_tree(&backup);
+
+    let salvaged = ftw(
+        directory.path(),
+        &["salvage", path_str(&backup), path_str(&target)],
+    );
+    salvaged.assert_success();
+    let record = json_record(&salvaged);
+    assert_eq!(json_string(&record, "format"), "ftwdb-salvage-v1");
+    assert_eq!(json_string(&record, "status"), "partial");
+    assert_eq!(json_u64(&record, "source_bytes"), prefix.len() as u64 + 7);
+    assert_eq!(
+        json_u64(&record, "recovered_prefix_bytes"),
+        prefix.len() as u64
+    );
+    assert_eq!(json_u64(&record, "discarded_bytes"), 7);
+    assert_eq!(json_u64(&record, "stop_offset"), prefix.len() as u64);
+    assert_eq!(
+        json_string(&record, "stop_reason"),
+        "incomplete-frame-header"
+    );
+    assert_eq!(json_u64(&record, "recovered_commits"), commits);
+    assert_eq!(json_u64(&record, "recovered_points"), points);
+    let source_crc = json_string(&record, "source_prefix_crc32");
+    assert_eq!(source_crc.len(), 8);
+    assert_eq!(
+        source_crc,
+        json_string(&record, "destination_snapshot_crc32")
+    );
+    assert_eq!(fs::read(target.join("active.wlog")).unwrap(), prefix);
+    check_store(directory.path(), &target, points, commits);
+    assert_eq!(snapshot_tree(&backup), source_before);
+
+    let existing = directory.path().join("existing-target");
+    fs::create_dir(&existing).unwrap();
+    fs::write(existing.join("keep"), b"unchanged").unwrap();
+    let existing_before = snapshot_tree(&existing);
+    let refused = ftw(
+        directory.path(),
+        &["salvage", path_str(&backup), path_str(&existing)],
+    );
+    assert_runtime_error(&refused);
+    assert!(refused.stderr.contains("already exists"));
+    assert_eq!(snapshot_tree(&existing), existing_before);
+}
+
+#[test]
+fn salvage_invalid_database_header_exits_one_and_publishes_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("damaged");
+    let target = directory.path().join("target");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("active.wlog"), b"not an FTWDB header").unwrap();
+    let source_before = snapshot_tree(&source);
+
+    let output = ftw(
+        directory.path(),
+        &["salvage", path_str(&source), path_str(&target)],
+    );
+    assert_runtime_error(&output);
+    assert!(output.stderr.contains("invalid FTWDB file header"));
+    assert!(!target.exists());
+    assert_eq!(snapshot_tree(&source), source_before);
 }
 
 #[test]

@@ -1,5 +1,5 @@
 use flate2::read::GzDecoder;
-use ftwdb::{Config, Durability, Store, load_real_fixture};
+use ftwdb::{Config, Durability, SalvageStatus, SalvageStopReason, Store, load_real_fixture};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
@@ -12,6 +12,7 @@ fn committed_real_fixture_loads_with_stable_identity() {
     let source = directory.path().join("source");
     let backup = directory.path().join("backup");
     let restored = directory.path().join("restored");
+    let salvaged = directory.path().join("salvaged");
     let mut store = Store::open_with(
         &source,
         Config {
@@ -52,4 +53,23 @@ fn committed_real_fixture_loads_with_stable_identity() {
         .unwrap();
     assert_eq!(restored_integrity.raw_points, 889_978);
     assert_eq!(restored_integrity.raw_commits, 89);
+
+    let salvage = Store::salvage_from(&backup, &salvaged).unwrap();
+    assert_eq!(salvage.status, SalvageStatus::Clean);
+    assert_eq!(salvage.stop_reason, SalvageStopReason::CleanEof);
+    assert_eq!(salvage.source_bytes, salvage.recovered_prefix_bytes);
+    assert_eq!(salvage.discarded_bytes, 0);
+    assert_eq!(salvage.recovered_points, 889_978);
+    assert_eq!(salvage.recovered_commits, 89);
+    assert_eq!(salvage.source_prefix_crc32, 0x9ff1_a95b);
+    assert_eq!(
+        salvage.source_prefix_crc32,
+        salvage.destination_snapshot_crc32
+    );
+    let salvaged_integrity = Store::open_read_only(&salvaged)
+        .unwrap()
+        .check_integrity()
+        .unwrap();
+    assert_eq!(salvaged_integrity.raw_points, 889_978);
+    assert_eq!(salvaged_integrity.raw_commits, 89);
 }
