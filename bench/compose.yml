@@ -1,0 +1,99 @@
+name: wattdb-bench
+
+services:
+  victoriametrics:
+    profiles: ["victoriametrics"]
+    image: victoriametrics/victoria-metrics:v1.148.0@sha256:407013e902f9a0ba1d4b2d4c077c47bbaf917c893c52ff39b19efe83a654afda
+    command:
+      - -storageDataPath=/data
+      - -retentionPeriod=100y
+    ports: ["8428:8428"]
+    volumes: ["victoriametrics:/data"]
+    cpus: ${BENCH_CPUS:-4.0}
+    mem_limit: ${BENCH_MEMORY:-4g}
+
+  questdb:
+    profiles: ["questdb"]
+    image: questdb/questdb:9.4.3@sha256:3fd139f9f16015afc1b064fe4591b271be26cdec10315415e5511e9d80a5919e
+    environment:
+      QDB_TELEMETRY_ENABLED: "false"
+    ports: ["9000:9000", "8812:8812", "9009:9009"]
+    volumes: ["questdb:/var/lib/questdb"]
+    cpus: ${BENCH_CPUS:-4.0}
+    mem_limit: ${BENCH_MEMORY:-4g}
+
+  timescaledb:
+    profiles: ["timescaledb"]
+    image: timescale/timescaledb:2.28.3-pg18@sha256:2c718e700b1c75b93488085596f2254c991c3aa29584fc282ebbe62fd8335791
+    environment:
+      POSTGRES_PASSWORD: wattdb-benchmark
+      POSTGRES_DB: energy
+    ports: ["5432:5432"]
+    volumes: ["timescaledb:/var/lib/postgresql"]
+    cpus: ${BENCH_CPUS:-4.0}
+    mem_limit: ${BENCH_MEMORY:-4g}
+
+  clickhouse:
+    profiles: ["clickhouse"]
+    image: clickhouse/clickhouse-server:26.6.2.81@sha256:140f3f799480b4b5c53c35333398ed76598fcdb546b3e2fd64f582b075a64adc
+    environment:
+      CLICKHOUSE_DB: energy
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports: ["8430:8123", "9001:9000"]
+    volumes: ["clickhouse:/var/lib/clickhouse"]
+    cpus: ${BENCH_CPUS:-4.0}
+    mem_limit: ${BENCH_MEMORY:-4g}
+
+  greptimedb:
+    profiles: ["greptimedb"]
+    image: greptime/greptimedb:v1.1.3@sha256:9c5017e61fa63ab1ce78cbc4b1b7df0128b844327840890e2b388e68503c30b2
+    command: standalone start --http-addr 0.0.0.0:4000 --rpc-addr 0.0.0.0:4001 --mysql-addr 0.0.0.0:4002
+    ports: ["4000:4000", "4001:4001", "4002:4002"]
+    volumes: ["greptimedb:/tmp/greptimedb"]
+    cpus: ${BENCH_CPUS:-4.0}
+    mem_limit: ${BENCH_MEMORY:-4g}
+
+  iotdb:
+    profiles: ["iotdb"]
+    image: apache/iotdb:2.0.10-standalone@sha256:014c15f1c7154a2910bae205ae415c38883d26b686c55eca1b4887fe7c4f8110
+    ports: ["6667:6667", "18080:18080"]
+    volumes:
+      - iotdb-data:/iotdb/data
+      - iotdb-logs:/iotdb/logs
+    cpus: ${BENCH_CPUS:-4.0}
+    mem_limit: ${BENCH_MEMORY:-4g}
+
+  influxdb:
+    profiles: ["influxdb"]
+    image: influxdb:3.10.0-core@sha256:b3e577f38c19963597170d8850a3a7f77af8f0cfa866c64cd13e5de0f238e114
+    command:
+      - influxdb3
+      - serve
+      - --node-id=wattdb-bench
+      - --object-store=file
+      - --data-dir=/var/lib/influxdb3
+      - --without-auth
+    ports: ["8181:8181"]
+    volumes: ["influxdb:/var/lib/influxdb3"]
+    cpus: ${BENCH_CPUS:-4.0}
+    mem_limit: ${BENCH_MEMORY:-4g}
+
+  tdengine:
+    profiles: ["tdengine"]
+    image: tdengine/tdengine@sha256:79d32ce8a42f64c7dbfc33946a36b3e176ea23c0cd695a1bc9e8aa889ca03b88
+    ports: ["6030:6030", "6041:6041"]
+    volumes: ["tdengine:/var/lib/taos"]
+    cpus: ${BENCH_CPUS:-4.0}
+    mem_limit: ${BENCH_MEMORY:-4g}
+
+volumes:
+  victoriametrics:
+  questdb:
+  timescaledb:
+  clickhouse:
+  greptimedb:
+  iotdb-data:
+  iotdb-logs:
+  influxdb:
+  tdengine:
+
