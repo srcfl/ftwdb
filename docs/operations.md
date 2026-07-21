@@ -67,3 +67,18 @@ real ext4 filesystem on the 64 MiB NBD profile, writes durable fixture batches
 until `ENOSPC`, then checks the readable durable prefix. See the emulator
 README for its command, output files, and pass result. This does not replace
 the M4 physical SD-card power-cut release gate.
+
+## Command-line checks
+
+`tests/cli.rs` runs the built `ftw` binary as a subprocess. It fixes the usage
+contract at exit code 2 with usage text on standard error, while data, file,
+and store errors use exit code 1. The test covers the generated workload,
+sanitized real fixture, TSBS IoT, integrity check, log inspection, and backup
+paths. It parses each promised JSON record and checks its main counts and
+status fields.
+
+The test also snapshots every path and every file byte in a store before and
+after both `check-store` and `inspect`. Separate missing-path checks prove that
+neither command creates its input. The backup check covers linked and copied
+file counts plus the hard-link fallback count on a normal local filesystem.
+Restore drills, salvage, and physical SD-card tests remain M4 work.
