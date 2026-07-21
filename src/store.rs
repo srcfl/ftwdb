@@ -183,6 +183,21 @@ impl Store {
 
     /// Commits catalog and data records atomically, then durably advances the
     /// rollup manifest if new points affect or supersede materialized state.
+    ///
+    /// A transaction tagged with [`Transaction::with_commit_id`] makes a
+    /// retry of this multi-step sequence safe. The identifier is checked
+    /// inside [`Database::commit`] before the raw frame is written, so a
+    /// replayed commit stores nothing and reports [`Commit::deduplicated`].
+    /// The failure mode this closes: the raw commit becomes durable, then
+    /// manifest advancement fails and poisons this store (or the process
+    /// crashes), so the caller saw an error for data that is permanently in
+    /// the log. After reopening the store, recovery has rebuilt the
+    /// identifier set from the log and `verify_and_reconcile_manifest` has
+    /// already invalidated any rollup whose provenance trails the raw log —
+    /// exactly the invalidation the failed advancement would have published.
+    /// The retried commit therefore returns `Ok` with `deduplicated: true`,
+    /// and this method skips manifest advancement for it: the points were
+    /// not rewritten, and rollup provenance is already reconciled.
     pub fn commit(&mut self, transaction: Transaction) -> Result<Commit> {
         self.ensure_writable()?;
         let committed_points: Vec<Point> = transaction
@@ -196,6 +211,9 @@ impl Store {
             .copied()
             .collect();
         let mut commit = self.database.commit(transaction)?;
+        if commit.deduplicated {
+            return Ok(commit);
+        }
         if !committed_points.is_empty() && self.manifest.rollups.iter().any(|rollup| rollup.active)
         {
             if !commit.durable {
@@ -1441,6 +1459,108 @@ mod tests {
                 .unwrap()
                 .source,
             RollupSource::Raw
+        );
+    }
+
+    #[test]
+    fn identified_commit_retries_safely_after_a_crash_before_manifest_advance() {
+        let directory = tempdir().unwrap();
+        let resolution = RollupResolution::FixedMicros(5 * SECOND);
+        let mut correction = Point::actual(1, 6 * SECOND, 100.0);
+        correction.change_time = 30 * SECOND;
+        let points_before;
+        {
+            let mut store = Store::open(directory.path()).unwrap();
+            initialize(
+                &mut store,
+                vec![RollupTier {
+                    resolution: resolution.clone(),
+                    retain_for_micros: None,
+                }],
+                None,
+            );
+            let mut transaction = Transaction::new();
+            transaction.append_points(points());
+            store.commit(transaction).unwrap();
+            store.maintain(DAY).unwrap();
+            points_before = store.database().stats().unwrap().points;
+        }
+        // Simulate the issue-#8 failure: the raw frame became durable, then
+        // the store failed (crashed) before manifest advancement, so the
+        // caller never got an acknowledgement for permanently stored points.
+        {
+            let mut database = crate::Database::open(directory.path().join("active.wlog")).unwrap();
+            let mut transaction = Transaction::new();
+            transaction
+                .append_points(vec![correction])
+                .with_commit_id(42);
+            database.commit(transaction).unwrap();
+            database.close().unwrap();
+        }
+
+        // Opening the store reconciles rollup provenance with the raw log —
+        // the invalidation the failed advancement never published.
+        let mut store = Store::open(directory.path()).unwrap();
+        assert_eq!(
+            store
+                .query_gauge(1, 0, 20 * SECOND, &resolution)
+                .unwrap()
+                .source,
+            RollupSource::Raw
+        );
+        // The retried commit is answered from the log without writing.
+        let mut retry = Transaction::new();
+        retry.append_points(vec![correction]).with_commit_id(42);
+        let generation_before = store.manifest_generation();
+        let commit = store.commit(retry).unwrap();
+        assert!(commit.deduplicated);
+        assert_eq!(commit.points, 0);
+        assert_eq!(store.manifest_generation(), generation_before);
+        assert_eq!(store.database().stats().unwrap().points, points_before + 1);
+        assert_eq!(
+            store
+                .database()
+                .query_history(1, 6 * SECOND, 6 * SECOND + 1)
+                .len(),
+            2 // the original sixth-second sample plus exactly one correction
+        );
+        // Maintenance then rebuilds the invalidated rollup as usual.
+        store.maintain(DAY).unwrap();
+        assert_eq!(
+            store
+                .query_gauge(1, 0, 20 * SECOND, &resolution)
+                .unwrap()
+                .source,
+            RollupSource::Materialized
+        );
+    }
+
+    #[test]
+    fn identified_store_commit_deduplicates_across_reopen() {
+        let directory = tempdir().unwrap();
+        let sample = Point::actual(1, 6 * SECOND, 6.0);
+        {
+            let mut store = Store::open(directory.path()).unwrap();
+            initialize(&mut store, Vec::new(), None);
+            let mut transaction = Transaction::new();
+            transaction.append_points(vec![sample]).with_commit_id(7);
+            assert!(!store.commit(transaction).unwrap().deduplicated);
+            store.close().unwrap();
+        }
+        let mut store = Store::open(directory.path()).unwrap();
+        let mut retry = Transaction::new();
+        retry.append_points(vec![sample]).with_commit_id(7);
+        assert!(store.commit(retry).unwrap().deduplicated);
+        // A different identifier commits independently.
+        let mut other = Transaction::new();
+        other
+            .append_points(vec![Point::actual(1, 7 * SECOND, 7.0)])
+            .with_commit_id(8);
+        assert!(!store.commit(other).unwrap().deduplicated);
+        assert_eq!(store.database().stats().unwrap().points, 2);
+        assert_eq!(
+            store.database().query_history(1, 0, DAY).len(),
+            2 // each identified commit's point appears exactly once
         );
     }
 

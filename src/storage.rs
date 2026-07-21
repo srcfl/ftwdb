@@ -5,7 +5,7 @@ use crate::segment::{Segment, SegmentStats};
 use crate::transaction::{Record, Transaction};
 use crc32fast::hash;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -19,6 +19,18 @@ const FRAME_HEADER_BYTES: usize = 24;
 const POINT_BYTES: usize = 72;
 const FRAME_KIND_LEGACY_POINTS: u16 = 0;
 const FRAME_KIND_TRANSACTION: u16 = 1;
+/// A transaction frame carrying a client-supplied idempotency identifier.
+///
+/// Format evolution follows the existing frame-kind precedent (kinds 0 and 1
+/// already coexist): a new kind keeps every old log byte-for-byte decodable
+/// and keeps identifier-less commits writing exactly the kind-1 frames they
+/// always wrote. The payload is the 16-byte little-endian commit identifier
+/// followed by an unmodified kind-1 transaction payload, so the identifier
+/// lives in the same checksummed durable unit as the records it protects —
+/// a separate identifier frame would reintroduce the torn-window problem
+/// this feature exists to close.
+const FRAME_KIND_IDENTIFIED_TRANSACTION: u16 = 2;
+const COMMIT_ID_BYTES: usize = 16;
 const TRANSACTION_MAGIC: &[u8; 4] = b"WTXN";
 const TRANSACTION_VERSION: u16 = 1;
 const TRANSACTION_HEADER_BYTES: usize = 12;
@@ -104,6 +116,11 @@ pub struct Commit {
     pub records: usize,
     pub bytes_written: u64,
     pub durable: bool,
+    /// True when the transaction's [`Transaction::with_commit_id`] identifier
+    /// was already committed, so this call wrote nothing: the original
+    /// commit's records and points are stored exactly once. `points`,
+    /// `records`, and `bytes_written` are zero for such a replayed commit.
+    pub deduplicated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -132,6 +149,12 @@ pub struct Database {
     read_only: bool,
     index: HashMap<u64, Vec<Point>>,
     catalog: Catalog,
+    /// Every client-supplied commit identifier in the log, rebuilt on open by
+    /// `scan_and_recover` so idempotency survives a crash or reopen. Growth is
+    /// one `u128` plus hash overhead per identified commit for the life of the
+    /// log — acceptable because the whole log is already replayed into memory
+    /// by design (the README acknowledges that ceiling).
+    commit_ids: HashSet<u128>,
     commits: u64,
     points: u64,
     catalog_records: u64,
@@ -226,6 +249,7 @@ impl Database {
             read_only,
             index: scan.index,
             catalog: scan.catalog,
+            commit_ids: scan.commit_ids,
             commits: scan.commits,
             points: scan.points,
             catalog_records: scan.catalog_records,
@@ -265,6 +289,7 @@ impl Database {
                 records: 0,
                 bytes_written: 0,
                 durable: self.bytes_since_sync == 0,
+                deduplicated: false,
             });
         }
 
@@ -334,16 +359,39 @@ impl Database {
             records: 1,
             bytes_written,
             durable,
+            deduplicated: false,
         })
     }
 
     /// Atomically commits catalog changes and point batches in one frame.
+    ///
+    /// When the transaction carries a [`Transaction::with_commit_id`]
+    /// identifier that is already in the log, nothing is validated or
+    /// written and the returned commit reports
+    /// [`Commit::deduplicated`]: the identifier is checked before any other
+    /// work, so a retried commit can never duplicate points. The check keys
+    /// on the identifier alone — a retry that reuses an identifier with
+    /// different records is also answered from the original commit. An empty
+    /// transaction writes no frame, so its identifier (if any) is not
+    /// recorded; there is nothing a replay could duplicate.
     pub fn commit(&mut self, transaction: Transaction) -> Result<Commit> {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
         if self.poisoned {
             return Err(Error::Poisoned);
+        }
+        if let Some(commit_id) = transaction.commit_id
+            && self.commit_ids.contains(&commit_id)
+        {
+            return Ok(Commit {
+                frame_offset: self.file.seek(SeekFrom::End(0))?,
+                points: 0,
+                records: 0,
+                bytes_written: 0,
+                durable: self.bytes_since_sync == 0,
+                deduplicated: true,
+            });
         }
         if transaction.is_empty() {
             return Ok(Commit {
@@ -352,6 +400,7 @@ impl Database {
                 records: 0,
                 bytes_written: 0,
                 durable: self.bytes_since_sync == 0,
+                deduplicated: false,
             });
         }
         let point_count = transaction.point_count();
@@ -375,12 +424,13 @@ impl Database {
             .map_err(|_| Error::Serialization("transaction exceeds u32 length".to_owned()))?;
         let record_count = u32::try_from(transaction.record_count())
             .map_err(|_| Error::Serialization("too many transaction records".to_owned()))?;
-        let frame_header = encode_frame_header(
-            FRAME_KIND_TRANSACTION,
-            record_count,
-            payload_len,
-            hash(&payload),
-        );
+        let frame_kind = if transaction.commit_id.is_some() {
+            FRAME_KIND_IDENTIFIED_TRANSACTION
+        } else {
+            FRAME_KIND_TRANSACTION
+        };
+        let frame_header =
+            encode_frame_header(frame_kind, record_count, payload_len, hash(&payload));
         let bytes_written = (FRAME_HEADER_BYTES + payload.len()) as u64;
         let frame_offset = self.file.seek(SeekFrom::End(0))?;
         let durable = self.write_frame(&frame_header, &payload, bytes_written)?;
@@ -393,6 +443,9 @@ impl Database {
             }
         }
         self.catalog = candidate_catalog;
+        if let Some(commit_id) = transaction.commit_id {
+            self.commit_ids.insert(commit_id);
+        }
         self.commits += 1;
         self.points += point_count as u64;
         let metadata_records = transaction.record_count()
@@ -409,7 +462,15 @@ impl Database {
             records: transaction.record_count(),
             bytes_written,
             durable,
+            deduplicated: false,
         })
+    }
+
+    /// Whether a [`Transaction::with_commit_id`] identifier has been applied
+    /// by this handle — recovered from the log on open or committed since.
+    #[must_use]
+    pub fn contains_commit_id(&self, commit_id: u128) -> bool {
+        self.commit_ids.contains(&commit_id)
     }
 
     fn write_frame(
@@ -680,6 +741,7 @@ fn write_database_header(file: &mut File) -> Result<()> {
 struct Scan {
     index: HashMap<u64, Vec<Point>>,
     catalog: Catalog,
+    commit_ids: HashSet<u128>,
     commits: u64,
     points: u64,
     catalog_records: u64,
@@ -714,6 +776,7 @@ fn scan_and_recover(
     let mut offset = DATABASE_HEADER_BYTES as u64;
     let mut index = HashMap::<u64, Vec<Point>>::new();
     let mut catalog = Catalog::default();
+    let mut commit_ids = HashSet::<u128>::new();
     let mut commits = 0_u64;
     let mut points = 0_u64;
     let mut catalog_records = 0_u64;
@@ -759,9 +822,14 @@ fn scan_and_recover(
             if item_count > max_batch_points || payload_len != expected_payload_len {
                 return corruption(offset, "invalid legacy point frame size");
             }
-        } else if frame_kind == FRAME_KIND_TRANSACTION {
+        } else if frame_kind == FRAME_KIND_TRANSACTION
+            || frame_kind == FRAME_KIND_IDENTIFIED_TRANSACTION
+        {
             if payload_len > max_transaction_bytes {
                 return corruption(offset, "transaction frame exceeds configured maximum");
+            }
+            if frame_kind == FRAME_KIND_IDENTIFIED_TRANSACTION && payload_len < COMMIT_ID_BYTES {
+                return corruption(offset, "identified transaction frame is too short");
             }
         } else {
             return corruption(offset, "unknown frame kind");
@@ -796,7 +864,20 @@ fn scan_and_recover(
             }
             points += item_count as u64;
         } else {
-            let records = decode_transaction(&payload, item_count, offset)?;
+            let transaction_payload = if frame_kind == FRAME_KIND_IDENTIFIED_TRANSACTION {
+                let commit_id = u128::from_le_bytes(payload[..COMMIT_ID_BYTES].try_into().unwrap());
+                // The writer refuses to append a frame whose identifier is
+                // already in the log, so a duplicate here can only come from
+                // tampering (say, concatenated logs); failing closed keeps
+                // the exactly-once promise instead of silently replaying.
+                if !commit_ids.insert(commit_id) {
+                    return corruption(offset, "duplicate commit identifier");
+                }
+                &payload[COMMIT_ID_BYTES..]
+            } else {
+                &payload[..]
+            };
+            let records = decode_transaction(transaction_payload, item_count, offset)?;
             catalog.apply_recovered(&records, offset)?;
             let recovered_point_count: usize = records
                 .iter()
@@ -827,6 +908,7 @@ fn scan_and_recover(
     Ok(Scan {
         index,
         catalog,
+        commit_ids,
         commits,
         points,
         catalog_records,
@@ -893,6 +975,12 @@ fn encode_transaction(transaction: &Transaction) -> Result<Vec<u8>> {
     let record_count = u32::try_from(transaction.record_count())
         .map_err(|_| Error::Serialization("too many transaction records".to_owned()))?;
     let mut payload = Vec::new();
+    // An identified transaction (frame kind 2) is the 16-byte little-endian
+    // commit identifier followed by the unchanged kind-1 payload, keeping the
+    // identifier in the same checksummed durable unit as the records.
+    if let Some(commit_id) = transaction.commit_id {
+        payload.extend_from_slice(&commit_id.to_le_bytes());
+    }
     payload.extend_from_slice(TRANSACTION_MAGIC);
     payload.extend_from_slice(&TRANSACTION_VERSION.to_le_bytes());
     payload.extend_from_slice(&0_u16.to_le_bytes());
@@ -1528,6 +1616,149 @@ mod tests {
         assert_eq!(comparison.len(), 1);
         assert_eq!(comparison[0].difference, Some(-200.0));
         assert_eq!(database.stats().unwrap().catalog_records, 4);
+    }
+
+    #[test]
+    fn identified_commit_replays_as_a_no_op_after_reopen() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("idempotent.ftwdb");
+        let mut telemetry = point(100, 10, 10, 1.0);
+        telemetry.run_id = 0;
+        let build = |value: Point, commit_id: u128| {
+            let mut transaction = Transaction::new();
+            transaction
+                .upsert_entity(home())
+                .define_series(power_series())
+                .append_points(vec![value])
+                .with_commit_id(commit_id);
+            transaction
+        };
+        {
+            let mut database = Database::open(&path).unwrap();
+            // Zero is an ordinary identifier, not a sentinel.
+            let commit = database.commit(build(telemetry, 0)).unwrap();
+            assert!(!commit.deduplicated);
+            assert_eq!(commit.points, 1);
+            database.close().unwrap();
+        }
+
+        // The crash-and-retry scenario: the acknowledgement was lost, but the
+        // frame was durable, so the retried commit must not write again.
+        let mut database = Database::open(&path).unwrap();
+        assert!(database.contains_commit_id(0));
+        let commit = database.commit(build(telemetry, 0)).unwrap();
+        assert!(commit.deduplicated);
+        assert_eq!(commit.points, 0);
+        assert_eq!(commit.records, 0);
+        assert_eq!(commit.bytes_written, 0);
+        assert_eq!(database.stats().unwrap().points, 1);
+        assert_eq!(database.query_history(7, 0, 1_000).len(), 1);
+
+        // A different identifier is an independent commit; retrying it within
+        // the same session is deduplicated without a reopen.
+        let mut revision = point(100, 20, 20, 2.0);
+        revision.run_id = 0;
+        let mut second = Transaction::new();
+        second.append_points(vec![revision]).with_commit_id(1);
+        assert!(!database.commit(second.clone()).unwrap().deduplicated);
+        assert!(database.commit(second).unwrap().deduplicated);
+        assert_eq!(database.stats().unwrap().points, 2);
+        assert_eq!(database.query_history(7, 0, 1_000).len(), 2);
+        database.close().unwrap();
+    }
+
+    #[test]
+    fn identifier_less_commits_stay_at_least_once() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("at-least-once.ftwdb");
+        let mut database = Database::open(&path).unwrap();
+        let mut telemetry = point(100, 10, 10, 1.0);
+        telemetry.run_id = 0;
+        let mut first = Transaction::new();
+        first
+            .upsert_entity(home())
+            .define_series(power_series())
+            .append_points(vec![telemetry]);
+        database.commit(first).unwrap();
+        // Without an identifier there is no dedup key: an identical retried
+        // commit stores the point twice. This documented at-least-once path
+        // is exactly today's behavior.
+        let mut retry = Transaction::new();
+        retry.append_points(vec![telemetry]);
+        let commit = database.commit(retry).unwrap();
+        assert!(!commit.deduplicated);
+        assert_eq!(commit.points, 1);
+        assert_eq!(database.stats().unwrap().points, 2);
+        assert_eq!(database.query_history(7, 0, 1_000).len(), 2);
+    }
+
+    #[test]
+    fn torn_identified_frame_forgets_its_identifier() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("torn-identified.ftwdb");
+        let mut telemetry = point(100, 10, 10, 1.0);
+        telemetry.run_id = 0;
+        {
+            let mut database = Database::open(&path).unwrap();
+            let mut catalog = Transaction::new();
+            catalog.upsert_entity(home()).define_series(power_series());
+            database.commit(catalog).unwrap();
+            let mut identified = Transaction::new();
+            identified.append_points(vec![telemetry]).with_commit_id(77);
+            database.commit(identified).unwrap();
+            database.close().unwrap();
+        }
+        // Tear the identified frame: identifier and points vanish together,
+        // because they share one durable unit.
+        let full_length = std::fs::metadata(&path).unwrap().len();
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(full_length - 7).unwrap();
+        drop(file);
+
+        let mut database = Database::open(&path).unwrap();
+        assert!(!database.contains_commit_id(77));
+        assert_eq!(database.stats().unwrap().points, 0);
+        // The retry is a genuine first commit and stores the point once.
+        let mut retry = Transaction::new();
+        retry.append_points(vec![telemetry]).with_commit_id(77);
+        assert!(!database.commit(retry).unwrap().deduplicated);
+        assert_eq!(database.stats().unwrap().points, 1);
+        assert_eq!(database.query_history(7, 0, 1_000).len(), 1);
+    }
+
+    #[test]
+    fn identified_and_identifier_less_frames_coexist_in_one_log() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("mixed-kinds.ftwdb");
+        let mut telemetry = point(100, 10, 10, 1.0);
+        telemetry.run_id = 0;
+        {
+            let mut database = Database::open(&path).unwrap();
+            // Kind 0: the legacy point frame.
+            database.append(&[point(50, 5, 5, 0.5)]).unwrap();
+            // Kind 1: an identifier-less transaction, byte-identical to what
+            // the code wrote before identified frames existed.
+            let mut plain = Transaction::new();
+            plain
+                .upsert_entity(home())
+                .define_series(power_series())
+                .append_points(vec![telemetry]);
+            database.commit(plain).unwrap();
+            // Kind 2: an identified transaction.
+            let mut revision = point(100, 20, 20, 2.0);
+            revision.run_id = 0;
+            let mut identified = Transaction::new();
+            identified.append_points(vec![revision]).with_commit_id(9);
+            database.commit(identified).unwrap();
+            database.close().unwrap();
+        }
+        let database = Database::open(&path).unwrap();
+        let stats = database.stats().unwrap();
+        assert_eq!(stats.points, 3);
+        assert_eq!(stats.commits, 3);
+        assert_eq!(stats.catalog_records, 2);
+        assert!(database.contains_commit_id(9));
+        assert!(!database.contains_commit_id(77));
     }
 
     #[test]
