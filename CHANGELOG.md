@@ -6,6 +6,11 @@ steps in [docs/releases.md](docs/releases.md).
 
 ## [Unreleased]
 
+### Fixed
+
+- Release publication now reads notes from the annotated tag through a file,
+  which works with an explicit GitHub repository target.
+
 ## [0.1.0-alpha.1] - 2026-07-21
 
 First public evaluation release.
