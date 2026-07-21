@@ -1,3 +1,4 @@
+use crate::storage::sync_parent_directory;
 use crate::{Error, Point, Result};
 use crc32fast::hash;
 use lz4_flex::block::{compress_prepend_size, decompress};
@@ -97,9 +98,9 @@ impl Segment {
             let _ = std::fs::remove_file(&temporary);
             return Err(Error::Io(error));
         }
-        sync_parent(path)?;
+        sync_parent_directory(path)?;
         std::fs::remove_file(&temporary)?;
-        sync_parent(path)?;
+        sync_parent_directory(path)?;
         Ok(stats)
     }
 
@@ -774,12 +775,6 @@ fn temporary_path(path: &Path) -> Result<PathBuf> {
         file_name.to_string_lossy(),
         std::process::id()
     )))
-}
-
-fn sync_parent(path: &Path) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    File::open(parent)?.sync_all()?;
-    Ok(())
 }
 
 fn corruption<T>(offset: u64, reason: &str) -> Result<T> {

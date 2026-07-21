@@ -7,6 +7,9 @@ description = "Forecasts, Telemetry & Watts: an SD-card-conscious embedded energ
 license = "Apache-2.0"
 repository = "https://github.com/srcfl/ftwdb"
 
+[package.metadata.ftwdb]
+support = "Unix targets only; Linux and macOS are tested in CI"
+
 [dependencies]
 crc32fast = "1.5.0"
 flate2 = "1.1.5"

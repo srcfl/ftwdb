@@ -5,6 +5,9 @@
 //! checksummed commit log, crash-tail recovery, bitemporal queries, and
 //! mergeable energy aggregates. It is not yet production-ready.
 
+#[cfg(not(unix))]
+compile_error!("FTWDB v0.1 supports Unix targets only; use Linux or macOS");
+
 mod aggregate;
 mod catalog;
 mod error;

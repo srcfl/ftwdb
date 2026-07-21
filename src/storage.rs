@@ -945,9 +945,9 @@ fn scan_and_recover(
     })
 }
 
-/// Makes a directory's entries durable, exactly like segment and manifest
-/// publication do for their parents. Opening the directory and syncing it is
-/// Unix semantics; Windows support is tracked separately (issue #15).
+/// Makes a directory's entries durable after creating, linking, renaming, or
+/// removing an entry. FTWDB v0.1 only builds on Unix because this guarantee
+/// depends on opening and syncing the directory itself.
 pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
     Ok(())
@@ -1384,6 +1384,16 @@ mod tests {
         // `Path::parent` reports an unopenable empty parent for a bare file
         // name; the creation sync must target the current directory instead.
         assert_eq!(parent_directory(Path::new("active.wlog")), Path::new("."));
+    }
+
+    #[test]
+    fn directory_sync_helpers_accept_directories_and_parent_paths() {
+        let directory = tempdir().unwrap();
+        let nested = directory.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+
+        super::sync_directory(&nested).unwrap();
+        super::sync_parent_directory(&nested.join("new-entry")).unwrap();
     }
 
     #[test]

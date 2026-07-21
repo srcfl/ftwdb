@@ -1,7 +1,8 @@
+use crate::storage::sync_parent_directory;
 use crate::{Error, GaugeBucket, Result, Sample};
 use crc32fast::hash;
 use lz4_flex::block::{compress_prepend_size, decompress};
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -62,9 +63,9 @@ impl RollupSegment {
             let _ = std::fs::remove_file(&temporary);
             return Err(Error::Io(error));
         }
-        sync_parent(path)?;
+        sync_parent_directory(path)?;
         std::fs::remove_file(&temporary)?;
-        sync_parent(path)?;
+        sync_parent_directory(path)?;
         Ok(stats)
     }
 
@@ -354,14 +355,6 @@ fn temporary_path(path: &Path) -> Result<PathBuf> {
         .unwrap_or_default()
         .as_nanos();
     Ok(parent.join(format!(".{file_name}.tmp-{}-{nonce}", std::process::id())))
-}
-
-fn sync_parent(path: &Path) -> Result<()> {
-    let parent = path.parent().ok_or(Error::InvalidConfig(
-        "rollup segment path must have a parent directory",
-    ))?;
-    File::open(parent)?.sync_all()?;
-    Ok(())
 }
 
 fn corruption<T>(offset: u64, reason: &str) -> Result<T> {

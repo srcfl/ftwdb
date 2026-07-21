@@ -26,6 +26,14 @@ It is **not production-ready**. The active log still rebuilds an in-memory read
 index, raw compaction/deletion is intentionally disabled, and real SD-card
 power-cut evidence has not yet been collected.
 
+## Platform support
+
+FTWDB v0.1 supports Unix targets only. CI tests Ubuntu Linux and macOS. A build
+for a non-Unix target stops with a clear compile error; FTWDB does not replace
+directory syncs with no-ops because that would weaken the stated durability
+contract. The NBD block-device smoke test needs Linux and runs separately from
+the portable Linux/macOS CI matrix.
+
 ## Quick start
 
 ```sh
