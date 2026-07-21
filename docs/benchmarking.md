@@ -36,6 +36,11 @@ The deterministic generator must include power gauges, cumulative meters,
 interval energy, SoC, price, weather, quality gaps, DST transitions, forecast
 revisions, optimization plans, and actual outcomes.
 
+The checked-in `bench/fixtures/ftw-real-v1` data adds a fixed replay from a
+running FTW installation. Use it to catch assumptions that fit the generator
+but not real cadence, jitter, gaps, or value distributions. Its aliases and
+time offsets are part of the fixture identity; do not restore source metadata.
+
 ## Query suite
 
 - latest point for one and many series;
@@ -76,10 +81,15 @@ offer a mode are marked unsupported rather than silently compared.
 5. Long soak plus physical power-cut rig. Docker-on-macOS numbers are developer
    feedback, not SD-card evidence.
 
+The standalone Rust [SD-card emulator](../bench/sd-card-emulator/README.md)
+adds an NBD block-device stage between Docker bandwidth limits and target-card
+tests. Run FTWDB on ext4, F2FS, or FAT over that device. Keep emulator results
+separate from physical-card results and record the profile, seed, fault point,
+acknowledged watermark, filesystem repair result, and emulator statistics.
+
 ## Statistical rules
 
 Use a fixed seed and input checksum, at least one warm-up, at least five fresh
 database repetitions, and confidence intervals. Retain every raw sample. Verify
 result equivalence before ranking performance. Do not combine server/network
 latency with embedded-call latency in one chart.
-

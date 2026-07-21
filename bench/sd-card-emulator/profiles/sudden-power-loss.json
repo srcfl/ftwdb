@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "name": "sudden-power-loss",
+  "device": {
+    "size_bytes": 1073741824,
+    "logical_block_bytes": 4096,
+    "erase_block_bytes": 4194304
+  },
+  "read": {
+    "bandwidth_bytes_per_second": 73400320,
+    "iops": 1500,
+    "base_latency_us": 1000,
+    "jitter_latency_us": 3000,
+    "spike_probability_ppm": 2000,
+    "spike_latency_us_min": 100000,
+    "spike_latency_us_max": 1000000
+  },
+  "write": {
+    "bandwidth_bytes_per_second": 20971520,
+    "iops": 300,
+    "base_latency_us": 4000,
+    "jitter_latency_us": 10000,
+    "spike_probability_ppm": 10000,
+    "spike_latency_us_min": 100000,
+    "spike_latency_us_max": 3000000
+  },
+  "cache": {
+    "enabled": true,
+    "max_bytes": 8388608,
+    "false_flush_probability_ppm": 10000,
+    "power_loss_persist_probability_ppm": 200000,
+    "power_loss_torn_probability_ppm": 200000,
+    "power_loss_reorder_probability_ppm": 750000
+  },
+  "wear": {
+    "enabled": false,
+    "accelerated_factor": 1,
+    "warning_cycles": 1000,
+    "failure_cycles": 2000,
+    "worn_eio_probability_ppm": 0,
+    "read_only_after_bad_blocks": 0
+  },
+  "faults": {
+    "eio_probability_ppm": 0,
+    "torn_write_probability_ppm": 0,
+    "silent_corruption_probability_ppm": 0,
+    "power_loss_after_ops": 1000,
+    "read_only_after_ops": null,
+    "disappear_after_ops": null
+  }
+}

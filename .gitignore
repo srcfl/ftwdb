@@ -1,4 +1,5 @@
 /target/
+/bench/sd-card-emulator/target/
 /bench-results/
 __pycache__/
 /.DS_Store
