@@ -1,6 +1,6 @@
 use crate::{Error, Point, Result};
 use crc32fast::hash;
-use lz4_flex::block::{compress_prepend_size, decompress_size_prepended};
+use lz4_flex::block::{compress_prepend_size, decompress};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -24,6 +24,10 @@ const COLUMN_COUNT: usize = 7;
 /// timestamp, valid-end, knowledge, change, run-id, and value columns plus two
 /// in the quality/flags column, so eight bytes is a hard lower bound per point.
 const MIN_ENCODED_POINT_BYTES: u64 = 8;
+/// A conservative per-point ceiling: four ten-byte i64 varints, a 19-byte
+/// u128 run-id varint, a ten-byte value varint, and up to twenty bytes for
+/// quality and flags. The writer never exceeds it for any point.
+const MAX_ENCODED_POINT_BYTES: u64 = 89;
 /// The LZ4 block format cannot expand one compressed byte into more than 255
 /// output bytes, so a payload bounds its decompressed size by this ratio.
 const MAX_LZ4_RATIO: u64 = 255;
@@ -516,6 +520,14 @@ fn read_block(file: &mut File, entry: IndexEntry) -> Result<Vec<Point>> {
     {
         return corruption(entry.offset, "block header disagrees with index");
     }
+    // The claimed uncompressed length sizes the decompression buffer, so pin
+    // it to what `points` column-encoded points can actually occupy before
+    // trusting it.
+    if (uncompressed_len as u64) < minimum_encoded_bytes(u64::from(points))
+        || uncompressed_len as u64 > maximum_encoded_bytes(u64::from(points))
+    {
+        return corruption(entry.offset, "block uncompressed length is out of bounds");
+    }
     let mut payload = vec![0_u8; payload_len];
     file.read_exact(&mut payload)?;
     if hash(&payload) != expected_payload_crc {
@@ -524,7 +536,19 @@ fn read_block(file: &mut File, entry: IndexEntry) -> Result<Vec<Point>> {
     let decoded = match compression {
         COMPRESSION_RAW => payload,
         COMPRESSION_LZ4 => {
-            decompress_size_prepended(&payload).map_err(|error| Error::Corruption {
+            // The payload is `compress_prepend_size` output: a four-byte
+            // little-endian size prefix followed by the raw LZ4 block. Size
+            // the output from the validated header length instead of the
+            // in-payload prefix, which would otherwise dictate an unbounded
+            // allocation before decompression can fail.
+            if payload.len() < 4 {
+                return corruption(entry.offset, "LZ4 block is too short");
+            }
+            let prefix = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
+            if prefix != uncompressed_len {
+                return corruption(entry.offset, "LZ4 size prefix disagrees with block header");
+            }
+            decompress(&payload[4..], uncompressed_len).map_err(|error| Error::Corruption {
                 offset: entry.offset,
                 reason: format!("invalid LZ4 block: {error}"),
             })?
@@ -638,6 +662,12 @@ fn minimum_encoded_bytes(points: u64) -> u64 {
     COLUMN_COUNT as u64 * 4 + 14 + points.saturating_mul(MIN_ENCODED_POINT_BYTES)
 }
 
+/// The largest possible encoded size of `points` column-encoded points: seven
+/// u32 column lengths plus at most `MAX_ENCODED_POINT_BYTES` for every point.
+fn maximum_encoded_bytes(points: u64) -> u64 {
+    COLUMN_COUNT as u64 * 4 + points.saturating_mul(MAX_ENCODED_POINT_BYTES)
+}
+
 fn checked_delta(left: i64, right: i64) -> Result<i64> {
     left.checked_sub(right)
         .ok_or_else(|| Error::Serialization("timestamp delta overflows i64".to_owned()))
@@ -745,7 +775,10 @@ fn corrupt_error(offset: u64, reason: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{BLOCK_HEADER_BYTES, INDEX_ENTRY_BYTES, INDEX_HEADER_BYTES, Segment};
+    use super::{
+        BLOCK_HEADER_BYTES, COMPRESSION_LZ4, INDEX_ENTRY_BYTES, INDEX_HEADER_BYTES,
+        SEGMENT_HEADER_BYTES, Segment,
+    };
     use crate::{Error, Point};
     use crc32fast::hash;
     use std::fs::OpenOptions;
@@ -882,6 +915,60 @@ mod tests {
         // under the index's compression-ratio bound, so the block is only
         // rejected when its columns are decoded.
         claim_first_block_points(&path, 1_000);
+        let mut segment = Segment::open(&path).unwrap();
+        assert!(matches!(
+            segment.query(1, i64::MIN, i64::MAX),
+            Err(Error::Corruption { .. })
+        ));
+    }
+
+    /// Rewrites the first block's claimed uncompressed length and LZ4 size
+    /// prefix, keeping every checksum consistent so only the decompression
+    /// bounds can reject it.
+    fn tamper_first_block_lz4(path: &Path, claimed_length: Option<u32>, claimed_prefix: u32) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let block = SEGMENT_HEADER_BYTES;
+        assert_eq!(bytes[block + 6], COMPRESSION_LZ4);
+        if let Some(claimed) = claimed_length {
+            bytes[block + 20..block + 24].copy_from_slice(&claimed.to_le_bytes());
+        }
+        let payload_len =
+            u32::from_le_bytes(bytes[block + 24..block + 28].try_into().unwrap()) as usize;
+        let payload_start = block + BLOCK_HEADER_BYTES;
+        bytes[payload_start..payload_start + 4].copy_from_slice(&claimed_prefix.to_le_bytes());
+        let payload_crc = hash(&bytes[payload_start..payload_start + payload_len]);
+        bytes[block + 28..block + 32].copy_from_slice(&payload_crc.to_le_bytes());
+        let header_crc = hash(&bytes[block..block + 48]);
+        bytes[block + 48..block + 52].copy_from_slice(&header_crc.to_le_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn huge_block_uncompressed_length_is_rejected_on_query() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("bomb-header.seg");
+        Segment::create(&path, &points(3_000), 4_096).unwrap();
+
+        // Both the block header and the LZ4 size prefix claim ~4 GiB; the
+        // structural bound on the header length must reject the block before
+        // any decompression buffer is sized.
+        tamper_first_block_lz4(&path, Some(u32::MAX), u32::MAX);
+        let mut segment = Segment::open(&path).unwrap();
+        assert!(matches!(
+            segment.query(1, i64::MIN, i64::MAX),
+            Err(Error::Corruption { .. })
+        ));
+    }
+
+    #[test]
+    fn lying_lz4_size_prefix_is_rejected_on_query() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("bomb-prefix.seg");
+        Segment::create(&path, &points(3_000), 4_096).unwrap();
+
+        // Only the in-payload size prefix claims ~4 GiB; it must be rejected
+        // against the validated header length instead of sizing an allocation.
+        tamper_first_block_lz4(&path, None, u32::MAX);
         let mut segment = Segment::open(&path).unwrap();
         assert!(matches!(
             segment.query(1, i64::MIN, i64::MAX),

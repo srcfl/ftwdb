@@ -1,6 +1,6 @@
 use crate::{Error, GaugeBucket, Result, Sample};
 use crc32fast::hash;
-use lz4_flex::block::{compress_prepend_size, decompress_size_prepended};
+use lz4_flex::block::{compress_prepend_size, decompress};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -12,6 +12,9 @@ const HEADER_BYTES: usize = 48;
 const BUCKET_BYTES: usize = 104;
 const COMPRESSION_RAW: u8 = 0;
 const COMPRESSION_LZ4: u8 = 1;
+/// The LZ4 block format cannot expand one compressed byte into more than 255
+/// output bytes, so a payload bounds its decompressed size by this ratio.
+const MAX_LZ4_RATIO: u64 = 255;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RollupSegmentStats {
@@ -101,7 +104,27 @@ impl RollupSegment {
         let decoded = match compression {
             COMPRESSION_RAW => payload,
             COMPRESSION_LZ4 => {
-                decompress_size_prepended(&payload).map_err(|error| Error::Corruption {
+                // The payload is `compress_prepend_size` output: a four-byte
+                // little-endian size prefix followed by the raw LZ4 block.
+                // Size the output from the header length — itself bounded by
+                // the format's maximum expansion ratio of the bytes actually
+                // stored — instead of the in-payload prefix, which would
+                // otherwise dictate an unbounded allocation before
+                // decompression can fail.
+                if uncompressed_len as u64 > (stored_len as u64).saturating_mul(MAX_LZ4_RATIO) {
+                    return corruption(0, "rollup uncompressed length exceeds LZ4 capacity");
+                }
+                if payload.len() < 4 {
+                    return corruption(HEADER_BYTES as u64, "LZ4 rollup payload is too short");
+                }
+                let prefix = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
+                if prefix != uncompressed_len {
+                    return corruption(
+                        HEADER_BYTES as u64,
+                        "LZ4 size prefix disagrees with rollup header",
+                    );
+                }
+                decompress(&payload[4..], uncompressed_len).map_err(|error| Error::Corruption {
                     offset: HEADER_BYTES as u64,
                     reason: format!("invalid LZ4 rollup payload: {error}"),
                 })?
@@ -339,8 +362,9 @@ fn corruption<T>(offset: u64, reason: &str) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::RollupSegment;
-    use crate::{FixedGaugeRollup, Point};
+    use super::{BUCKET_BYTES, COMPRESSION_LZ4, HEADER_BYTES, MAGIC, RollupSegment, VERSION};
+    use crate::{Error, FixedGaugeRollup, Point};
+    use crc32fast::hash;
     use std::io::{Seek, SeekFrom, Write};
     use tempfile::tempdir;
 
@@ -375,6 +399,56 @@ mod tests {
         let path = directory.path().join("rollup.rseg");
         RollupSegment::create(&path, &buckets()).unwrap();
         assert!(RollupSegment::create(&path, &buckets()).is_err());
+    }
+
+    /// Builds a rollup segment file with a consistent header around an
+    /// arbitrary LZ4 payload, so only the decompression bounds can reject it.
+    fn crafted_lz4_segment(bucket_count: u32, payload: &[u8]) -> Vec<u8> {
+        let uncompressed_len = bucket_count * BUCKET_BYTES as u32;
+        let mut header = [0_u8; HEADER_BYTES];
+        header[..8].copy_from_slice(MAGIC);
+        header[8..10].copy_from_slice(&VERSION.to_le_bytes());
+        header[10] = COMPRESSION_LZ4;
+        header[12..16].copy_from_slice(&bucket_count.to_le_bytes());
+        header[16..20].copy_from_slice(&uncompressed_len.to_le_bytes());
+        header[20..24].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        header[24..28].copy_from_slice(&hash(payload).to_le_bytes());
+        let header_crc = hash(&header[..44]);
+        header[44..48].copy_from_slice(&header_crc.to_le_bytes());
+        let mut bytes = header.to_vec();
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    #[test]
+    fn rejects_decompression_bomb_bucket_count() {
+        // A few dozen bytes claiming ~4 GiB of buckets must fail on the LZ4
+        // expansion bound before any decompression buffer is sized.
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("bomb.rseg");
+        let mut payload = u32::MAX.to_le_bytes().to_vec();
+        payload.extend_from_slice(&[0_u8; 12]);
+        std::fs::write(&path, crafted_lz4_segment(41_000_000, &payload)).unwrap();
+        assert!(matches!(
+            RollupSegment::open(&path),
+            Err(Error::Corruption { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_lying_lz4_size_prefix() {
+        // The header claims one bucket while the in-payload LZ4 size prefix
+        // claims ~4 GiB; the prefix must be rejected against the header
+        // instead of sizing an allocation.
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("prefix.rseg");
+        let mut payload = u32::MAX.to_le_bytes().to_vec();
+        payload.extend_from_slice(&[0_u8; 12]);
+        std::fs::write(&path, crafted_lz4_segment(1, &payload)).unwrap();
+        assert!(matches!(
+            RollupSegment::open(&path),
+            Err(Error::Corruption { .. })
+        ));
     }
 
     #[test]
