@@ -72,5 +72,7 @@ configuration asymmetry.
 Initial progress: the deterministic mixed energy generator, portable bundle,
 machine-readable WattDB runner, and exact WattDB/SQLite native comparison are
 implemented. The pinned server registry is explicitly marked compose/smoke-only
-until each adapter verifies results. ARM64 SD, full-disk, soak, backup/salvage,
-and physical power-cut work remain open and are required for the M4 exit.
+until each adapter verifies results. VictoriaMetrics now has a result-verified
+telemetry-subset adapter, but not a full-domain or equal-durability comparison.
+ARM64 SD, full-disk, soak, backup/salvage, the remaining adapters, and physical
+power-cut work remain open and are required for the M4 exit.

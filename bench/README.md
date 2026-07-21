@@ -39,3 +39,20 @@ generator and rejects unequal 5-minute results:
 ```sh
 cargo bench --bench energy_compare -- --quick
 ```
+
+## VictoriaMetrics telemetry subset
+
+The adapter imports only `run_id=0` telemetry, labels it with the dataset CRC,
+and verifies every 5-minute count/sum/min/max bucket before emitting JSON. It
+refuses a database that already contains the dataset.
+
+```sh
+docker compose -f bench/compose.yml --profile victoriametrics up -d --pull never
+python3 bench/adapters/victoriametrics.py bench-results/workload
+docker compose -f bench/compose.yml --profile victoriametrics down
+```
+
+Use a fresh named volume for a measured run. The result is a telemetry-subset
+server/HTTP chart, not a full workload or native embedded comparison: catalog,
+plans, three-dimensional revisions, and DST calendar totals are explicitly
+reported as unsupported.
