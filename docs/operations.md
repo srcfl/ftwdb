@@ -9,8 +9,11 @@ It loads the highest valid manifest generation and re-opens every active rollup
 segment, validating checksums, encoded lengths, aggregate invariants,
 descriptor coverage, and raw-source watermarks. The command emits a single JSON
 record with raw commit/point counts, active rollup file/bucket/byte counts, and
-a `stale_rollup_files` count of rollups whose provenance trails the raw log —
-state a writable open would reconcile but a check only reports.
+`raw_recovered_tail_bytes` plus `raw_recovered_tail` fields that distinguish an
+`incomplete-header`, an `incomplete-payload`, and no recovery. It also reports a
+`stale_rollup_files` count of rollups whose provenance trails the raw log — state
+a writable open would reconcile but a check only reports. These are additive
+fields in the `ftwdb-integrity-v1` JSON object.
 
 Inactive files are not required for the current database state and are not
 included in this check. Rollup files that no retained manifest generation

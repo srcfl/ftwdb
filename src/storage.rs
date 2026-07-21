@@ -123,6 +123,28 @@ pub struct Commit {
     pub deduplicated: bool,
 }
 
+/// Why the final bytes of a log were recovered.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RecoveredTail {
+    /// The log ended at a frame boundary.
+    #[default]
+    None,
+    /// The log ended before its final frame header was complete.
+    IncompleteHeader,
+    /// The final frame header was complete, but its payload was short.
+    IncompletePayload,
+}
+
+impl std::fmt::Display for RecoveredTail {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::None => "none",
+            Self::IncompleteHeader => "incomplete-header",
+            Self::IncompletePayload => "incomplete-payload",
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Stats {
     pub points: u64,
@@ -131,6 +153,7 @@ pub struct Stats {
     pub catalog_records: u64,
     pub file_bytes: u64,
     pub recovered_tail_bytes: u64,
+    pub recovered_tail: RecoveredTail,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -159,6 +182,7 @@ pub struct Database {
     points: u64,
     catalog_records: u64,
     recovered_tail_bytes: u64,
+    recovered_tail: RecoveredTail,
     bytes_since_sync: u64,
     poisoned: bool,
 }
@@ -254,6 +278,7 @@ impl Database {
             points: scan.points,
             catalog_records: scan.catalog_records,
             recovered_tail_bytes: scan.recovered_tail_bytes,
+            recovered_tail: scan.recovered_tail,
             bytes_since_sync: 0,
             poisoned: false,
         })
@@ -704,6 +729,7 @@ impl Database {
             catalog_records: self.catalog_records,
             file_bytes,
             recovered_tail_bytes: self.recovered_tail_bytes,
+            recovered_tail: self.recovered_tail,
         })
     }
 }
@@ -746,6 +772,7 @@ struct Scan {
     points: u64,
     catalog_records: u64,
     recovered_tail_bytes: u64,
+    recovered_tail: RecoveredTail,
 }
 
 /// Replays the log, recovering from a torn tail. With `simulate_recovery` the
@@ -781,11 +808,13 @@ fn scan_and_recover(
     let mut points = 0_u64;
     let mut catalog_records = 0_u64;
     let mut recovered_tail_bytes = 0_u64;
+    let mut recovered_tail = RecoveredTail::None;
 
     while offset < original_len {
         let remaining = original_len - offset;
         if remaining < FRAME_HEADER_BYTES as u64 {
             recovered_tail_bytes = remaining;
+            recovered_tail = RecoveredTail::IncompleteHeader;
             if !simulate_recovery {
                 truncate_recovered_tail(file, offset)?;
             }
@@ -838,6 +867,7 @@ fn scan_and_recover(
         let frame_len = FRAME_HEADER_BYTES as u64 + payload_len as u64;
         if remaining < frame_len {
             recovered_tail_bytes = remaining;
+            recovered_tail = RecoveredTail::IncompletePayload;
             if !simulate_recovery {
                 truncate_recovered_tail(file, offset)?;
             }
@@ -847,14 +877,12 @@ fn scan_and_recover(
         let mut payload = vec![0_u8; payload_len];
         file.read_exact(&mut payload)?;
         if hash(&payload) != payload_checksum {
-            if remaining == frame_len {
-                recovered_tail_bytes = frame_len;
-                if !simulate_recovery {
-                    truncate_recovered_tail(file, offset)?;
-                }
-                break;
-            }
-            return corruption(offset, "payload checksum mismatch before valid tail");
+            let reason = if remaining == frame_len {
+                "payload checksum mismatch in complete final frame"
+            } else {
+                "payload checksum mismatch before valid tail"
+            };
+            return corruption(offset, reason);
         }
 
         if frame_kind == FRAME_KIND_LEGACY_POINTS {
@@ -913,6 +941,7 @@ fn scan_and_recover(
         points,
         catalog_records,
         recovered_tail_bytes,
+        recovered_tail,
     })
 }
 
@@ -1417,6 +1446,10 @@ mod tests {
         let database = Database::open_read_only(&path).unwrap();
         let stats = database.stats().unwrap();
         assert!(stats.recovered_tail_bytes > 0);
+        assert_eq!(
+            stats.recovered_tail,
+            super::RecoveredTail::IncompletePayload
+        );
         assert_eq!(stats.file_bytes, first_length);
         assert_eq!(database.query_latest(7, 0, 10).len(), 1);
         database.close().unwrap();
@@ -1489,7 +1522,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_last_frame_is_removed_as_one_atomic_batch() {
+    fn incomplete_final_payload_is_removed_as_one_atomic_batch() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("torn-tail.ftwdb");
         let first_length;
@@ -1513,8 +1546,49 @@ mod tests {
 
         let database = Database::open(&path).unwrap();
         assert_eq!(database.query_latest(7, 0, 10).len(), 1);
-        assert_eq!(database.stats().unwrap().file_bytes, first_length);
-        assert!(database.stats().unwrap().recovered_tail_bytes > 0);
+        let stats = database.stats().unwrap();
+        assert_eq!(stats.file_bytes, first_length);
+        assert!(stats.recovered_tail_bytes > 0);
+        assert_eq!(
+            stats.recovered_tail,
+            super::RecoveredTail::IncompletePayload
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn incomplete_final_header_is_removed_and_reported() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("short-header.ftwdb");
+        let first_length;
+        {
+            let mut database = Database::open(&path).unwrap();
+            database.append(&[point(1, 1, 1, 1.0)]).unwrap();
+            first_length = database.stats().unwrap().file_bytes;
+            database.append(&[point(2, 2, 2, 2.0)]).unwrap();
+            database.close().unwrap();
+        }
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(first_length + 7).unwrap();
+        drop(file);
+        let bytes_before = std::fs::read(&path).unwrap();
+
+        let database = Database::open_read_only(&path).unwrap();
+        let stats = database.stats().unwrap();
+        assert_eq!(stats.file_bytes, first_length);
+        assert_eq!(stats.recovered_tail_bytes, 7);
+        assert_eq!(stats.recovered_tail, super::RecoveredTail::IncompleteHeader);
+        assert_eq!(database.query_latest(7, 0, 10).len(), 1);
+        database.close().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
+
+        let database = Database::open(&path).unwrap();
+        let stats = database.stats().unwrap();
+        assert_eq!(stats.file_bytes, first_length);
+        assert_eq!(stats.recovered_tail_bytes, 7);
+        assert_eq!(stats.recovered_tail, super::RecoveredTail::IncompleteHeader);
+        assert_eq!(database.query_latest(7, 0, 10).len(), 1);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[cfg(unix)]

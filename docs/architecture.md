@@ -20,9 +20,9 @@ of state:
 1. **Power-loss behavior is specified.** A committed batch is either present in
    full or absent after recovery. Durability modes state exactly when an
    acknowledgement implies an `fsync`.
-2. **Corruption is detected.** Headers and payloads are checksummed. A torn tail
-   is recoverable; corruption before a valid later frame is an error, not silent
-   data loss.
+2. **Corruption is detected.** Headers and payloads are checksummed. Only an
+   incomplete final header or payload is recoverable. A complete frame with a
+   bad checksum is an error even when it is last; open leaves its bytes intact.
 3. **Writes are predominantly sequential.** Small random page rewrites and
    write-amplifying B-trees are avoided on the ingest path.
 4. **Write amplification is a product metric.** Every benchmark records logical

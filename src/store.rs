@@ -52,6 +52,8 @@ pub struct IntegrityReport {
     pub manifest_generation: u64,
     pub raw_points: u64,
     pub raw_commits: u64,
+    pub raw_recovered_tail_bytes: u64,
+    pub raw_recovered_tail: crate::RecoveredTail,
     pub active_rollup_files: usize,
     pub active_rollup_buckets: u64,
     pub active_rollup_bytes: u64,
@@ -544,6 +546,8 @@ impl Store {
             manifest_generation: self.manifest.generation,
             raw_points: raw.points,
             raw_commits: raw.commits,
+            raw_recovered_tail_bytes: raw.recovered_tail_bytes,
+            raw_recovered_tail: raw.recovered_tail,
             stale_rollup_files: self.stale_rollup_files,
             ..IntegrityReport::default()
         };

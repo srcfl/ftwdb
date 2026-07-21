@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
-use ftwdb::{Config, Database, Durability, Point};
+use ftwdb::{Config, Database, Durability, Entity, EntityId, Error, Point, Transaction};
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::process::ExitStatusExt;
@@ -152,24 +153,27 @@ fn always_recovers_every_acknowledged_batch_after_sigkill() {
     println!("power-cut raw results: {}", result_path.display());
 }
 
-/// This records the current policy; it does not claim that the policy is
-/// safe for latent media corruption. A full final frame with bad payload CRC is
-/// indistinguishable from one kind of torn write in format v1, so changing this
-/// behavior needs an explicit compatibility and recovery decision.
 #[test]
-fn current_policy_discards_complete_final_frame_with_bad_payload_crc() {
+fn complete_final_frame_with_bad_payload_crc_is_corruption_and_preserved() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("final-crc.ftwdb");
     let first = numbered_batch(0, 3);
-    let second = numbered_batch(1, 3);
 
     let mut database = Database::open(&path).unwrap();
     database.append(&first).unwrap();
     let first_length = database.stats().unwrap().file_bytes;
-    database.append(&second).unwrap();
+    let mut catalog_change = Transaction::new();
+    catalog_change.upsert_entity(Entity {
+        id: EntityId(14),
+        kind: "crc-test".to_owned(),
+        name: "must-not-be-recovered".to_owned(),
+        parent: None,
+        valid_from: 0,
+        valid_to: None,
+        properties: BTreeMap::new(),
+    });
+    database.commit(catalog_change).unwrap();
     database.close().unwrap();
-    let full_length = std::fs::metadata(&path).unwrap().len();
-
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -182,12 +186,25 @@ fn current_policy_discards_complete_final_frame_with_bad_payload_crc() {
     file.write_all(&[last[0] ^ 0xff]).unwrap();
     file.sync_all().unwrap();
     drop(file);
+    let corrupt_bytes = std::fs::read(&path).unwrap();
 
-    let recovered = Database::open(&path).unwrap();
-    assert_eq!(recovered.query_history(1, i64::MIN, i64::MAX), first);
-    let stats = recovered.stats().unwrap();
-    assert_eq!(stats.file_bytes, first_length);
-    assert_eq!(stats.recovered_tail_bytes, full_length - first_length);
+    for result in [Database::open(&path), Database::open_read_only(&path)] {
+        match result {
+            Err(Error::Corruption { offset, reason }) => {
+                assert_eq!(offset, first_length);
+                assert_eq!(reason, "payload checksum mismatch in complete final frame");
+            }
+            Err(other) => panic!("expected payload corruption, got {other:?}"),
+            Ok(_) => panic!("expected payload corruption, got an open database"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt_bytes);
+    }
+
+    let entries = std::fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(entries, [path.file_name().unwrap()]);
 }
 
 struct KillOutcome {
