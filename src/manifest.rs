@@ -132,19 +132,32 @@ fn generation_candidates(directory: &Path) -> Result<Vec<(u64, PathBuf)>> {
 /// `RETAINED_FALLBACK_GENERATIONS` fallbacks, returning the retained
 /// generations newest first. The newest file is never a deletion candidate,
 /// so the generation a caller just published always survives, and the
-/// retained fallbacks preserve the corruption recovery in `load`. Unlink
-/// failures are ignored: the publish that preceded this call already
+/// retained fallbacks preserve the corruption recovery in `load`. The
+/// `loaded_generation` — whichever generation `load` actually returned — is
+/// also never removed even when it sits below the filename window: `load` may
+/// have skipped past that many corrupt newer files to reach it, and deleting
+/// the only proven-readable generation would make the store unrecoverable.
+/// Unlink failures are ignored: the publish that preceded this call already
 /// succeeded, and a surviving file is simply retried by the next prune.
-pub(crate) fn prune_generations(directory: &Path) -> Result<Vec<(u64, PathBuf)>> {
-    let mut candidates = generation_candidates(directory)?;
-    let retain = (1 + RETAINED_FALLBACK_GENERATIONS).min(candidates.len());
-    for (_, path) in candidates.split_off(retain) {
-        let _ = std::fs::remove_file(path);
+pub(crate) fn prune_generations(
+    directory: &Path,
+    loaded_generation: u64,
+) -> Result<Vec<(u64, PathBuf)>> {
+    let mut retained = generation_candidates(directory)?;
+    let window = (1 + RETAINED_FALLBACK_GENERATIONS).min(retained.len());
+    for (generation, path) in retained.split_off(window) {
+        if generation == loaded_generation {
+            // Candidates are sorted newest first, and this generation is
+            // older than everything already retained.
+            retained.push((generation, path));
+        } else {
+            let _ = std::fs::remove_file(path);
+        }
     }
     if let Ok(file) = File::open(directory) {
         let _ = file.sync_all();
     }
-    Ok(candidates)
+    Ok(retained)
 }
 
 /// Every rollup filename referenced by the given retained generations,
@@ -293,11 +306,36 @@ mod tests {
         for generation in 1..=5 {
             manifest(generation).publish(directory.path()).unwrap();
         }
-        let retained = super::prune_generations(directory.path()).unwrap();
+        let retained = super::prune_generations(directory.path(), 5).unwrap();
         let generations: Vec<u64> = retained.iter().map(|(generation, _)| *generation).collect();
         assert_eq!(generations, vec![5, 4, 3]);
         let on_disk = super::generation_candidates(directory.path()).unwrap();
         assert_eq!(on_disk.len(), 1 + super::RETAINED_FALLBACK_GENERATIONS);
+        assert_eq!(
+            super::referenced_rollup_files(&retained).unwrap(),
+            std::collections::HashSet::from(["one.rseg".to_owned()])
+        );
+    }
+
+    #[test]
+    fn pruning_never_removes_the_loaded_generation() {
+        let directory = tempdir().unwrap();
+        for generation in 1..=5 {
+            manifest(generation).publish(directory.path()).unwrap();
+        }
+        // As if generations 3..=5 were corrupt and `load` fell back to 1: the
+        // loaded generation must survive alongside the filename window while
+        // everything else below it is still pruned.
+        let retained = super::prune_generations(directory.path(), 1).unwrap();
+        let generations: Vec<u64> = retained.iter().map(|(generation, _)| *generation).collect();
+        assert_eq!(generations, vec![5, 4, 3, 1]);
+        let on_disk: Vec<u64> = super::generation_candidates(directory.path())
+            .unwrap()
+            .iter()
+            .map(|(generation, _)| *generation)
+            .collect();
+        assert_eq!(on_disk, vec![5, 4, 3, 1]);
+        // The loaded generation's rollup references stay protected.
         assert_eq!(
             super::referenced_rollup_files(&retained).unwrap(),
             std::collections::HashSet::from(["one.rseg".to_owned()])
@@ -310,7 +348,7 @@ mod tests {
         for generation in 1..=5 {
             manifest(generation).publish(directory.path()).unwrap();
         }
-        let retained = super::prune_generations(directory.path()).unwrap();
+        let retained = super::prune_generations(directory.path(), 5).unwrap();
         let newest = &retained[0].1;
         let mut file = std::fs::OpenOptions::new()
             .write(true)

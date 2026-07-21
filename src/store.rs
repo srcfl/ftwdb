@@ -837,7 +837,13 @@ impl Store {
     /// the store — the current manifest is already durable, and any file that
     /// survives one pass is reconsidered by the next.
     fn remove_unreferenced_files(&self) {
-        let Ok(retained) = manifest::prune_generations(&self.manifest_directory) else {
+        // Passing the loaded generation keeps the manifest this store is
+        // actually running on alive even when `load` fell back past the
+        // newest filename window, and keeps its rollup references in the
+        // retained set below.
+        let Ok(retained) =
+            manifest::prune_generations(&self.manifest_directory, self.manifest.generation)
+        else {
             return;
         };
         // If any retained generation cannot be read back, a segment cannot be
@@ -1692,6 +1698,59 @@ mod tests {
             stored_files(&directory.path().join("rollups")),
             rollups_before
         );
+        assert_eq!(
+            store
+                .query_gauge(1, 0, 20 * SECOND, &resolution)
+                .unwrap()
+                .source,
+            RollupSource::Materialized
+        );
+    }
+
+    #[test]
+    fn fallback_generation_past_the_retained_window_survives_pruning() {
+        let directory = tempdir().unwrap();
+        let resolution = RollupResolution::FixedMicros(5 * SECOND);
+        let loaded_generation;
+        {
+            let mut store = Store::open(directory.path()).unwrap();
+            initialize(
+                &mut store,
+                vec![RollupTier {
+                    resolution: resolution.clone(),
+                    retain_for_micros: None,
+                }],
+                None,
+            );
+            let mut transaction = Transaction::new();
+            transaction.append_points(points());
+            store.commit(transaction).unwrap();
+            store.maintain(DAY).unwrap();
+            loaded_generation = store.manifest_generation();
+            store.close().unwrap();
+        }
+        // More corrupt newer generations than the retained filename window
+        // holds, as repeated torn publishes could leave behind: `load` must
+        // fall back past all of them, and the prune that open runs must not
+        // delete the only generation the store could actually read.
+        let manifest_directory = directory.path().join("manifests");
+        for corrupt in loaded_generation + 1..=loaded_generation + 3 {
+            std::fs::write(
+                manifest_directory.join(format!("MANIFEST.{corrupt:020}")),
+                b"junk",
+            )
+            .unwrap();
+        }
+        let valid = manifest_directory.join(format!("MANIFEST.{loaded_generation:020}"));
+
+        let store = Store::open(directory.path()).unwrap();
+        assert_eq!(store.manifest_generation(), loaded_generation);
+        assert!(valid.exists());
+        store.close().unwrap();
+
+        // Without that file a second open would find only corrupt manifests.
+        let store = Store::open(directory.path()).unwrap();
+        assert_eq!(store.manifest_generation(), loaded_generation);
         assert_eq!(
             store
                 .query_gauge(1, 0, 20 * SECOND, &resolution)

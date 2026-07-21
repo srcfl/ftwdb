@@ -12,6 +12,9 @@ const HEADER_BYTES: usize = 48;
 const BUCKET_BYTES: usize = 104;
 const COMPRESSION_RAW: u8 = 0;
 const COMPRESSION_LZ4: u8 = 1;
+/// A fixed shard cap keeps both the decompressed byte buffer and the decoded
+/// bucket vector bounded even for a valid, maximally compressed payload.
+const MAX_ROLLUP_BUCKETS: u32 = 262_144;
 /// The LZ4 block format cannot expand one compressed byte into more than 255
 /// output bytes, so a payload bounds its decompressed size by this ratio.
 const MAX_LZ4_RATIO: u64 = 255;
@@ -34,6 +37,11 @@ pub struct RollupSegment {
 impl RollupSegment {
     /// Publishes a fully synced segment without replacing an existing target.
     pub fn create(path: impl AsRef<Path>, buckets: &[GaugeBucket]) -> Result<RollupSegmentStats> {
+        if buckets.len() > MAX_ROLLUP_BUCKETS as usize {
+            return Err(Error::InvalidModel(
+                "rollup segment exceeds 262144 buckets".to_owned(),
+            ));
+        }
         validate_buckets(buckets, 0)?;
         let path = path.as_ref();
         if path.exists() {
@@ -85,6 +93,9 @@ impl RollupSegment {
         let payload_crc = u32::from_le_bytes(header[24..28].try_into().unwrap());
         let min_start = i64::from_le_bytes(header[28..36].try_into().unwrap());
         let max_end = i64::from_le_bytes(header[36..44].try_into().unwrap());
+        if bucket_count > MAX_ROLLUP_BUCKETS {
+            return corruption(0, "rollup bucket count exceeds implementation limit");
+        }
         let expected_uncompressed = (bucket_count as usize)
             .checked_mul(BUCKET_BYTES)
             .ok_or_else(|| Error::Corruption {
@@ -362,7 +373,10 @@ fn corruption<T>(offset: u64, reason: &str) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BUCKET_BYTES, COMPRESSION_LZ4, HEADER_BYTES, MAGIC, RollupSegment, VERSION};
+    use super::{
+        BUCKET_BYTES, COMPRESSION_LZ4, HEADER_BYTES, MAGIC, MAX_ROLLUP_BUCKETS, RollupSegment,
+        VERSION,
+    };
     use crate::{Error, FixedGaugeRollup, Point};
     use crc32fast::hash;
     use std::io::{Seek, SeekFrom, Write};
@@ -430,6 +444,18 @@ mod tests {
         let mut payload = u32::MAX.to_le_bytes().to_vec();
         payload.extend_from_slice(&[0_u8; 12]);
         std::fs::write(&path, crafted_lz4_segment(41_000_000, &payload)).unwrap();
+        assert!(matches!(
+            RollupSegment::open(&path),
+            Err(Error::Corruption { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_bucket_count_above_memory_limit() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("too-many-buckets.rseg");
+        let payload = 0_u32.to_le_bytes();
+        std::fs::write(&path, crafted_lz4_segment(MAX_ROLLUP_BUCKETS + 1, &payload)).unwrap();
         assert!(matches!(
             RollupSegment::open(&path),
             Err(Error::Corruption { .. })

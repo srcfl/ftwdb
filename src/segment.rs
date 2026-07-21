@@ -20,6 +20,10 @@ const INDEX_VERSION: u16 = 1;
 const INDEX_HEADER_BYTES: usize = 16;
 const INDEX_ENTRY_BYTES: usize = 40;
 const COLUMN_COUNT: usize = 7;
+/// Hard ceiling for one decoded block. This matches the default append batch
+/// limit and keeps a valid, highly compressible block from expanding into a
+/// multi-gigabyte `Vec<Point>`.
+const MAX_BLOCK_POINTS: u32 = 262_144;
 /// Every encoded point consumes at least one varint byte in each of the
 /// timestamp, valid-end, knowledge, change, run-id, and value columns plus two
 /// in the quality/flags column, so eight bytes is a hard lower bound per point.
@@ -64,9 +68,9 @@ impl Segment {
         points: &[Point],
         block_points: usize,
     ) -> Result<SegmentStats> {
-        if block_points == 0 || block_points > u32::MAX as usize {
+        if block_points == 0 || block_points > MAX_BLOCK_POINTS as usize {
             return Err(Error::InvalidConfig(
-                "segment block_points must be in 1..=u32::MAX",
+                "segment block_points must be in 1..=262144",
             ));
         }
         let path = path.as_ref();
@@ -548,6 +552,21 @@ fn read_block(file: &mut File, entry: IndexEntry) -> Result<Vec<Point>> {
             if prefix != uncompressed_len {
                 return corruption(entry.offset, "LZ4 size prefix disagrees with block header");
             }
+            // The per-point bound above still admits headers claiming roughly
+            // `points * MAX_ENCODED_POINT_BYTES` output from a tiny payload,
+            // so also pin the claim to the stream itself: the LZ4 block format
+            // cannot expand one stored byte into more than MAX_LZ4_RATIO
+            // output bytes, so a compressed stream (the payload minus its
+            // four-byte size prefix) of real data is never smaller than
+            // uncompressed_len / MAX_LZ4_RATIO and the writer's own output
+            // always passes this check.
+            let stream_len = (payload.len() - 4) as u64;
+            if uncompressed_len as u64 > stream_len.saturating_mul(MAX_LZ4_RATIO) {
+                return corruption(
+                    entry.offset,
+                    "block uncompressed length exceeds LZ4 capacity",
+                );
+            }
             decompress(&payload[4..], uncompressed_len).map_err(|error| Error::Corruption {
                 offset: entry.offset,
                 reason: format!("invalid LZ4 block: {error}"),
@@ -615,6 +634,7 @@ fn validate_index(index: &[IndexEntry], index_offset: u64, point_count: u64) -> 
     let mut expected_offset = SEGMENT_HEADER_BYTES as u64;
     for entry in index {
         if entry.points == 0
+            || entry.points > MAX_BLOCK_POINTS
             || entry.min_time > entry.max_time
             || entry.offset != expected_offset
             || entry
@@ -777,7 +797,7 @@ fn corrupt_error(offset: u64, reason: &str) -> Error {
 mod tests {
     use super::{
         BLOCK_HEADER_BYTES, COMPRESSION_LZ4, INDEX_ENTRY_BYTES, INDEX_HEADER_BYTES,
-        SEGMENT_HEADER_BYTES, Segment,
+        MAX_BLOCK_POINTS, SEGMENT_HEADER_BYTES, Segment,
     };
     use crate::{Error, Point};
     use crc32fast::hash;
@@ -906,6 +926,23 @@ mod tests {
     }
 
     #[test]
+    fn block_point_limit_bounds_writer_and_reader_allocations() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("bounded.seg");
+        assert!(matches!(
+            Segment::create(&path, &points(10), MAX_BLOCK_POINTS as usize + 1),
+            Err(Error::InvalidConfig(_))
+        ));
+
+        Segment::create(&path, &points(100), 1_000).unwrap();
+        claim_first_block_points(&path, MAX_BLOCK_POINTS + 1);
+        assert!(matches!(
+            Segment::open(&path),
+            Err(Error::Corruption { .. })
+        ));
+    }
+
+    #[test]
     fn inflated_block_point_count_is_rejected_on_query() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("inflated-block.seg");
@@ -957,6 +994,32 @@ mod tests {
         assert!(matches!(
             segment.query(1, i64::MIN, i64::MAX),
             Err(Error::Corruption { .. })
+        ));
+    }
+
+    #[test]
+    fn decompression_bomb_within_point_bounds_is_rejected_on_query() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("bomb-ratio.seg");
+        Segment::create(&path, &points(3_000), 4_096).unwrap();
+
+        // Claim a point count that passes the index's compression-ratio bound
+        // and an uncompressed length inside the per-point window it implies,
+        // yet far beyond what the actual payload can legally expand to: the
+        // stream-ratio bound must reject the block before the decompression
+        // buffer is sized.
+        let bytes = std::fs::read(&path).unwrap();
+        let block = SEGMENT_HEADER_BYTES;
+        let payload_len = u32::from_le_bytes(bytes[block + 24..block + 28].try_into().unwrap());
+        let claimed_length = payload_len * 255;
+        let claimed_points = claimed_length / 64;
+        tamper_first_block_lz4(&path, Some(claimed_length), claimed_length);
+        claim_first_block_points(&path, claimed_points);
+
+        let mut segment = Segment::open(&path).unwrap();
+        assert!(matches!(
+            segment.query(1, i64::MIN, i64::MAX),
+            Err(Error::Corruption { reason, .. }) if reason.contains("exceeds LZ4 capacity")
         ));
     }
 
