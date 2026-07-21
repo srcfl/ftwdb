@@ -441,7 +441,16 @@ impl Database {
         if self.poisoned {
             return Err(Error::Poisoned);
         }
-        self.file.sync_data()?;
+        let sync_result = self.file.sync_data();
+        if let Err(error) = sync_result {
+            // A failed fsync may still have marked the dirty pages clean, so
+            // a retried sync could succeed without the data ever reaching
+            // media (fsyncgate). Poison the writer, exactly as a failed
+            // frame write does, so durability can only be claimed again by
+            // reopening and re-reading what is actually on disk.
+            self.poisoned = true;
+            return Err(Error::Io(error));
+        }
         self.bytes_since_sync = 0;
         Ok(())
     }
@@ -1326,6 +1335,45 @@ mod tests {
         assert_eq!(database.query_latest(7, 0, 10).len(), 1);
         assert_eq!(database.stats().unwrap().file_bytes, first_length);
         assert!(database.stats().unwrap().recovered_tail_bytes > 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_flush_poisons_the_writer_instead_of_permitting_a_retry() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("fsyncgate.ftwdb");
+        let mut database = Database::open_with(
+            &path,
+            Config {
+                durability: Durability::Manual,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        database.append(&[point(1, 1, 1, 1.0)]).unwrap();
+
+        // A pipe cannot be synchronized, so `sync_data` on it fails exactly
+        // where a dying disk would fail the real log file's fsync.
+        let (_reader, writer) = std::io::pipe().unwrap();
+        let real_file = std::mem::replace(
+            &mut database.file,
+            std::fs::File::from(std::os::fd::OwnedFd::from(writer)),
+        );
+
+        assert!(matches!(database.flush(), Err(Error::Io(_))));
+        // The kernel may have marked the unwritten pages clean during the
+        // failed sync, so no retry may be able to report durability: every
+        // writer API must now fail with `Error::Poisoned`.
+        assert!(matches!(database.flush(), Err(Error::Poisoned)));
+        assert!(matches!(
+            database.append(&[point(2, 2, 2, 2.0)]),
+            Err(Error::Poisoned)
+        ));
+        assert!(matches!(
+            database.commit(Transaction::new()),
+            Err(Error::Poisoned)
+        ));
+        drop(real_file);
     }
 
     #[test]
