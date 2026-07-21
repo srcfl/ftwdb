@@ -1,4 +1,4 @@
-# Integrity checks, backup, and restore
+# Integrity checks, backup, restore, and salvage
 
 ## Integrity check
 
@@ -109,7 +109,70 @@ cryptographic authenticity check.
 
 Restore does not repair a damaged backup and does not infer data past a corrupt
 frame. Use a separate target, keep the source backup, and run `ftw check-store`
-on the result. Salvage will use a separate command and safety review.
+on the result.
+
+## Strict salvage
+
+`ftw salvage <damaged-store> <absent-target>` copies the longest valid raw-log
+prefix into a new store. The command exits with code 2 for missing or extra
+arguments. A valid database header followed by a damaged frame produces a
+verified `partial` result and exit code 0. Header, source-open, lock,
+source-race, stage-check, or publication errors use exit code 1. The command
+never changes the source. It has no replace option, and it leaves any existing
+target, including an empty directory or dangling symlink, unchanged.
+
+Salvage opens the source directory without following a symlink, then opens
+only `active.wlog` relative to that directory with no-follow and nonblocking
+flags. Both paths must keep the same file identity during the run, and
+`active.wlog` must be a regular file. The command takes a shared lock on that
+file. It does not read a manifest or rollup, so damaged, stale, and orphan
+derived files do not affect the recovered raw prefix.
+
+The scanner first requires a valid FTWDB-v1 database header. It then validates
+each frame in order: bounds, kind and version, header and payload CRC, payload
+duplicate commit IDs, decode, catalog and transaction rules, and point limits.
+It stops before the first failed frame. It never searches for a later `WBAT`
+marker, and it never copies frames after a failure. This means that salvage
+cannot recover sound data that happens to follow damaged data. A complete last
+frame with a bad CRC counts as damage; salvage cannot prove that an interrupted
+write caused it.
+
+The fixed `stop_reason` values are:
+
+- `clean-eof`;
+- `incomplete-frame-header` and `incomplete-frame-payload`;
+- `invalid-frame-magic`, `unsupported-frame-version`, and
+  `frame-header-checksum-mismatch`;
+- `invalid-legacy-frame-size`, `transaction-frame-too-large`,
+  `identified-transaction-too-short`, and `unknown-frame-kind`;
+- `payload-checksum-mismatch`, `duplicate-commit-id`,
+  `invalid-transaction`, `transaction-point-count-too-large`, and
+  `invalid-catalog-transaction`.
+
+After a valid database header, each listed frame or transaction fault yields a
+`partial` result, including a fault in the first frame. A header-only source is
+`clean`; a bad first frame can produce a checked header-only target with zero
+commits and points. An invalid or unsupported database header is fatal and
+publishes no target.
+
+The new store contains the header and validated frames as `active.wlog`, plus
+empty `manifests` and `rollups` directories. Salvage uses the same hidden-stage,
+file sync, directory sync, identity rollback, and atomic no-clobber publication
+as restore. It opens both the stage and target read-only and runs the full store
+check with no recovery. The shared stage lock stays held through publication,
+the target check, and any rollback.
+
+The source-prefix CRC32 uses the restore snapshot domain and one relative path,
+`active.wlog`. It covers that path length and bytes, the recovered prefix
+length, and the exact prefix bytes. The destination snapshot covers the same
+path and bytes. Salvage compares the values before and after publication. CRC32
+detects many accidental changes but does not prove authenticity.
+
+On success, `ftwdb-salvage-v1` reports `status`, `source_bytes`,
+`recovered_prefix_bytes`, `discarded_bytes`, `stop_offset`, `stop_reason`,
+`recovered_commits`, `recovered_points`, `source_prefix_crc32`, and
+`destination_snapshot_crc32`. `status` is `clean` only at a checked frame
+boundary at end of file; otherwise it is `partial`.
 
 ## Sync and full-disk checks
 
@@ -132,14 +195,16 @@ the M4 physical SD-card power-cut release gate.
 `tests/cli.rs` runs the built `ftw` binary as a subprocess. It fixes the usage
 contract at exit code 2 with usage text on standard error, while data, file,
 and store errors use exit code 1. The test covers the generated workload,
-sanitized real fixture, TSBS IoT, integrity check, log inspection, backup, and
-strict restore paths. It parses each promised JSON record and checks its main
-counts and status fields.
+sanitized real fixture, TSBS IoT, integrity check, log inspection, backup,
+strict restore, and salvage paths. It parses each promised JSON record and
+checks its main counts and status fields.
 
 The test also snapshots every path and every file byte in a store before and
 after both `check-store` and `inspect`. Separate missing-path checks prove that
 neither command creates its input. The backup check covers linked and copied
 file counts plus the hard-link fallback count on a normal local filesystem.
 The restore check covers JSON, exact bytes, counts, checksum equality,
-corruption refusal, and no-clobber behavior. Salvage and physical SD-card tests
-remain M4 work.
+corruption refusal, and no-clobber behavior. The salvage checks cover clean and
+partial results, every frame and transaction stop class, no resync, source
+identity, special files, concurrent no-clobber publication, rollback, and the
+sanitized fixture. Physical SD-card tests remain an M4 release gate.

@@ -6,6 +6,7 @@ use crate::transaction::{Record, Transaction};
 use crc32fast::hash;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
@@ -136,6 +137,49 @@ pub enum RecoveredTail {
     IncompletePayload,
 }
 
+/// Why salvage stopped after its longest fully validated raw-log prefix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SalvageStopReason {
+    CleanEof,
+    IncompleteFrameHeader,
+    InvalidFrameMagic,
+    UnsupportedFrameVersion,
+    FrameHeaderChecksumMismatch,
+    InvalidLegacyFrameSize,
+    TransactionFrameTooLarge,
+    IdentifiedTransactionTooShort,
+    UnknownFrameKind,
+    IncompleteFramePayload,
+    PayloadChecksumMismatch,
+    DuplicateCommitId,
+    InvalidTransaction,
+    TransactionPointCountTooLarge,
+    InvalidCatalogTransaction,
+}
+
+impl fmt::Display for SalvageStopReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::CleanEof => "clean-eof",
+            Self::IncompleteFrameHeader => "incomplete-frame-header",
+            Self::InvalidFrameMagic => "invalid-frame-magic",
+            Self::UnsupportedFrameVersion => "unsupported-frame-version",
+            Self::FrameHeaderChecksumMismatch => "frame-header-checksum-mismatch",
+            Self::InvalidLegacyFrameSize => "invalid-legacy-frame-size",
+            Self::TransactionFrameTooLarge => "transaction-frame-too-large",
+            Self::IdentifiedTransactionTooShort => "identified-transaction-too-short",
+            Self::UnknownFrameKind => "unknown-frame-kind",
+            Self::IncompleteFramePayload => "incomplete-frame-payload",
+            Self::PayloadChecksumMismatch => "payload-checksum-mismatch",
+            Self::DuplicateCommitId => "duplicate-commit-id",
+            Self::InvalidTransaction => "invalid-transaction",
+            Self::TransactionPointCountTooLarge => "transaction-point-count-too-large",
+            Self::InvalidCatalogTransaction => "invalid-catalog-transaction",
+        };
+        f.write_str(name)
+    }
+}
+
 impl std::fmt::Display for RecoveredTail {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
@@ -193,11 +237,21 @@ std::thread_local! {
     static FAIL_NEXT_SYNC: std::cell::Cell<Option<std::io::ErrorKind>> = const {
         std::cell::Cell::new(None)
     };
+
+    static MUTATE_SALVAGE_SOURCE_AFTER_IDENTITY_CHECKS: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
 fn fail_next_sync(kind: std::io::ErrorKind) {
     FAIL_NEXT_SYNC.with(|failure| failure.set(Some(kind)));
+}
+
+#[cfg(test)]
+pub(crate) fn mutate_salvage_source_after_identity_checks(passed_checks: usize) {
+    MUTATE_SALVAGE_SOURCE_AFTER_IDENTITY_CHECKS.with(|remaining| {
+        remaining.set(Some(passed_checks));
+    });
 }
 
 fn sync_database_file(file: &File) -> std::io::Result<()> {
@@ -794,6 +848,13 @@ struct Scan {
     catalog_records: u64,
     recovered_tail_bytes: u64,
     recovered_tail: RecoveredTail,
+    validated_bytes: u64,
+    salvage_stop_reason: Option<SalvageStopReason>,
+}
+
+enum ScanMode {
+    Recover { simulate: bool },
+    Salvage,
 }
 
 /// Replays the log, recovering from a torn tail. With `simulate_recovery` the
@@ -804,6 +865,22 @@ fn scan_and_recover(
     max_batch_points: usize,
     max_transaction_bytes: usize,
     simulate_recovery: bool,
+) -> Result<Scan> {
+    scan_log(
+        file,
+        max_batch_points,
+        max_transaction_bytes,
+        ScanMode::Recover {
+            simulate: simulate_recovery,
+        },
+    )
+}
+
+fn scan_log(
+    file: &mut File,
+    max_batch_points: usize,
+    max_transaction_bytes: usize,
+    mode: ScanMode,
 ) -> Result<Scan> {
     let mut database_header = [0_u8; DATABASE_HEADER_BYTES];
     file.seek(SeekFrom::Start(0))?;
@@ -830,14 +907,29 @@ fn scan_and_recover(
     let mut catalog_records = 0_u64;
     let mut recovered_tail_bytes = 0_u64;
     let mut recovered_tail = RecoveredTail::None;
+    let mut salvage_stop_reason = None;
+
+    macro_rules! stop_or_corruption {
+        ($reason:expr, $message:expr) => {
+            if matches!(mode, ScanMode::Salvage) {
+                salvage_stop_reason = Some($reason);
+                break;
+            }
+            return corruption(offset, $message);
+        };
+    }
 
     while offset < original_len {
         let remaining = original_len - offset;
         if remaining < FRAME_HEADER_BYTES as u64 {
-            recovered_tail_bytes = remaining;
-            recovered_tail = RecoveredTail::IncompleteHeader;
-            if !simulate_recovery {
-                truncate_recovered_tail(file, offset)?;
+            if let ScanMode::Recover { simulate } = mode {
+                recovered_tail_bytes = remaining;
+                recovered_tail = RecoveredTail::IncompleteHeader;
+                if !simulate {
+                    truncate_recovered_tail(file, offset)?;
+                }
+            } else {
+                salvage_stop_reason = Some(SalvageStopReason::IncompleteFrameHeader);
             }
             break;
         }
@@ -846,15 +938,21 @@ fn scan_and_recover(
         file.seek(SeekFrom::Start(offset))?;
         file.read_exact(&mut frame_header)?;
         if &frame_header[..4] != FRAME_MAGIC {
-            return corruption(offset, "invalid frame magic");
+            stop_or_corruption!(SalvageStopReason::InvalidFrameMagic, "invalid frame magic");
         }
         let frame_version = u16::from_le_bytes(frame_header[4..6].try_into().unwrap());
         if frame_version != FRAME_VERSION {
-            return corruption(offset, "unsupported frame version");
+            stop_or_corruption!(
+                SalvageStopReason::UnsupportedFrameVersion,
+                "unsupported frame version"
+            );
         }
         let header_checksum = u32::from_le_bytes(frame_header[20..24].try_into().unwrap());
         if hash(&frame_header[..20]) != header_checksum {
-            return corruption(offset, "frame header checksum mismatch");
+            stop_or_corruption!(
+                SalvageStopReason::FrameHeaderChecksumMismatch,
+                "frame header checksum mismatch"
+            );
         }
 
         let frame_kind = u16::from_le_bytes(frame_header[6..8].try_into().unwrap());
@@ -862,35 +960,47 @@ fn scan_and_recover(
         let payload_len = u32::from_le_bytes(frame_header[12..16].try_into().unwrap()) as usize;
         let payload_checksum = u32::from_le_bytes(frame_header[16..20].try_into().unwrap());
         if frame_kind == FRAME_KIND_LEGACY_POINTS {
-            let expected_payload_len =
-                item_count
-                    .checked_mul(POINT_BYTES)
-                    .ok_or_else(|| Error::Corruption {
-                        offset,
-                        reason: "frame point count overflows".to_owned(),
-                    })?;
+            let Some(expected_payload_len) = item_count.checked_mul(POINT_BYTES) else {
+                stop_or_corruption!(
+                    SalvageStopReason::InvalidLegacyFrameSize,
+                    "frame point count overflows"
+                );
+            };
             if item_count > max_batch_points || payload_len != expected_payload_len {
-                return corruption(offset, "invalid legacy point frame size");
+                stop_or_corruption!(
+                    SalvageStopReason::InvalidLegacyFrameSize,
+                    "invalid legacy point frame size"
+                );
             }
         } else if frame_kind == FRAME_KIND_TRANSACTION
             || frame_kind == FRAME_KIND_IDENTIFIED_TRANSACTION
         {
             if payload_len > max_transaction_bytes {
-                return corruption(offset, "transaction frame exceeds configured maximum");
+                stop_or_corruption!(
+                    SalvageStopReason::TransactionFrameTooLarge,
+                    "transaction frame exceeds configured maximum"
+                );
             }
             if frame_kind == FRAME_KIND_IDENTIFIED_TRANSACTION && payload_len < COMMIT_ID_BYTES {
-                return corruption(offset, "identified transaction frame is too short");
+                stop_or_corruption!(
+                    SalvageStopReason::IdentifiedTransactionTooShort,
+                    "identified transaction frame is too short"
+                );
             }
         } else {
-            return corruption(offset, "unknown frame kind");
+            stop_or_corruption!(SalvageStopReason::UnknownFrameKind, "unknown frame kind");
         }
 
         let frame_len = FRAME_HEADER_BYTES as u64 + payload_len as u64;
         if remaining < frame_len {
-            recovered_tail_bytes = remaining;
-            recovered_tail = RecoveredTail::IncompletePayload;
-            if !simulate_recovery {
-                truncate_recovered_tail(file, offset)?;
+            if let ScanMode::Recover { simulate } = mode {
+                recovered_tail_bytes = remaining;
+                recovered_tail = RecoveredTail::IncompletePayload;
+                if !simulate {
+                    truncate_recovered_tail(file, offset)?;
+                }
+            } else {
+                salvage_stop_reason = Some(SalvageStopReason::IncompleteFramePayload);
             }
             break;
         }
@@ -903,7 +1013,7 @@ fn scan_and_recover(
             } else {
                 "payload checksum mismatch before valid tail"
             };
-            return corruption(offset, reason);
+            stop_or_corruption!(SalvageStopReason::PayloadChecksumMismatch, reason);
         }
 
         if frame_kind == FRAME_KIND_LEGACY_POINTS {
@@ -920,14 +1030,32 @@ fn scan_and_recover(
                 // tampering (say, concatenated logs); failing closed keeps
                 // the exactly-once promise instead of silently replaying.
                 if !commit_ids.insert(commit_id) {
-                    return corruption(offset, "duplicate commit identifier");
+                    stop_or_corruption!(
+                        SalvageStopReason::DuplicateCommitId,
+                        "duplicate commit identifier"
+                    );
                 }
                 &payload[COMMIT_ID_BYTES..]
             } else {
                 &payload[..]
             };
-            let records = decode_transaction(transaction_payload, item_count, offset)?;
-            catalog.apply_recovered(&records, offset)?;
+            let records = match decode_transaction(transaction_payload, item_count, offset) {
+                Ok(records) => records,
+                Err(error) if matches!(mode, ScanMode::Salvage) => {
+                    let _ = error;
+                    salvage_stop_reason = Some(SalvageStopReason::InvalidTransaction);
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            if let Err(error) = catalog.apply_recovered(&records, offset) {
+                if matches!(mode, ScanMode::Salvage) {
+                    let _ = error;
+                    salvage_stop_reason = Some(SalvageStopReason::InvalidCatalogTransaction);
+                    break;
+                }
+                return Err(error);
+            }
             let recovered_point_count: usize = records
                 .iter()
                 .map(|record| match record {
@@ -936,7 +1064,10 @@ fn scan_and_recover(
                 })
                 .sum();
             if recovered_point_count > max_batch_points {
-                return corruption(offset, "transaction point count exceeds maximum");
+                stop_or_corruption!(
+                    SalvageStopReason::TransactionPointCountTooLarge,
+                    "transaction point count exceeds maximum"
+                );
             }
             for record in &records {
                 match record {
@@ -954,6 +1085,10 @@ fn scan_and_recover(
         offset += frame_len;
     }
 
+    if matches!(mode, ScanMode::Salvage) && salvage_stop_reason.is_none() {
+        salvage_stop_reason = Some(SalvageStopReason::CleanEof);
+    }
+
     Ok(Scan {
         index,
         catalog,
@@ -963,7 +1098,195 @@ fn scan_and_recover(
         catalog_records,
         recovered_tail_bytes,
         recovered_tail,
+        validated_bytes: offset,
+        salvage_stop_reason,
     })
+}
+
+pub(crate) struct SalvageSource {
+    pub(crate) file: File,
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) source_bytes: u64,
+    pub(crate) recovered_prefix_bytes: u64,
+    pub(crate) recovered_commits: u64,
+    pub(crate) recovered_points: u64,
+    pub(crate) stop_reason: SalvageStopReason,
+    identity: ReadOnlyFileIdentity,
+    root: File,
+    root_path: std::path::PathBuf,
+    root_identity: ReadOnlyDirectoryIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReadOnlyFileIdentity {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReadOnlyDirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl ReadOnlyDirectoryIdentity {
+    fn read(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+impl ReadOnlyFileIdentity {
+    fn read(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            length: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+}
+
+impl SalvageSource {
+    pub(crate) fn open(root_path: &Path, file_name: &str) -> Result<Self> {
+        use rustix::fs::{Mode, OFlags, open, openat};
+
+        let root_descriptor = open(
+            root_path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .map_err(|error| Error::Io(error.into()))?;
+        let root = File::from(root_descriptor);
+        let root_metadata = root.metadata()?;
+        let root_path_metadata = std::fs::symlink_metadata(root_path)?;
+        let root_identity = ReadOnlyDirectoryIdentity::read(&root_metadata);
+        if !root_path_metadata.file_type().is_dir()
+            || ReadOnlyDirectoryIdentity::read(&root_path_metadata) != root_identity
+        {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "salvage source is not a stable directory: {}",
+                    root_path.display()
+                ),
+            )));
+        }
+
+        let path = root_path.join(file_name);
+        let path_metadata = std::fs::symlink_metadata(&path)?;
+        if !path_metadata.file_type().is_file() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("read-only path is not a regular file: {}", path.display()),
+            )));
+        }
+        let descriptor = openat(
+            &root,
+            file_name,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|error| Error::Io(error.into()))?;
+        let mut file = File::from(descriptor);
+        let opened_metadata = file.metadata()?;
+        if !opened_metadata.file_type().is_file()
+            || opened_metadata.dev() != path_metadata.dev()
+            || opened_metadata.ino() != path_metadata.ino()
+        {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("read-only path changed while opening: {}", path.display()),
+            )));
+        }
+        match file.try_lock_shared() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(Error::Locked {
+                    path: path.to_owned(),
+                });
+            }
+            Err(TryLockError::Error(error)) => return Err(Error::Io(error)),
+        }
+        let metadata = file.metadata()?;
+        if metadata.len() < DATABASE_HEADER_BYTES as u64 {
+            return Err(Error::InvalidHeader);
+        }
+        let scan = scan_log(
+            &mut file,
+            Config::default().max_batch_points,
+            Config::default().max_transaction_bytes,
+            ScanMode::Salvage,
+        )?;
+        Ok(Self {
+            file,
+            path: path.to_owned(),
+            source_bytes: metadata.len(),
+            recovered_prefix_bytes: scan.validated_bytes,
+            recovered_commits: scan.commits,
+            recovered_points: scan.points,
+            stop_reason: scan.salvage_stop_reason.unwrap(),
+            identity: ReadOnlyFileIdentity::read(&metadata),
+            root,
+            root_path: root_path.to_owned(),
+            root_identity,
+        })
+    }
+
+    pub(crate) fn ensure_unchanged(&self) -> Result<()> {
+        #[cfg(test)]
+        let mutate = MUTATE_SALVAGE_SOURCE_AFTER_IDENTITY_CHECKS.with(|remaining| {
+            let Some(checks) = remaining.get() else {
+                return false;
+            };
+            if checks == 0 {
+                remaining.set(None);
+                true
+            } else {
+                remaining.set(Some(checks - 1));
+                false
+            }
+        });
+        #[cfg(test)]
+        if mutate {
+            let mut writer = OpenOptions::new().read(true).write(true).open(&self.path)?;
+            writer.seek(SeekFrom::End(-1))?;
+            let mut byte = [0_u8; 1];
+            writer.read_exact(&mut byte)?;
+            writer.seek(SeekFrom::End(-1))?;
+            writer.write_all(&[byte[0] ^ 0xff])?;
+            writer.sync_all()?;
+        }
+
+        let descriptor_identity = ReadOnlyFileIdentity::read(&self.file.metadata()?);
+        let path_metadata = std::fs::symlink_metadata(&self.path)?;
+        let path_identity = ReadOnlyFileIdentity::read(&path_metadata);
+        let root_descriptor_identity = ReadOnlyDirectoryIdentity::read(&self.root.metadata()?);
+        let root_path_metadata = std::fs::symlink_metadata(&self.root_path)?;
+        let root_path_identity = ReadOnlyDirectoryIdentity::read(&root_path_metadata);
+        if !path_metadata.file_type().is_file()
+            || descriptor_identity != self.identity
+            || path_identity != self.identity
+            || !root_path_metadata.file_type().is_dir()
+            || root_descriptor_identity != self.root_identity
+            || root_path_identity != self.root_identity
+        {
+            return Err(Error::SourceChanged {
+                path: self.path.clone(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Opens one existing regular file without following a final symlink or
@@ -1117,6 +1440,9 @@ fn decode_transaction(payload: &[u8], expected_records: usize, offset: u64) -> R
     if record_count != expected_records {
         return corruption(offset, "transaction record count mismatch");
     }
+    if record_count > payload.len().saturating_sub(TRANSACTION_HEADER_BYTES) / RECORD_HEADER_BYTES {
+        return corruption(offset, "transaction record count exceeds payload bounds");
+    }
 
     let mut cursor = TRANSACTION_HEADER_BYTES;
     let mut records = Vec::with_capacity(record_count);
@@ -1235,14 +1561,19 @@ fn decode_point(raw: &[u8]) -> Point {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, Database, Durability, Point, fail_next_sync};
+    use super::{
+        Config, DATABASE_HEADER_BYTES, Database, Durability, FRAME_HEADER_BYTES,
+        FRAME_KIND_IDENTIFIED_TRANSACTION, FRAME_KIND_TRANSACTION, FRAME_VERSION, Point,
+        SalvageSource, SalvageStopReason, ScanMode, encode_frame_header, encode_transaction,
+        fail_next_sync, scan_log,
+    };
     use crate::{
         Entity, EntityId, Error, Plan, PlanStatus, RollupPolicy, Run, RunId, RunKind, RunStatus,
         SeriesDefinition, SeriesSemantics, Transaction,
     };
     use std::collections::BTreeMap;
     use std::fs::OpenOptions;
-    use std::io::{Seek, SeekFrom, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use tempfile::tempdir;
 
     fn point(valid_time: i64, knowledge_time: i64, change_time: i64, value: f64) -> Point {
@@ -1286,6 +1617,379 @@ mod tests {
                 tiers: Vec::new(),
             },
         }
+    }
+
+    fn header_only(path: &std::path::Path) {
+        Database::open(path).unwrap().close().unwrap();
+        assert_eq!(
+            std::fs::metadata(path).unwrap().len(),
+            DATABASE_HEADER_BYTES as u64
+        );
+    }
+
+    fn append_raw_frame(path: &std::path::Path, kind: u16, items: u32, payload: &[u8]) -> u64 {
+        let offset = std::fs::metadata(path).unwrap().len();
+        let header = encode_frame_header(
+            kind,
+            items,
+            u32::try_from(payload.len()).unwrap(),
+            crc32fast::hash(payload),
+        );
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(&header).unwrap();
+        file.write_all(payload).unwrap();
+        file.sync_all().unwrap();
+        offset
+    }
+
+    fn legacy_log(path: &std::path::Path, frames: usize) -> Vec<u64> {
+        let mut database = Database::open(path).unwrap();
+        let mut offsets = Vec::new();
+        for frame in 0..frames {
+            offsets.push(database.stats().unwrap().file_bytes);
+            database
+                .append(&[point(
+                    frame as i64,
+                    frame as i64,
+                    frame as i64,
+                    frame as f64,
+                )])
+                .unwrap();
+        }
+        database.close().unwrap();
+        offsets
+    }
+
+    fn rewrite_frame_header(
+        path: &std::path::Path,
+        offset: u64,
+        rewrite: impl FnOnce(&mut [u8; FRAME_HEADER_BYTES]),
+    ) {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let mut header = [0_u8; FRAME_HEADER_BYTES];
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.read_exact(&mut header).unwrap();
+        rewrite(&mut header);
+        let checksum = crc32fast::hash(&header[..20]);
+        header[20..24].copy_from_slice(&checksum.to_le_bytes());
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&header).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    fn salvage_scan(path: &std::path::Path, max_batch_points: usize) -> super::Scan {
+        let mut file = OpenOptions::new().read(true).open(path).unwrap();
+        scan_log(
+            &mut file,
+            max_batch_points,
+            Config::default().max_transaction_bytes,
+            ScanMode::Salvage,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn salvage_stops_before_the_first_bad_frame_and_never_resynchronizes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("bad-middle-frame.ftwdb");
+        let offsets = legacy_log(&path, 3);
+        let source_bytes = std::fs::metadata(&path).unwrap().len();
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(offsets[1] + FRAME_HEADER_BYTES as u64))
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0x80;
+        file.seek(SeekFrom::Start(offsets[1] + FRAME_HEADER_BYTES as u64))
+            .unwrap();
+        file.write_all(&byte).unwrap();
+        file.sync_all().unwrap();
+
+        let scan = salvage_scan(&path, Config::default().max_batch_points);
+        assert_eq!(
+            scan.salvage_stop_reason,
+            Some(SalvageStopReason::PayloadChecksumMismatch)
+        );
+        assert_eq!(scan.validated_bytes, offsets[1]);
+        assert_eq!(scan.commits, 1);
+        assert_eq!(scan.points, 1);
+        assert_eq!(
+            source_bytes - scan.validated_bytes,
+            source_bytes - offsets[1]
+        );
+    }
+
+    #[test]
+    fn salvage_classifies_frame_headers_bounds_and_short_ends_as_partial() {
+        let directory = tempdir().unwrap();
+
+        let complete_bad_crc = directory.path().join("complete-bad-crc.ftwdb");
+        let offsets = legacy_log(&complete_bad_crc, 2);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&complete_bad_crc)
+            .unwrap();
+        file.seek(SeekFrom::End(-1)).unwrap();
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 1;
+        file.seek(SeekFrom::End(-1)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.sync_all().unwrap();
+        let scan = salvage_scan(&complete_bad_crc, Config::default().max_batch_points);
+        assert_eq!(
+            scan.salvage_stop_reason,
+            Some(SalvageStopReason::PayloadChecksumMismatch)
+        );
+        assert_eq!(scan.validated_bytes, offsets[1]);
+        assert_eq!((scan.commits, scan.points), (1, 1));
+
+        let short_header = directory.path().join("short-header.ftwdb");
+        let offsets = legacy_log(&short_header, 2);
+        OpenOptions::new()
+            .write(true)
+            .open(&short_header)
+            .unwrap()
+            .set_len(offsets[1] + 7)
+            .unwrap();
+        let scan = salvage_scan(&short_header, Config::default().max_batch_points);
+        assert_eq!(
+            scan.salvage_stop_reason,
+            Some(SalvageStopReason::IncompleteFrameHeader)
+        );
+        assert_eq!(scan.validated_bytes, offsets[1]);
+        assert_eq!((scan.commits, scan.points), (1, 1));
+
+        let short_payload = directory.path().join("short-payload.ftwdb");
+        let offsets = legacy_log(&short_payload, 2);
+        let length = std::fs::metadata(&short_payload).unwrap().len();
+        OpenOptions::new()
+            .write(true)
+            .open(&short_payload)
+            .unwrap()
+            .set_len(length - 7)
+            .unwrap();
+        let scan = salvage_scan(&short_payload, Config::default().max_batch_points);
+        assert_eq!(
+            scan.salvage_stop_reason,
+            Some(SalvageStopReason::IncompleteFramePayload)
+        );
+        assert_eq!(scan.validated_bytes, offsets[1]);
+        assert_eq!((scan.commits, scan.points), (1, 1));
+
+        let bad_magic = directory.path().join("bad-magic.ftwdb");
+        let offset = legacy_log(&bad_magic, 1)[0];
+        rewrite_frame_header(&bad_magic, offset, |header| {
+            header[..4].copy_from_slice(b"NOPE");
+        });
+        assert_eq!(
+            salvage_scan(&bad_magic, Config::default().max_batch_points).salvage_stop_reason,
+            Some(SalvageStopReason::InvalidFrameMagic)
+        );
+
+        let unsupported_version = directory.path().join("unsupported-version.ftwdb");
+        let offset = legacy_log(&unsupported_version, 1)[0];
+        rewrite_frame_header(&unsupported_version, offset, |header| {
+            header[4..6].copy_from_slice(&(FRAME_VERSION + 1).to_le_bytes());
+        });
+        assert_eq!(
+            salvage_scan(&unsupported_version, Config::default().max_batch_points)
+                .salvage_stop_reason,
+            Some(SalvageStopReason::UnsupportedFrameVersion)
+        );
+
+        let bad_header_crc = directory.path().join("bad-header-crc.ftwdb");
+        let offset = legacy_log(&bad_header_crc, 1)[0];
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&bad_header_crc)
+            .unwrap();
+        file.seek(SeekFrom::Start(offset + 8)).unwrap();
+        file.write_all(&2_u32.to_le_bytes()).unwrap();
+        file.sync_all().unwrap();
+        assert_eq!(
+            salvage_scan(&bad_header_crc, Config::default().max_batch_points).salvage_stop_reason,
+            Some(SalvageStopReason::FrameHeaderChecksumMismatch)
+        );
+
+        let invalid_legacy_size = directory.path().join("legacy-size.ftwdb");
+        let offset = legacy_log(&invalid_legacy_size, 1)[0];
+        rewrite_frame_header(&invalid_legacy_size, offset, |header| {
+            header[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        });
+        assert_eq!(
+            salvage_scan(&invalid_legacy_size, Config::default().max_batch_points)
+                .salvage_stop_reason,
+            Some(SalvageStopReason::InvalidLegacyFrameSize)
+        );
+
+        let unknown_kind = directory.path().join("unknown-kind.ftwdb");
+        let offset = legacy_log(&unknown_kind, 1)[0];
+        rewrite_frame_header(&unknown_kind, offset, |header| {
+            header[6..8].copy_from_slice(&99_u16.to_le_bytes());
+        });
+        assert_eq!(
+            salvage_scan(&unknown_kind, Config::default().max_batch_points).salvage_stop_reason,
+            Some(SalvageStopReason::UnknownFrameKind)
+        );
+
+        let oversized = directory.path().join("oversized-transaction.ftwdb");
+        header_only(&oversized);
+        let offset = append_raw_frame(&oversized, FRAME_KIND_TRANSACTION, 0, b"bad");
+        rewrite_frame_header(&oversized, offset, |header| {
+            let length = u32::try_from(Config::default().max_transaction_bytes + 1).unwrap();
+            header[12..16].copy_from_slice(&length.to_le_bytes());
+        });
+        assert_eq!(
+            salvage_scan(&oversized, Config::default().max_batch_points).salvage_stop_reason,
+            Some(SalvageStopReason::TransactionFrameTooLarge)
+        );
+    }
+
+    #[test]
+    fn salvage_classifies_all_transaction_failures_after_a_valid_header_as_partial() {
+        let directory = tempdir().unwrap();
+
+        let invalid_transaction = directory.path().join("invalid-transaction.ftwdb");
+        header_only(&invalid_transaction);
+        append_raw_frame(&invalid_transaction, FRAME_KIND_TRANSACTION, 0, b"bad");
+        let scan = salvage_scan(&invalid_transaction, Config::default().max_batch_points);
+        assert_eq!(
+            scan.salvage_stop_reason,
+            Some(SalvageStopReason::InvalidTransaction)
+        );
+        assert_eq!(scan.validated_bytes, DATABASE_HEADER_BYTES as u64);
+        assert_eq!((scan.commits, scan.points), (0, 0));
+
+        let invalid_catalog = directory.path().join("invalid-catalog.ftwdb");
+        header_only(&invalid_catalog);
+        let mut transaction = Transaction::new();
+        transaction.define_series(power_series());
+        let payload = encode_transaction(&transaction).unwrap();
+        append_raw_frame(&invalid_catalog, FRAME_KIND_TRANSACTION, 1, &payload);
+        let scan = salvage_scan(&invalid_catalog, Config::default().max_batch_points);
+        assert_eq!(
+            scan.salvage_stop_reason,
+            Some(SalvageStopReason::InvalidCatalogTransaction)
+        );
+        assert_eq!(scan.validated_bytes, DATABASE_HEADER_BYTES as u64);
+        assert_eq!((scan.commits, scan.points), (0, 0));
+
+        let duplicate = directory.path().join("duplicate-commit-id.ftwdb");
+        header_only(&duplicate);
+        let mut identified = Transaction::new();
+        identified.with_commit_id(77);
+        let payload = encode_transaction(&identified).unwrap();
+        append_raw_frame(&duplicate, FRAME_KIND_IDENTIFIED_TRANSACTION, 0, &payload);
+        let duplicate_offset =
+            append_raw_frame(&duplicate, FRAME_KIND_IDENTIFIED_TRANSACTION, 0, &payload);
+        let scan = salvage_scan(&duplicate, Config::default().max_batch_points);
+        assert_eq!(
+            scan.salvage_stop_reason,
+            Some(SalvageStopReason::DuplicateCommitId)
+        );
+        assert_eq!(scan.validated_bytes, duplicate_offset);
+        assert_eq!((scan.commits, scan.points), (1, 0));
+
+        let too_many_points = directory.path().join("too-many-points.ftwdb");
+        header_only(&too_many_points);
+        let mut catalog = Transaction::new();
+        catalog.upsert_entity(home()).define_series(power_series());
+        let payload = encode_transaction(&catalog).unwrap();
+        append_raw_frame(&too_many_points, FRAME_KIND_TRANSACTION, 2, &payload);
+        let mut first = point(1, 1, 1, 1.0);
+        first.run_id = 0;
+        let mut second = point(2, 2, 2, 2.0);
+        second.run_id = 0;
+        let mut transaction = Transaction::new();
+        transaction.append_points(vec![first, second]);
+        let payload = encode_transaction(&transaction).unwrap();
+        let rejected_offset =
+            append_raw_frame(&too_many_points, FRAME_KIND_TRANSACTION, 1, &payload);
+        let scan = salvage_scan(&too_many_points, 1);
+        assert_eq!(
+            scan.salvage_stop_reason,
+            Some(SalvageStopReason::TransactionPointCountTooLarge)
+        );
+        assert_eq!(scan.validated_bytes, rejected_offset);
+        assert_eq!((scan.commits, scan.points), (1, 0));
+
+        let identified_too_short = directory.path().join("identified-too-short.ftwdb");
+        header_only(&identified_too_short);
+        append_raw_frame(
+            &identified_too_short,
+            FRAME_KIND_IDENTIFIED_TRANSACTION,
+            0,
+            b"short",
+        );
+        assert_eq!(
+            salvage_scan(&identified_too_short, Config::default().max_batch_points)
+                .salvage_stop_reason,
+            Some(SalvageStopReason::IdentifiedTransactionTooShort)
+        );
+
+        let header_only_path = directory.path().join("header-only.ftwdb");
+        header_only(&header_only_path);
+        let scan = salvage_scan(&header_only_path, Config::default().max_batch_points);
+        assert_eq!(scan.salvage_stop_reason, Some(SalvageStopReason::CleanEof));
+        assert_eq!(scan.validated_bytes, DATABASE_HEADER_BYTES as u64);
+        assert_eq!((scan.commits, scan.points), (0, 0));
+    }
+
+    #[test]
+    fn normal_recovery_keeps_catalog_validation_before_the_point_limit() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("recovery-policy.ftwdb");
+        header_only(&path);
+        let mut transaction = Transaction::new();
+        transaction.append_points(vec![point(1, 1, 1, 1.0), point(2, 2, 2, 2.0)]);
+        let payload = encode_transaction(&transaction).unwrap();
+        append_raw_frame(&path, FRAME_KIND_TRANSACTION, 1, &payload);
+
+        match Database::open_with(
+            &path,
+            Config {
+                max_batch_points: 1,
+                ..Config::default()
+            },
+        ) {
+            Err(Error::Corruption { reason, .. }) => {
+                assert!(reason.contains("invalid recovered transaction"));
+            }
+            Err(error) => panic!("wrong normal recovery error: {error}"),
+            Ok(_) => panic!("normal recovery accepted invalid catalog dependencies"),
+        }
+    }
+
+    #[test]
+    fn salvage_source_identity_detects_an_uncooperative_in_place_writer() {
+        let directory = tempdir().unwrap();
+        let source_root = directory.path().join("source");
+        std::fs::create_dir(&source_root).unwrap();
+        let active = source_root.join("active.wlog");
+        legacy_log(&active, 1);
+        let source = SalvageSource::open(&source_root, "active.wlog").unwrap();
+
+        let mut writer = OpenOptions::new().write(true).open(&active).unwrap();
+        writer.seek(SeekFrom::End(-1)).unwrap();
+        writer.write_all(&[0xff]).unwrap();
+        writer.sync_all().unwrap();
+
+        assert!(matches!(
+            source.ensure_unchanged(),
+            Err(Error::SourceChanged { path }) if path == active
+        ));
     }
 
     fn optimization_run() -> Run {

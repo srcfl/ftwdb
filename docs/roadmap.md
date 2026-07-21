@@ -88,9 +88,13 @@ integrity checks, inspection, backup and restore JSON, exact restored bytes,
 and byte-for-byte read-only behavior. The sanitized fixture restore fixes the
 expected result at 889,978 points, 89 commits, and snapshot CRC32 `9ff1a95b`.
 The Linux NBD power-loss run now follows recovery with an off-card backup and a
-verified restore to a new target on the emulated card. Together with the
+verified restore to a new target on the emulated card. Strict salvage now reads
+only the raw log, stops at the first invalid frame without resync, ignores all
+derived files, and publishes a checked prefix through the same atomic
+no-clobber path. The sanitized fixture fixes clean salvage at 889,978 points,
+89 commits, and snapshot CRC32 `9ff1a95b`; the NBD run also checks a seven-byte
+torn suffix and a verified partial target. Together with the
 process-lock, sync-failure, `/dev/full`, and NBD tests, this closes the
 robustness gaps tracked in issue #17. Tests on the target board and SD cards,
-power cuts during commits, soak runs, remote backup policy, corruption salvage,
-and the remaining result-verified adapters stay open and are required for the
-M4 exit.
+power cuts during commits, soak runs, remote backup policy, and the remaining
+result-verified adapters stay open and are required for the M4 exit.

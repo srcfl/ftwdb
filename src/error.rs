@@ -37,6 +37,9 @@ pub enum Error {
         path: PathBuf,
         reason: String,
     },
+    SourceChanged {
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for Error {
@@ -73,6 +76,11 @@ impl fmt::Display for Error {
             Self::SnapshotPublication { path, reason } => write!(
                 f,
                 "snapshot publication at {} could not be rolled back cleanly: {reason}",
+                path.display()
+            ),
+            Self::SourceChanged { path } => write!(
+                f,
+                "source file {} changed while it was being checked",
                 path.display()
             ),
         }

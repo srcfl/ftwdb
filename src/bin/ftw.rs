@@ -1,8 +1,8 @@
 use flate2::read::GzDecoder;
 use ftwdb::{
     BackupReport, Config, Database, Durability, EnergyWorkload, Error, RestoreReport,
-    RollupResolution, Store, Transaction, WorkloadConfig, gauge_bucket_checksum, load_real_fixture,
-    load_tsbs_iot,
+    RollupResolution, SalvageReport, Store, Transaction, WorkloadConfig, gauge_bucket_checksum,
+    load_real_fixture, load_tsbs_iot,
 };
 use std::env;
 use std::fs::File;
@@ -42,6 +42,7 @@ fn main() -> ExitCode {
         Some("check-store") => check_store(&arguments[2..]),
         Some("backup") => backup(&arguments[2..]),
         Some("restore") => restore(&arguments[2..]),
+        Some("salvage") => salvage(&arguments[2..]),
         Some("generate") => generate(&arguments[2..]),
         Some("bench-ftwdb") => bench_ftwdb(&arguments[2..]),
         Some("bench-real-fixture") => bench_real_fixture(&arguments[2..]),
@@ -318,6 +319,33 @@ fn restore_report_json(report: &RestoreReport) -> String {
     )
 }
 
+fn salvage(arguments: &[String]) -> CliResult<()> {
+    if arguments.len() != 2 {
+        return Err(usage_error(
+            "salvage requires a damaged store and absent target directory",
+        ));
+    }
+    let report = Store::salvage_from(&arguments[0], &arguments[1])?;
+    println!("{}", salvage_report_json(&report));
+    Ok(())
+}
+
+fn salvage_report_json(report: &SalvageReport) -> String {
+    format!(
+        "{{\"format\":\"ftwdb-salvage-v1\",\"status\":\"{}\",\"source_bytes\":{},\"recovered_prefix_bytes\":{},\"discarded_bytes\":{},\"stop_offset\":{},\"stop_reason\":\"{}\",\"recovered_commits\":{},\"recovered_points\":{},\"source_prefix_crc32\":\"{:08x}\",\"destination_snapshot_crc32\":\"{:08x}\"}}",
+        report.status,
+        report.source_bytes,
+        report.recovered_prefix_bytes,
+        report.discarded_bytes,
+        report.stop_offset,
+        report.stop_reason,
+        report.recovered_commits,
+        report.recovered_points,
+        report.source_prefix_crc32,
+        report.destination_snapshot_crc32
+    )
+}
+
 fn backup_report_json(report: &BackupReport) -> String {
     let fallback_error_kinds = report
         .hard_link_fallback_error_kinds
@@ -574,14 +602,14 @@ fn runtime_invalid(reason: impl Into<String>) -> CliError {
 
 fn usage(program: &str) {
     eprintln!(
-        "usage:\n  {program} inspect <database-file>\n  {program} check-store <store-directory>\n  {program} backup <store-directory> <absent-destination>\n  {program} restore <backup-directory> <absent-target>\n  {program} generate <output-directory> [--seed N] [--sites N] [--days N] [--cadence-seconds N] [--start-micros N]\n  {program} bench-ftwdb <workload-directory> <empty-database-directory> [--durability always|manual] [--batch-points N]\n  {program} bench-real-fixture <points.csv.gz> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-points N]\n  {program} bench-tsbs-iot <influx-line-file|-> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-rows N]"
+        "usage:\n  {program} inspect <database-file>\n  {program} check-store <store-directory>\n  {program} backup <store-directory> <absent-destination>\n  {program} restore <backup-directory> <absent-target>\n  {program} salvage <damaged-store> <absent-target>\n  {program} generate <output-directory> [--seed N] [--sites N] [--days N] [--cadence-seconds N] [--start-micros N]\n  {program} bench-ftwdb <workload-directory> <empty-database-directory> [--durability always|manual] [--batch-points N]\n  {program} bench-real-fixture <points.csv.gz> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-points N]\n  {program} bench-tsbs-iot <influx-line-file|-> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-rows N]"
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{backup_report_json, restore_report_json};
-    use ftwdb::{BackupReport, RestoreReport};
+    use super::{backup_report_json, restore_report_json, salvage_report_json};
+    use ftwdb::{BackupReport, RestoreReport, SalvageReport, SalvageStatus, SalvageStopReason};
 
     #[test]
     fn backup_json_uses_fixed_error_kind_names() {
@@ -616,6 +644,27 @@ mod tests {
         assert_eq!(
             restore_report_json(&report),
             "{\"format\":\"ftwdb-restore-v1\",\"files\":4,\"bytes\":123,\"manifest_generation\":7,\"raw_commits\":8,\"raw_points\":9,\"source_snapshot_crc32\":\"0123abcd\",\"destination_snapshot_crc32\":\"0123abcd\"}"
+        );
+    }
+
+    #[test]
+    fn salvage_json_has_fixed_status_reason_checksums_and_counts() {
+        let report = SalvageReport {
+            status: SalvageStatus::Partial,
+            source_bytes: 130,
+            recovered_prefix_bytes: 123,
+            discarded_bytes: 7,
+            stop_offset: 123,
+            stop_reason: SalvageStopReason::IncompleteFrameHeader,
+            recovered_commits: 8,
+            recovered_points: 9,
+            source_prefix_crc32: 0x0123_abcd,
+            destination_snapshot_crc32: 0x0123_abcd,
+        };
+
+        assert_eq!(
+            salvage_report_json(&report),
+            "{\"format\":\"ftwdb-salvage-v1\",\"status\":\"partial\",\"source_bytes\":130,\"recovered_prefix_bytes\":123,\"discarded_bytes\":7,\"stop_offset\":123,\"stop_reason\":\"incomplete-frame-header\",\"recovered_commits\":8,\"recovered_points\":9,\"source_prefix_crc32\":\"0123abcd\",\"destination_snapshot_crc32\":\"0123abcd\"}"
         );
     }
 }

@@ -73,6 +73,18 @@ test "$before_hash" = "$after_hash"
 sha256sum "$out/restore-backup/active.wlog" >"$out/restore-backup-sha.txt"
 sha256sum "$mount_dir/restored-database/active.wlog" >"$out/restore-target-sha.txt"
 
+# Keep the damaged source off the emulated card. A short tail must yield a
+# verified partial store on the card without changing the clean raw prefix.
+cp -a "$out/restore-backup" "$out/salvage-source"
+printf 'partial' >>"$out/salvage-source/active.wlog"
+sync
+"$ftw" salvage "$out/salvage-source" "$mount_dir/salvaged-database" \
+  >"$out/salvage.json"
+"$ftw" check-store "$mount_dir/salvaged-database" \
+  >"$out/salvage-check.json"
+sha256sum "$mount_dir/salvaged-database/active.wlog" \
+  >"$out/salvage-target-sha.txt"
+
 json_u64() {
   local file=$1
   local field=$2
@@ -103,12 +115,24 @@ test "$(json_string "$out/restore.json" source_snapshot_crc32)" = \
   "$(json_string "$out/restore.json" destination_snapshot_crc32)"
 test "$(cut -d' ' -f1 "$out/restore-backup-sha.txt")" = \
   "$(cut -d' ' -f1 "$out/restore-target-sha.txt")"
+test "$(json_string "$out/salvage.json" status)" = partial
+test "$(json_string "$out/salvage.json" stop_reason)" = incomplete-frame-header
+test "$(json_u64 "$out/salvage.json" discarded_bytes)" = 7
+test "$(json_u64 "$out/salvage.json" recovered_points)" = 889978
+test "$(json_u64 "$out/salvage.json" recovered_commits)" = 89
+test "$(json_u64 "$out/salvage-check.json" raw_points)" = 889978
+test "$(json_u64 "$out/salvage-check.json" raw_commits)" = 89
+test "$(json_string "$out/salvage.json" source_prefix_crc32)" = \
+  "$(json_string "$out/salvage.json" destination_snapshot_crc32)"
+test "$(cut -d' ' -f1 "$out/restore-backup-sha.txt")" = \
+  "$(cut -d' ' -f1 "$out/salvage-target-sha.txt")"
 
 linux_nbd_finish
 trap - EXIT
 
 printf 'linux_nbd_smoke=passed\n'
 printf 'restore_drill=passed\n'
+printf 'salvage_drill=passed\n'
 printf 'fsck_exit=%d\n' "$fsck_exit"
 printf 'active_log_sha256=%s\n' "$after_hash"
 cat "$out/load.json"
@@ -116,3 +140,5 @@ cat "$out/check-after.json"
 cat "$out/verification.json"
 cat "$out/restore.json"
 cat "$out/restore-check.json"
+cat "$out/salvage.json"
+cat "$out/salvage-check.json"

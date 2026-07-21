@@ -37,10 +37,13 @@ pub use real_fixture::{RealFixtureLoadReport, load_real_fixture};
 pub use rollup::{CalendarGaugeRollup, FixedGaugeRollup, GaugeBucket};
 pub use rollup_segment::{RollupSegment, RollupSegmentStats};
 pub use segment::{Segment, SegmentStats};
-pub use storage::{Commit, Config, Database, Durability, PlanOutcome, Point, RecoveredTail, Stats};
+pub use storage::{
+    Commit, Config, Database, Durability, PlanOutcome, Point, RecoveredTail, SalvageStopReason,
+    Stats,
+};
 pub use store::{
     BackupReport, IntegrityReport, MaintenanceReport, RestoreReport, RetentionGate, RollupQuery,
-    RollupSource, Store,
+    RollupSource, SalvageReport, SalvageStatus, Store,
 };
 pub use transaction::Transaction;
 pub use tsbs::{TsbsIotLoadReport, load_tsbs_iot};
