@@ -16,8 +16,36 @@ const HOUR: i64 = 60 * MINUTE;
 const DAY: i64 = 24 * HOUR;
 const FIVE_MINUTES: i64 = 5 * MINUTE;
 
-/// Upper bound for a `workload.postcard` snapshot accepted by `read_bundle`.
+/// Upper bound for a `workload.postcard` snapshot. `write_bundle` and
+/// `read_bundle` both enforce it through `check_bundle_size`, so `ftw
+/// generate` can never leave a bundle on disk that `ftw bench-ftwdb`
+/// refuses to read; `WorkloadConfig::validate` rejects configurations whose
+/// worst-case encoding would exceed it before any points are generated.
 const MAX_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Worst-case postcard encoding of one `Point`, used by
+/// `WorkloadConfig::validate` to bound a bundle before generating it.
+/// Postcard varints cap at 10 bytes for the `u64`/zigzag-`i64` fields
+/// (`series_id` plus four timestamps), 19 bytes for the `u128` run
+/// identifier, and 5 bytes for each `u32` (`quality`, `flags`); the `f64`
+/// value is a fixed 8 bytes: 5 * 10 + 19 + 2 * 5 + 8 = 87. Measured
+/// bundles encode at roughly 45 bytes per point, so this over-estimates by
+/// about 2x — acceptable for a limit meant to reject workloads three
+/// decimal orders of magnitude past any documented benchmark run.
+const MAX_ENCODED_POINT_BYTES: u64 = 87;
+
+/// Rejects an encoded bundle larger than the cap. The single authority for
+/// the limit on both the write and read paths: whatever this function
+/// admits at `write_bundle` time it also admits at `read_bundle` time, so
+/// the two ends of the bundle protocol can never disagree.
+fn check_bundle_size(encoded_bytes: u64, cap_bytes: u64) -> Result<()> {
+    if encoded_bytes > cap_bytes {
+        return Err(Error::InvalidConfig(
+            "workload bundle exceeds the 1 GiB limit; reduce sites or days, or lengthen the cadence",
+        ));
+    }
+    Ok(())
+}
 
 const GRID_POWER: u64 = 1;
 const SOLAR_POWER: u64 = 2;
@@ -72,6 +100,26 @@ impl WorkloadConfig {
                 "workload exceeds the 100 million base-sample safety limit",
             ));
         }
+        // Early bundle-size guard, mirroring the authoritative check in
+        // `write_bundle`: rejecting here costs nothing, while rejecting
+        // after generation throws away minutes of point synthesis. The
+        // point count bounds the generator from above: up to six telemetry
+        // points per base sample (each site emits samples + 1 base
+        // instants), 24 hourly prices per site-day, and 792 forecast and
+        // plan points per site-day (288 first issues, at most 216
+        // revisions, 288 setpoints). Non-point records are covered by a
+        // generous allowance of 8 KiB per site plus 1 KiB per site-day for
+        // the runs, plan, and catalog rows the generator emits there.
+        let site_days = u64::from(self.sites).saturating_mul(u64::from(self.days));
+        let points = samples
+            .saturating_add(u64::from(self.sites))
+            .saturating_mul(6)
+            .saturating_add(site_days.saturating_mul(24 + 792));
+        let estimated_bytes = points
+            .saturating_mul(MAX_ENCODED_POINT_BYTES)
+            .saturating_add(u64::from(self.sites).saturating_mul(8_192))
+            .saturating_add(site_days.saturating_mul(1_024));
+        check_bundle_size(estimated_bytes, MAX_BUNDLE_BYTES)?;
         Ok(())
     }
 }
@@ -176,6 +224,13 @@ impl EnergyWorkload {
     /// Writes a portable CSV bundle for server adapters plus a binary canonical
     /// snapshot whose CRC is the dataset identity.
     pub fn write_bundle(&self, directory: impl AsRef<Path>) -> Result<WorkloadSummary> {
+        // Encode and size-check first: the authoritative guard against a
+        // bundle `read_bundle` would refuse must fire before any file is
+        // created, so an over-cap workload never leaves a partial or
+        // unreadable artifact on disk.
+        let canonical = postcard::to_stdvec(self)
+            .map_err(|error| Error::Serialization(format!("workload encode failed: {error}")))?;
+        check_bundle_size(canonical.len() as u64, MAX_BUNDLE_BYTES)?;
         let directory = directory.as_ref();
         std::fs::create_dir_all(directory)?;
         write_entities(directory.join("entities.csv"), &self.entities)?;
@@ -183,8 +238,6 @@ impl EnergyWorkload {
         write_runs(directory.join("runs.csv"), &self.runs)?;
         write_plans(directory.join("plans.csv"), &self.plans)?;
         write_points(directory.join("points.csv"), &self.points)?;
-        let canonical = postcard::to_stdvec(self)
-            .map_err(|error| Error::Serialization(format!("workload encode failed: {error}")))?;
         let mut file = File::create(directory.join("workload.postcard"))?;
         file.write_all(&canonical)?;
         file.sync_all()?;
@@ -212,12 +265,9 @@ impl EnergyWorkload {
         // year of one site at 60-second cadence encodes to a few hundred
         // MiB — while the old 8 GiB guard admitted files no bench host
         // could realistically decode twice over in RAM. A larger file almost
-        // certainly means the wrong path was passed, not a real workload.
-        if metadata.len() > MAX_BUNDLE_BYTES {
-            return Err(Error::InvalidConfig(
-                "workload bundle exceeds the 1 GiB reader limit",
-            ));
-        }
+        // certainly means the wrong path was passed, not a real workload:
+        // `write_bundle` enforces the same cap through the same function.
+        check_bundle_size(metadata.len(), MAX_BUNDLE_BYTES)?;
         let encoded = std::fs::read(path)?;
         let workload: Self = postcard::from_bytes(&encoded)
             .map_err(|error| Error::Serialization(format!("workload decode failed: {error}")))?;
@@ -795,6 +845,40 @@ mod tests {
             store.database().catalog().plans().len(),
             workload.plans.len()
         );
+    }
+
+    #[test]
+    fn bundle_size_check_rejects_only_sizes_past_the_cap() {
+        assert!(super::check_bundle_size(1_024, 1_024).is_ok());
+        assert!(matches!(
+            super::check_bundle_size(1_025, 1_024),
+            Err(crate::Error::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn config_whose_bundle_cannot_fit_the_cap_is_rejected_before_generation() {
+        // 120 days of one site at one-second cadence stays under the 100
+        // million base-sample limit but expands to roughly 62 million points
+        // — about 2.8 GiB encoded, past the shared 1 GiB bundle cap.
+        let config = WorkloadConfig {
+            days: 120,
+            cadence_seconds: 1,
+            ..WorkloadConfig::default()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(crate::Error::InvalidConfig(_))
+        ));
+        // The largest documented benchmark run — a year of one site at
+        // 60-second cadence — still validates.
+        WorkloadConfig {
+            days: 365,
+            cadence_seconds: 60,
+            ..WorkloadConfig::default()
+        }
+        .validate()
+        .unwrap();
     }
 
     #[test]
