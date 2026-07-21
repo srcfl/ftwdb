@@ -1,6 +1,7 @@
 use std::error::Error as StdError;
 use std::fmt;
 use std::io;
+use std::path::PathBuf;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -15,6 +16,7 @@ pub enum Error {
     InvalidModel(String),
     Serialization(String),
     Poisoned,
+    Locked { path: PathBuf },
 }
 
 impl fmt::Display for Error {
@@ -37,6 +39,11 @@ impl fmt::Display for Error {
             Self::Poisoned => write!(
                 f,
                 "database writer is poisoned after a failed write; close and reopen it"
+            ),
+            Self::Locked { path } => write!(
+                f,
+                "database file {} is locked by another process; close the other opener first",
+                path.display()
             ),
         }
     }

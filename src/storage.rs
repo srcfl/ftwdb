@@ -6,7 +6,7 @@ use crate::transaction::{Record, Transaction};
 use crc32fast::hash;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -146,12 +146,27 @@ impl Database {
 
     pub fn open_with(path: impl AsRef<Path>, config: Config) -> Result<Self> {
         validate_config(config)?;
+        let path = path.as_ref();
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
             .open(path)?;
+
+        // Take an exclusive advisory lock before recovery so a second opener
+        // can neither interleave frames nor truncate this handle's in-flight
+        // tail. The lock lives exactly as long as the handle: closing or
+        // dropping the database releases it, even on panic or crash.
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(Error::Locked {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(TryLockError::Error(error)) => return Err(Error::Io(error)),
+        }
 
         if file.metadata()?.len() == 0 {
             write_database_header(&mut file)?;
@@ -1029,6 +1044,22 @@ mod tests {
         assert_eq!(latest.len(), 2);
         assert_eq!(latest[0].value, 3.0);
         assert_eq!(database.query_as_of(7, 0, 1_000, 15)[0].value, 1.0);
+    }
+
+    #[test]
+    fn second_opener_fails_until_the_first_handle_closes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("locked.ftwdb");
+        let first = Database::open(&path).unwrap();
+        match Database::open(&path) {
+            Err(Error::Locked { path: reported }) => assert_eq!(reported, path),
+            Err(other) => panic!("expected Error::Locked, got {other:?}"),
+            Ok(_) => panic!("expected Error::Locked, got a second open database"),
+        }
+        drop(first);
+        let mut reopened = Database::open(&path).unwrap();
+        reopened.append(&[point(1, 1, 1, 1.0)]).unwrap();
+        reopened.close().unwrap();
     }
 
     #[test]
