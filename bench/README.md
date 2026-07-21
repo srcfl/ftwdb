@@ -108,3 +108,39 @@ Use a fresh named volume for a measured run. The result is a telemetry-subset
 server/HTTP chart, not a full workload or native embedded comparison: catalog,
 plans, three-dimensional revisions, and DST calendar totals are explicitly
 reported as unsupported.
+
+## QuestDB stored revision subset
+
+The QuestDB adapter checks the bundle summary and every numeric CSV field before
+it writes. It stores every `points.csv` row through ILP over HTTP. The table uses
+`valid_time` as its designated timestamp and maps the portable `change_time` to
+`event_time`; it also stores `knowledge_time`, `valid_time_end`, `series_id`,
+`run_id`, value, quality, and flags. The dataset CRC32 tags each row.
+
+Use a new Compose project name for each run. The adapter refuses to run if the
+volume contains any table. It also checks that `summary.txt` and `points.csv`
+stay byte-identical from validation through import:
+
+```sh
+docker compose -p ftwdb-questdb-run-1 -f bench/compose.yml \
+  --profile questdb up -d --pull never questdb
+python3 bench/adapters/questdb.py bench-results/workload
+docker compose -p ftwdb-questdb-run-1 -f bench/compose.yml \
+  --profile questdb down
+```
+
+`down` keeps the named volume. Record its size before any explicit `down -v`.
+The adapter waits until the dataset's exact point count is query-visible. It
+then filters site-0 grid actuals (`series_id=1`, `run_id=0`) to
+`[first,last)`, which excludes the generator's final closing point. QuestDB
+runs `SAMPLE BY 5m ALIGN TO FIRST OBSERVATION`, so an arbitrary start
+microsecond stays the bucket anchor. Each count, sum, minimum, and maximum must
+match the local result before the adapter emits one JSON line.
+
+The result has `implemented_subset` scope. QuestDB stores all point revisions,
+but this adapter queries only the grid actual series. The JSON lists catalog
+import, plan-record import, and a DST calendar query as `not_implemented`; it
+does not claim that QuestDB lacks those features. Its WAL plus ILP/HTTP
+acknowledgement does not claim the same durability as FTWDB.
+The first real 9.4.3 check is recorded in
+[`docs/results/2026-07-21-questdb-9.4.3.md`](../docs/results/2026-07-21-questdb-9.4.3.md).

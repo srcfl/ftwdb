@@ -74,6 +74,11 @@ machine-readable FTWDB runner, and exact FTWDB/SQLite native comparison are
 implemented. The pinned server registry is explicitly marked compose/smoke-only
 until each adapter verifies results. VictoriaMetrics now has a result-verified
 telemetry-subset adapter, but not a full-domain or equal-durability comparison.
+QuestDB now has a result-verified stored-revision subset: ILP/HTTP stores every
+portable point and all three revision times, while an exact-range
+`SAMPLE BY 5m ALIGN TO FIRST OBSERVATION` query verifies site-0 grid actuals.
+This adapter does not yet import catalog or plan records or verify a DST
+calendar query. Its acknowledged durability point is not yet equal to FTWDB's.
 The TSBS IoT write adapter, fixed sanitized real-installation replay, model-query
 benchmarks, process-kill test, and local full-disk evidence now cover more of the
 workload and failure surface. A deterministic NBD SD-card emulator and one ARM64
