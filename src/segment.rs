@@ -20,6 +20,13 @@ const INDEX_VERSION: u16 = 1;
 const INDEX_HEADER_BYTES: usize = 16;
 const INDEX_ENTRY_BYTES: usize = 40;
 const COLUMN_COUNT: usize = 7;
+/// Every encoded point consumes at least one varint byte in each of the
+/// timestamp, valid-end, knowledge, change, run-id, and value columns plus two
+/// in the quality/flags column, so eight bytes is a hard lower bound per point.
+const MIN_ENCODED_POINT_BYTES: u64 = 8;
+/// The LZ4 block format cannot expand one compressed byte into more than 255
+/// output bytes, so a payload bounds its decompressed size by this ratio.
+const MAX_LZ4_RATIO: u64 = 255;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SegmentStats {
@@ -371,6 +378,11 @@ fn decode_columns(encoded: &[u8], series_id: u64, count: usize, offset: u64) -> 
     if count == 0 {
         return corruption(offset, "zero-point segment block");
     }
+    // Bound the untrusted point count by the payload that is actually present
+    // before reserving any point-sized capacity.
+    if minimum_encoded_bytes(count as u64) > encoded.len() as u64 {
+        return corruption(offset, "block point count exceeds payload capacity");
+    }
     let columns = split_columns(encoded, offset)?;
     let mut timestamp_cursor = 0;
     if columns[0].len() < 8 {
@@ -588,6 +600,18 @@ fn validate_index(index: &[IndexEntry], index_offset: u64, point_count: u64) -> 
         {
             return corruption(index_offset, "invalid segment index entry");
         }
+        // The block payload cannot decode to more points than its byte count
+        // allows: even through LZ4 the payload expands at most MAX_LZ4_RATIO
+        // times, and every decoded point needs MIN_ENCODED_POINT_BYTES.
+        let payload_bytes = u64::from(entry.length).saturating_sub(BLOCK_HEADER_BYTES as u64);
+        if minimum_encoded_bytes(u64::from(entry.points))
+            > payload_bytes.saturating_mul(MAX_LZ4_RATIO)
+        {
+            return corruption(
+                index_offset,
+                "segment index point count exceeds block capacity",
+            );
+        }
         if let Some(previous) = previous
             && (entry.series_id, entry.min_time) < (previous.series_id, previous.min_time)
         {
@@ -604,6 +628,14 @@ fn validate_index(index: &[IndexEntry], index_offset: u64, point_count: u64) -> 
         );
     }
     Ok(())
+}
+
+/// The smallest possible encoded size of `points` column-encoded points: seven
+/// u32 column lengths, the fixed eight-byte first timestamp and first value
+/// (seven bytes beyond their one-byte varint minimum each), and at least
+/// `MIN_ENCODED_POINT_BYTES` for every point.
+fn minimum_encoded_bytes(points: u64) -> u64 {
+    COLUMN_COUNT as u64 * 4 + 14 + points.saturating_mul(MIN_ENCODED_POINT_BYTES)
 }
 
 fn checked_delta(left: i64, right: i64) -> Result<i64> {
@@ -713,10 +745,12 @@ fn corrupt_error(offset: u64, reason: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{BLOCK_HEADER_BYTES, Segment};
+    use super::{BLOCK_HEADER_BYTES, INDEX_ENTRY_BYTES, INDEX_HEADER_BYTES, Segment};
     use crate::{Error, Point};
+    use crc32fast::hash;
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
+    use std::path::Path;
     use tempfile::tempdir;
 
     fn points(count: usize) -> Vec<Point> {
@@ -735,6 +769,47 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    /// Rewrites the claimed point count of the first block, keeping every
+    /// checksum consistent so only the new structural bounds can reject it.
+    fn claim_first_block_points(path: &Path, claimed: u32) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let index_offset = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
+        let entry_count = u32::from_le_bytes(
+            bytes[index_offset + 8..index_offset + 12]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let entries_start = index_offset + INDEX_HEADER_BYTES;
+        let entries_end = entries_start + entry_count * INDEX_ENTRY_BYTES;
+
+        // Index entry point count.
+        bytes[entries_start + 36..entries_start + 40].copy_from_slice(&claimed.to_le_bytes());
+        // Matching block header point count plus its checksum.
+        let block_offset = u64::from_le_bytes(
+            bytes[entries_start + 24..entries_start + 32]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        bytes[block_offset + 16..block_offset + 20].copy_from_slice(&claimed.to_le_bytes());
+        let block_crc = hash(&bytes[block_offset..block_offset + 48]);
+        bytes[block_offset + 48..block_offset + 52].copy_from_slice(&block_crc.to_le_bytes());
+        // Index checksum.
+        let index_crc = hash(&bytes[entries_start..entries_end]);
+        bytes[index_offset + 12..index_offset + 16].copy_from_slice(&index_crc.to_le_bytes());
+        // Segment header total point count plus its checksum.
+        let mut total = 0_u64;
+        for entry in 0..entry_count {
+            let offset = entries_start + entry * INDEX_ENTRY_BYTES;
+            total += u64::from(u32::from_le_bytes(
+                bytes[offset + 36..offset + 40].try_into().unwrap(),
+            ));
+        }
+        bytes[16..24].copy_from_slice(&total.to_le_bytes());
+        let header_crc = hash(&bytes[..36]);
+        bytes[36..40].copy_from_slice(&header_crc.to_le_bytes());
+        std::fs::write(path, bytes).unwrap();
     }
 
     #[test]
@@ -775,6 +850,38 @@ mod tests {
         file.write_all(&[0xAA]).unwrap();
         file.sync_all().unwrap();
 
+        let mut segment = Segment::open(&path).unwrap();
+        assert!(matches!(
+            segment.query(1, i64::MIN, i64::MAX),
+            Err(Error::Corruption { .. })
+        ));
+    }
+
+    #[test]
+    fn huge_index_point_count_is_rejected_on_open() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("huge-index.seg");
+        Segment::create(&path, &points(100), 1_000).unwrap();
+
+        // Claim u32::MAX points in one small block; opening must fail with a
+        // corruption error instead of reserving tens of gigabytes on query.
+        claim_first_block_points(&path, u32::MAX);
+        assert!(matches!(
+            Segment::open(&path),
+            Err(Error::Corruption { .. })
+        ));
+    }
+
+    #[test]
+    fn inflated_block_point_count_is_rejected_on_query() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("inflated-block.seg");
+        Segment::create(&path, &points(100), 1_000).unwrap();
+
+        // Claim more points than the decoded payload can hold while staying
+        // under the index's compression-ratio bound, so the block is only
+        // rejected when its columns are decoded.
+        claim_first_block_points(&path, 1_000);
         let mut segment = Segment::open(&path).unwrap();
         assert!(matches!(
             segment.query(1, i64::MIN, i64::MAX),
