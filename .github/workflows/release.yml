@@ -31,6 +31,10 @@ jobs:
             echo "invalid release tag: ${tag}" >&2
             exit 1
           fi
+          if [[ "$(git cat-file -t "${tag}")" != "tag" ]]; then
+            echo "release tag must be annotated: ${tag}" >&2
+            exit 1
+          fi
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
           if [[ "v${version}" != "${tag}" ]]; then
             echo "Cargo version ${version} does not match tag ${tag}" >&2
@@ -112,6 +116,12 @@ jobs:
         run: |
           set -euo pipefail
           sort -k2 dist/*.sha256 > dist/SHA256SUMS
+          git for-each-ref --format='%(contents)' \
+            "refs/tags/${GITHUB_REF_NAME}" > dist/RELEASE_NOTES.md
+          if [[ ! -s dist/RELEASE_NOTES.md ]]; then
+            echo "annotated tag has no release notes: ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
           prerelease=()
           if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
             prerelease+=(--prerelease)
@@ -121,5 +131,5 @@ jobs:
             --repo "${GITHUB_REPOSITORY}" \
             --verify-tag \
             --title "FTWDB ${GITHUB_REF_NAME}" \
-            --notes-from-tag \
+            --notes-file dist/RELEASE_NOTES.md \
             "${prerelease[@]}"

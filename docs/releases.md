@@ -46,7 +46,8 @@ remove exposed secrets or meet a legal requirement, and record that event.
 
 Pushing a matching tag starts `.github/workflows/release.yml`. The workflow:
 
-1. checks the tag syntax and exact Cargo/changelog version;
+1. checks that the tag is annotated and matches the exact Cargo/changelog
+   version;
 2. repeats the release test and package checks;
 3. builds native `ftw` archives on GitHub's Linux and macOS runners;
 4. creates `SHA256SUMS` for the archives; and
