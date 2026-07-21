@@ -1,11 +1,14 @@
 [package]
 name = "ftwdb"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 rust-version = "1.97"
 description = "Forecasts, Telemetry & Watts: an SD-card-conscious embedded energy database"
 license = "Apache-2.0"
 repository = "https://github.com/srcfl/ftwdb"
+readme = "README.md"
+keywords = ["database", "time-series", "embedded", "energy"]
+categories = ["database-implementations"]
 
 [package.metadata.ftwdb]
 support = "Unix targets only; Linux and macOS are tested in CI"

@@ -1,6 +1,6 @@
 # Roadmap
 
-## M0: durability and semantics — in progress
+## M0: durability and semantics — initial exit complete
 
 - checksummed append frames and tail recovery;
 - explicit durability modes;
@@ -9,7 +9,10 @@
 - mergeable gauge/counter aggregate states;
 - property, corruption, and microbenchmark coverage.
 
-Exit: recovery invariants pass under randomized truncation and bit flips.
+Initial exit met: property tests cover every truncation point in the final
+frame, complete checksum-corrupt frames stay intact and return corruption, and
+earlier frame corruption never becomes tail recovery. Broader media-fault and
+physical power-cut work continues in M4.
 
 ## M1: catalog, plans, and transactional records — complete
 

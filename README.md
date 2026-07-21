@@ -7,6 +7,15 @@ small Rust engine that is fast on time-window aggregates, survives abrupt power
 loss, and minimizes write amplification on SD cards and other constrained edge
 storage.
 
+The current release is **v0.1.0-alpha.1**. It is an evaluation build for Unix
+systems, not a production release. Download release archives from
+[GitHub Releases](https://github.com/srcfl/ftwdb/releases), or install the CLI
+from its immutable tag:
+
+```sh
+cargo install --git https://github.com/srcfl/ftwdb --tag v0.1.0-alpha.1 --locked --bin ftw
+```
+
 This repository currently contains the first executable storage slice:
 
 - append-only, checksummed atomic batches;
@@ -78,6 +87,7 @@ cargo run --release -- salvage ./damaged-energy.ftwdb ./salvaged-energy.ftwdb
 - [Deterministic energy workload](docs/workload.md)
 - [Bootstrap benchmark result](docs/results/2026-07-21-macos-arm64.md)
 - [TSBS and robustness result](docs/results/2026-07-21-tsbs-robustness.md)
+- [Release policy and process](docs/releases.md)
 - [Roadmap](docs/roadmap.md)
 
 ## License
