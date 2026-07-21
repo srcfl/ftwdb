@@ -15,11 +15,14 @@ This repository currently contains the first executable storage slice:
 - persistent catalog recovery and exact-time plan-versus-actual queries;
 - latest-revision and point-in-time queries;
 - mergeable gauge, energy-integral, and reset-aware counter aggregates;
+- immutable compressed raw and rollup segments with checksummed manifests;
+- persistent fixed and IANA-calendar rollups, including DST-correct energy;
+- automatic late-data invalidation, rebuild, cached queries, and retention gates;
 - tests, property tests, Criterion benchmarks, and a competitor benchmark plan.
 
-It is **not production-ready**. The current in-memory read index and uncompressed
-point encoding are intentional bootstrap implementations used to validate
-durability and semantics before the immutable columnar segment format lands.
+It is **not production-ready**. The active log still rebuilds an in-memory read
+index, raw compaction/deletion is intentionally disabled, and real SD-card
+power-cut evidence has not yet been collected.
 
 ## Quick start
 
@@ -41,6 +44,7 @@ cargo run --release -- inspect ./data.wattdb
 - [Energy model, plans, and rollups](docs/energy-model.md)
 - [Storage format v1](docs/format.md)
 - [Immutable segment format](docs/segment-format.md)
+- [Persistent rollups and retention](docs/rollups.md)
 - [OSS database research](docs/research.md)
 - [Benchmark protocol](docs/benchmarking.md)
 - [Bootstrap benchmark result](docs/results/2026-07-21-macos-arm64.md)

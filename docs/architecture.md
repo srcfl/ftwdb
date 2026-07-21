@@ -40,27 +40,16 @@ of state:
 
 ```text
 database/
-  LOCK
-  MANIFEST.000001
-  commit/
-    active.log
-    sealed-*.log
-  segments/
-    raw-*.seg
+  active.wlog
+  manifests/
+    MANIFEST.00000000000000000001
   rollups/
-    5m-*.seg
-    30m-*.seg
-    1h-*.seg
-    1d-*.seg
-    1mo-*.seg
-  catalog/
-    entities-*.seg
-    relations-*.seg
-    runs-*.seg
+    g1-s42-f300000000-*.rseg
 ```
 
-The current v1 prototype is one append file. It validates framing and recovery
-before the directory layout is introduced.
+This is the current M3 directory shape. Raw immutable segments exist as a
+standalone format but are not yet installed into the manifest or used to
+reclaim the mixed active log.
 
 ## Write path
 
@@ -87,8 +76,9 @@ Readers use a stable manifest snapshot. The planner:
 4. merges immutable blocks and recent committed frames;
 5. applies revision winner rules `(knowledge_time, change_time, append_order)`.
 
-The prototype rebuilds an in-memory per-series index on open. The segment
-milestone replaces this with sparse block indexes and bounded caches.
+The active log currently rebuilds an in-memory per-series index on open.
+Materialized rollups use verified immutable files and a process-local cache;
+M4 moves raw reads to sparse segment indexes and bounds both caches.
 
 ## Crash and corruption model
 
@@ -109,4 +99,3 @@ The first production shape is one writer with snapshot readers. This matches
 edge ingestion, makes commit order unambiguous, and avoids a coordination-heavy
 write path. Concurrent producers feed one bounded writer queue. Independent
 readers never mutate segment files.
-

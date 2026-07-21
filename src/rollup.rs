@@ -1,4 +1,5 @@
-use crate::{Point, Sample};
+use crate::{CalendarUnit, Error, Point, Result, RollupResolution, Sample};
+use jiff::{Timestamp, ToSpan};
 use std::collections::BTreeMap;
 
 /// A closed aggregate state for one fixed UTC bucket.
@@ -101,6 +102,91 @@ pub struct FixedGaugeRollup {
     buckets: BTreeMap<i64, GaugeBucket>,
 }
 
+/// Materialized calendar rollups whose bucket edges are local midnights in an
+/// IANA time zone. The stored edges remain UTC microseconds, so 23/25-hour DST
+/// days and variable-length months retain their true energy duration.
+#[derive(Clone, Debug)]
+pub struct CalendarGaugeRollup {
+    resolution: RollupResolution,
+    buckets: BTreeMap<i64, GaugeBucket>,
+}
+
+impl CalendarGaugeRollup {
+    pub fn build(
+        points: &[Point],
+        unit: CalendarUnit,
+        iana_timezone: &str,
+        max_gap_micros: i64,
+    ) -> Result<Self> {
+        if max_gap_micros < 0 {
+            return Err(Error::InvalidConfig(
+                "calendar rollup maximum gap must not be negative",
+            ));
+        }
+
+        // Resolve the zone even for an empty input. A typo in durable policy
+        // must fail maintenance instead of remaining latent until data arrives.
+        let _ = Timestamp::UNIX_EPOCH
+            .in_tz(iana_timezone)
+            .map_err(calendar_error)?;
+        let mut ordered = points.to_vec();
+        ordered.sort_by_key(|point| point.valid_time);
+        let mut buckets = BTreeMap::new();
+
+        for point in &ordered {
+            let (start, end) = calendar_bucket_bounds(point.valid_time, unit, iana_timezone)?;
+            buckets
+                .entry(start)
+                .or_insert_with(|| GaugeBucket::empty(start, end))
+                .add_sample(Sample::new(point.valid_time, point.value));
+        }
+
+        for pair in ordered.windows(2) {
+            let previous = pair[0];
+            let next = pair[1];
+            let gap = next.valid_time - previous.valid_time;
+            if gap <= 0 || gap > max_gap_micros {
+                continue;
+            }
+            add_calendar_interval(
+                &mut buckets,
+                unit,
+                iana_timezone,
+                previous.valid_time,
+                next.valid_time,
+                previous.value,
+            )?;
+        }
+
+        Ok(Self {
+            resolution: RollupResolution::Calendar {
+                unit,
+                iana_timezone: iana_timezone.to_owned(),
+            },
+            buckets,
+        })
+    }
+
+    #[must_use]
+    pub const fn resolution(&self) -> &RollupResolution {
+        &self.resolution
+    }
+
+    #[must_use]
+    pub fn buckets(&self) -> impl ExactSizeIterator<Item = &GaugeBucket> {
+        self.buckets.values()
+    }
+
+    #[must_use]
+    pub fn range(&self, start: i64, end: i64) -> Vec<GaugeBucket> {
+        self.buckets
+            .values()
+            .filter(|bucket| bucket.end > start && bucket.start < end)
+            .copied()
+            .collect()
+    }
+}
+
 impl FixedGaugeRollup {
     /// Builds rollups from latest-revision points sorted internally by valid
     /// time. Interpolation is previous-value hold. A gap larger than
@@ -183,6 +269,62 @@ fn add_interval(
     }
 }
 
+fn add_calendar_interval(
+    buckets: &mut BTreeMap<i64, GaugeBucket>,
+    unit: CalendarUnit,
+    timezone: &str,
+    mut start: i64,
+    end: i64,
+    value: f64,
+) -> Result<()> {
+    while start < end {
+        let (bucket_start, bucket_end) = calendar_bucket_bounds(start, unit, timezone)?;
+        let interval_end = end.min(bucket_end);
+        buckets
+            .entry(bucket_start)
+            .or_insert_with(|| GaugeBucket::empty(bucket_start, bucket_end))
+            .add_covered_interval(value, interval_end - start);
+        start = interval_end;
+    }
+    Ok(())
+}
+
+pub(crate) fn calendar_bucket_bounds(
+    timestamp_micros: i64,
+    unit: CalendarUnit,
+    timezone: &str,
+) -> Result<(i64, i64)> {
+    let zoned = Timestamp::from_microsecond(timestamp_micros)
+        .and_then(|timestamp| timestamp.in_tz(timezone))
+        .map_err(calendar_error)?;
+    let start = match unit {
+        CalendarUnit::Day => zoned.start_of_day(),
+        CalendarUnit::Month => zoned
+            .first_of_month()
+            .map_err(calendar_error)?
+            .start_of_day(),
+        CalendarUnit::Year => zoned
+            .first_of_year()
+            .map_err(calendar_error)?
+            .start_of_day(),
+    }
+    .map_err(calendar_error)?;
+    let end = match unit {
+        CalendarUnit::Day => start.checked_add(1.day()),
+        CalendarUnit::Month => start.checked_add(1.month()),
+        CalendarUnit::Year => start.checked_add(1.year()),
+    }
+    .map_err(calendar_error)?;
+    Ok((
+        start.timestamp().as_microsecond(),
+        end.timestamp().as_microsecond(),
+    ))
+}
+
+fn calendar_error(error: jiff::Error) -> Error {
+    Error::InvalidModel(format!("invalid calendar rollup: {error}"))
+}
+
 fn bucket_start(timestamp: i64, resolution: i64) -> i64 {
     timestamp.div_euclid(resolution) * resolution
 }
@@ -203,8 +345,9 @@ fn option_max(left: Option<f64>, right: Option<f64>) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::FixedGaugeRollup;
-    use crate::Point;
+    use super::{CalendarGaugeRollup, FixedGaugeRollup, calendar_bucket_bounds};
+    use crate::{CalendarUnit, Point};
+    use jiff::civil::date;
 
     const SECOND: i64 = 1_000_000;
 
@@ -248,5 +391,59 @@ mod tests {
         assert_eq!(merged.end, 10 * SECOND);
         assert_eq!(merged.covered_micros, 10 * SECOND);
         assert_eq!(merged.time_weighted_mean(), Some(3.0));
+    }
+
+    #[test]
+    fn stockholm_calendar_days_follow_dst_not_24_hour_assumptions() {
+        let spring_noon = date(2026, 3, 29)
+            .at(12, 0, 0, 0)
+            .in_tz("Europe/Stockholm")
+            .unwrap()
+            .timestamp()
+            .as_microsecond();
+        let fall_noon = date(2026, 10, 25)
+            .at(12, 0, 0, 0)
+            .in_tz("Europe/Stockholm")
+            .unwrap()
+            .timestamp()
+            .as_microsecond();
+        let spring =
+            calendar_bucket_bounds(spring_noon, CalendarUnit::Day, "Europe/Stockholm").unwrap();
+        let fall =
+            calendar_bucket_bounds(fall_noon, CalendarUnit::Day, "Europe/Stockholm").unwrap();
+
+        assert_eq!(spring.1 - spring.0, 23 * 3_600 * SECOND);
+        assert_eq!(fall.1 - fall.0, 25 * 3_600 * SECOND);
+    }
+
+    #[test]
+    fn calendar_energy_uses_real_bucket_duration() {
+        let start = date(2026, 3, 29)
+            .at(0, 0, 0, 0)
+            .in_tz("Europe/Stockholm")
+            .unwrap()
+            .timestamp()
+            .as_microsecond();
+        let end = date(2026, 3, 30)
+            .at(0, 0, 0, 0)
+            .in_tz("Europe/Stockholm")
+            .unwrap()
+            .timestamp()
+            .as_microsecond();
+        let points = [
+            Point::actual(1, start, 1_000.0),
+            Point::actual(1, end, 1_000.0),
+        ];
+        let rollup = CalendarGaugeRollup::build(
+            &points,
+            CalendarUnit::Day,
+            "Europe/Stockholm",
+            26 * 3_600 * SECOND,
+        )
+        .unwrap();
+        let first = *rollup.buckets().next().unwrap();
+
+        assert_eq!(first.covered_micros, 23 * 3_600 * SECOND);
+        assert_eq!(first.power_to_energy_hours(), 23_000.0);
     }
 }
