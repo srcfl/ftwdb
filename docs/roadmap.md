@@ -74,7 +74,12 @@ machine-readable FTWDB runner, and exact FTWDB/SQLite native comparison are
 implemented. The pinned server registry is explicitly marked compose/smoke-only
 until each adapter verifies results. VictoriaMetrics now has a result-verified
 telemetry-subset adapter, but not a full-domain or equal-durability comparison.
-ARM64 SD, full-disk, soak, remote backup/salvage, the remaining adapters, and physical
-power-cut work remain open and are required for the M4 exit. Local snapshot
-backup plus post-publication integrity verification is implemented; remote
-backup policy and corruption salvage remain open.
+The TSBS IoT write adapter, fixed sanitized real-installation replay, model-query
+benchmarks, process-kill test, and local full-disk evidence now cover more of the
+workload and failure surface. A deterministic NBD SD-card emulator and one ARM64
+Linux/ext4 smoke run add repeatable media-cache and power-loss checks, but the
+recorded cut happened after the load and host sync. Local snapshot backup plus
+post-publication integrity verification is implemented. Tests on the target
+board and SD cards, power cuts during commits, a repeatable full-disk test,
+soak runs, remote backup policy, restore drills, corruption salvage, and the
+remaining result-verified adapters stay open and are required for the M4 exit.

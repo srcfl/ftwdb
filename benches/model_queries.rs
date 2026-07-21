@@ -341,6 +341,7 @@ fn verify_answers(fixture: &Fixture) {
         FIVE_MINUTES,
         2 * SECOND,
     )
+    .unwrap()
     .range(0, fixture.actual_end);
     assert_eq!(rollup.source, RollupSource::Materialized);
     assert_eq!(rollup.buckets, expected);

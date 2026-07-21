@@ -145,7 +145,7 @@ The standalone Rust crate under `bench/sd-card-emulator` exposes sparse media
 through NBD on Linux. Its profiles can set bandwidth, IOPS, latency tails,
 volatile cache behavior, false flush replies, power loss, torn and reordered
 writes, wear, bad blocks, EIO, silent bit changes, read-only state, and device
-loss. Ten protocol and model tests passed, including FTWDB acknowledged-
+loss. Eleven protocol and model tests passed, including FTWDB acknowledged-
 watermark checks.
 
 An OrbStack container then ran Linux 7.0.11 on ARM64 with a 1 GiB emulated NBD
@@ -188,17 +188,16 @@ This proves a local, self-contained snapshot. FTWDB still lacks a restore
 command, scheduled restore drills, remote upload, encryption, incremental
 backup, retention, and salvage from a damaged source.
 
-## Risks found
+## Risks found at the tested commit
 
 1. A complete final frame with a bad payload CRC is treated as an interrupted
    tail and removed. That rule can hide bit rot in a batch already acknowledged
    by `Durability::Always`. Normal open should fail on a complete bad frame; a
    separate repair command may choose to remove it.
-2. FTWDB has no process lock. A two-writer trial let both writers commit and
-   produced both copies of the dataset. The trial did not corrupt the log, but
-   it confirms that the database does not enforce its single-writer rule.
-3. The new active log does not have a clear parent-directory sync after file
-   creation.
+2. At the tested commit, FTWDB had no process lock. PR #18 added shared and
+   exclusive file locks after this run.
+3. At the tested commit, the new active log did not sync its parent directory
+   after file creation. PR #20 added that sync after this run.
 4. The emulator covers returned I/O errors and several media faults. The suite
    still needs a Linux NBD matrix, failed host `fsync`, corrupt inactive
    manifests and segments, and runs on the target board and cards.
@@ -210,5 +209,6 @@ backup, retention, and salvage from a damaged source.
 FTWDB has good logical batch recovery, explicit full-disk failure, fast stored
 Gauge rollups, a working local backup, a fixed real-data replay, and a
 repeatable SD fault model. It is not ready for unattended SD-card use. The
-last-frame CRC policy, lack of a writer lock, missing model query paths, and
-lack of target-hardware power-cut evidence remain release blockers.
+last-frame CRC policy, missing model query paths, and lack of target-hardware
+power-cut evidence remain release blockers. The writer lock and parent-directory
+sync findings above were fixed after this run.

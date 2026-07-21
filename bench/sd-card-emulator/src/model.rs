@@ -399,6 +399,7 @@ impl SdCard {
                     .rng
                     .chance(self.profile.cache.false_flush_probability_ppm)
             {
+                self.persist_pending()?;
                 self.persist(offset, &data)?;
                 self.file
                     .sync_data()
@@ -432,10 +433,7 @@ impl SdCard {
             self.record_fault("false_flush", operation, 0);
             return Ok(());
         }
-        let pending = std::mem::take(&mut self.pending);
-        for write in pending {
-            self.persist(write.offset, &write.data)?;
-        }
+        self.persist_pending()?;
         self.file
             .sync_data()
             .map_err(|error| DeviceError::io("flush backing file", error))?;
@@ -571,6 +569,14 @@ impl SdCard {
             .iter()
             .map(|write| write.data.len() as u64)
             .sum()
+    }
+
+    fn persist_pending(&mut self) -> Result<(), DeviceError> {
+        let pending = std::mem::take(&mut self.pending);
+        for write in pending {
+            self.persist(write.offset, &write.data)?;
+        }
+        Ok(())
     }
 
     fn wait_for_io(&mut self, write: bool, bytes: usize) {
@@ -807,6 +813,21 @@ mod tests {
         card.flush().unwrap();
         raw = fs::read(&path).unwrap();
         assert_eq!(&raw[1024..1028], &[1, 2, 3, 4]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fua_preserves_order_with_older_overlapping_cached_writes() {
+        let path = temporary_file("fua-order");
+        let mut card = SdCard::open(&path, profile(), 43).unwrap();
+        card.write(1024, vec![1; 512], false).unwrap();
+        card.write(1024, vec![2; 512], true).unwrap();
+
+        assert_eq!(card.read(1024, 512).unwrap(), vec![2; 512]);
+        card.power_loss().unwrap();
+        card.reset();
+        assert_eq!(card.read(1024, 512).unwrap(), vec![2; 512]);
+
         fs::remove_file(path).unwrap();
     }
 
