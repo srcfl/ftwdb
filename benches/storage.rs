@@ -63,11 +63,17 @@ fn storage_benchmarks(criterion: &mut Criterion) {
         bencher.iter(|| database.query_latest(1, 0, i64::MAX));
     });
     group.bench_function("materialize_5m_gauge_rollup", |bencher| {
-        bencher.iter(|| database.rollup_gauge(1, 0, i64::MAX, 300_000_000, 10_000_000));
+        bencher.iter(|| {
+            database
+                .rollup_gauge(1, 0, i64::MAX, 300_000_000, 10_000_000)
+                .unwrap()
+        });
     });
     group.finish();
 
-    let rollup = database.rollup_gauge(1, 0, i64::MAX, 300_000_000, 10_000_000);
+    let rollup = database
+        .rollup_gauge(1, 0, i64::MAX, 300_000_000, 10_000_000)
+        .unwrap();
     let bucket_count = rollup.buckets().len() as u64;
     let mut group = criterion.benchmark_group("query_materialized_rollup");
     group.throughput(Throughput::Elements(bucket_count));

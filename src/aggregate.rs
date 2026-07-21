@@ -1,5 +1,7 @@
 //! Mergeable aggregate states used by the rollup pyramid.
 
+use crate::{Error, Result};
+
 /// A scalar sample at a UTC timestamp expressed in microseconds since Unix
 /// epoch.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -48,11 +50,15 @@ impl GaugeAggregate {
     }
 
     /// Adds a sample in non-decreasing timestamp order.
-    pub fn push(&mut self, sample: Sample, max_gap_micros: i64) {
-        assert!(
-            sample.timestamp >= self.last.timestamp,
-            "samples must be time ordered"
-        );
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] and leaves the state unchanged when
+    /// the sample is older than the last pushed sample.
+    pub fn push(&mut self, sample: Sample, max_gap_micros: i64) -> Result<()> {
+        if sample.timestamp < self.last.timestamp {
+            return Err(Error::InvalidArgument("samples must be time ordered"));
+        }
         let gap = sample.timestamp - self.last.timestamp;
         if gap <= max_gap_micros {
             self.integral_value_micros += self.last.value * gap as f64;
@@ -63,15 +69,21 @@ impl GaugeAggregate {
         self.min = self.min.min(sample.value);
         self.max = self.max.max(sample.value);
         self.last = sample;
+        Ok(())
     }
 
     /// Combines adjacent aggregate states without revisiting their raw points.
-    #[must_use]
-    pub fn merge(self, next: Self, max_gap_micros: i64) -> Self {
-        assert!(
-            next.first.timestamp >= self.last.timestamp,
-            "aggregate states must be time ordered"
-        );
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] when `next` starts before this
+    /// state's last sample.
+    pub fn merge(self, next: Self, max_gap_micros: i64) -> Result<Self> {
+        if next.first.timestamp < self.last.timestamp {
+            return Err(Error::InvalidArgument(
+                "aggregate states must be time ordered",
+            ));
+        }
         let gap = next.first.timestamp - self.last.timestamp;
         let (bridge_integral, bridge_coverage) = if gap <= max_gap_micros {
             (self.last.value * gap as f64, gap)
@@ -79,7 +91,7 @@ impl GaugeAggregate {
             (0.0, 0)
         };
 
-        Self {
+        Ok(Self {
             count: self.count + next.count,
             sum: self.sum + next.sum,
             min: self.min.min(next.min),
@@ -90,7 +102,7 @@ impl GaugeAggregate {
                 + bridge_integral
                 + next.integral_value_micros,
             covered_micros: self.covered_micros + bridge_coverage + next.covered_micros,
-        }
+        })
     }
 
     #[must_use]
@@ -133,32 +145,44 @@ impl CounterAggregate {
         }
     }
 
-    pub fn push(&mut self, sample: Sample) {
-        assert!(
-            sample.timestamp >= self.last.timestamp,
-            "samples must be time ordered"
-        );
+    /// Adds a sample in non-decreasing timestamp order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] and leaves the state unchanged when
+    /// the sample is older than the last pushed sample.
+    pub fn push(&mut self, sample: Sample) -> Result<()> {
+        if sample.timestamp < self.last.timestamp {
+            return Err(Error::InvalidArgument("samples must be time ordered"));
+        }
         let (delta, reset) = counter_step(self.last.value, sample.value);
         self.positive_delta += delta;
         self.resets += u64::from(reset);
         self.count += 1;
         self.last = sample;
+        Ok(())
     }
 
-    #[must_use]
-    pub fn merge(self, next: Self) -> Self {
-        assert!(
-            next.first.timestamp >= self.last.timestamp,
-            "aggregate states must be time ordered"
-        );
+    /// Combines adjacent aggregate states without revisiting their raw points.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] when `next` starts before this
+    /// state's last sample.
+    pub fn merge(self, next: Self) -> Result<Self> {
+        if next.first.timestamp < self.last.timestamp {
+            return Err(Error::InvalidArgument(
+                "aggregate states must be time ordered",
+            ));
+        }
         let (bridge_delta, reset) = counter_step(self.last.value, next.first.value);
-        Self {
+        Ok(Self {
             count: self.count + next.count,
             first: self.first,
             last: next.last,
             positive_delta: self.positive_delta + bridge_delta + next.positive_delta,
             resets: self.resets + u64::from(reset) + next.resets,
-        }
+        })
     }
 }
 
@@ -175,6 +199,7 @@ fn counter_step(previous: f64, next: f64) -> (f64, bool) {
 #[cfg(test)]
 mod tests {
     use super::{CounterAggregate, GaugeAggregate, Sample};
+    use crate::Error;
 
     #[test]
     fn merged_gauge_matches_direct_aggregation() {
@@ -188,22 +213,24 @@ mod tests {
 
         let mut direct = GaugeAggregate::from_sample(samples[0]);
         for sample in &samples[1..] {
-            direct.push(*sample, max_gap);
+            direct.push(*sample, max_gap).unwrap();
         }
 
         let mut left = GaugeAggregate::from_sample(samples[0]);
-        left.push(samples[1], max_gap);
+        left.push(samples[1], max_gap).unwrap();
         let mut right = GaugeAggregate::from_sample(samples[2]);
-        right.push(samples[3], max_gap);
+        right.push(samples[3], max_gap).unwrap();
 
-        assert_eq!(direct, left.merge(right, max_gap));
+        assert_eq!(direct, left.merge(right, max_gap).unwrap());
         assert_eq!(direct.time_weighted_mean(), Some(22.0 / 6.0));
     }
 
     #[test]
     fn long_gaps_are_not_treated_as_observed_energy() {
         let mut aggregate = GaugeAggregate::from_sample(Sample::new(0, 2.0));
-        aggregate.push(Sample::new(60_000_000, 2.0), 5_000_000);
+        aggregate
+            .push(Sample::new(60_000_000, 2.0), 5_000_000)
+            .unwrap();
         assert_eq!(aggregate.covered_micros, 0);
         assert_eq!(aggregate.time_weighted_mean(), None);
     }
@@ -211,10 +238,42 @@ mod tests {
     #[test]
     fn counter_resets_are_counted_and_do_not_go_negative() {
         let mut aggregate = CounterAggregate::from_sample(Sample::new(0, 100.0));
-        aggregate.push(Sample::new(1, 105.0));
-        aggregate.push(Sample::new(2, 2.0));
-        aggregate.push(Sample::new(3, 7.0));
+        aggregate.push(Sample::new(1, 105.0)).unwrap();
+        aggregate.push(Sample::new(2, 2.0)).unwrap();
+        aggregate.push(Sample::new(3, 7.0)).unwrap();
         assert_eq!(aggregate.positive_delta, 12.0);
         assert_eq!(aggregate.resets, 1);
+    }
+
+    #[test]
+    fn out_of_order_gauge_samples_error_without_mutating_state() {
+        let mut aggregate = GaugeAggregate::from_sample(Sample::new(10, 1.0));
+        aggregate.push(Sample::new(20, 2.0), 100).unwrap();
+        let before = aggregate;
+        assert!(matches!(
+            aggregate.push(Sample::new(15, 3.0), 100),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert_eq!(aggregate, before);
+        assert!(matches!(
+            before.merge(GaugeAggregate::from_sample(Sample::new(5, 1.0)), 100),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn out_of_order_counter_samples_error_without_mutating_state() {
+        let mut aggregate = CounterAggregate::from_sample(Sample::new(10, 1.0));
+        aggregate.push(Sample::new(20, 2.0)).unwrap();
+        let before = aggregate;
+        assert!(matches!(
+            aggregate.push(Sample::new(15, 3.0)),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert_eq!(aggregate, before);
+        assert!(matches!(
+            before.merge(CounterAggregate::from_sample(Sample::new(5, 1.0))),
+            Err(Error::InvalidArgument(_))
+        ));
     }
 }

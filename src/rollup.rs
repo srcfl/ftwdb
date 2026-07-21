@@ -77,10 +77,16 @@ impl GaugeBucket {
     }
 
     /// Combines exact adjacent fine buckets into one coarser closed state.
-    #[must_use]
-    pub fn merge_exact(self, next: Self) -> Self {
-        assert_eq!(self.end, next.start, "rollup buckets must be adjacent");
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] when `next` does not start exactly
+    /// where this bucket ends.
+    pub fn merge_exact(self, next: Self) -> Result<Self> {
+        if self.end != next.start {
+            return Err(Error::InvalidArgument("rollup buckets must be adjacent"));
+        }
+        Ok(Self {
             start: self.start,
             end: next.end,
             count: self.count + next.count,
@@ -91,7 +97,7 @@ impl GaugeBucket {
             last: next.last.or(self.last),
             integral_value_micros: self.integral_value_micros + next.integral_value_micros,
             covered_micros: self.covered_micros + next.covered_micros,
-        }
+        })
     }
 }
 
@@ -119,7 +125,7 @@ impl CalendarGaugeRollup {
         max_gap_micros: i64,
     ) -> Result<Self> {
         if max_gap_micros < 0 {
-            return Err(Error::InvalidConfig(
+            return Err(Error::InvalidArgument(
                 "calendar rollup maximum gap must not be negative",
             ));
         }
@@ -191,10 +197,22 @@ impl FixedGaugeRollup {
     /// Builds rollups from latest-revision points sorted internally by valid
     /// time. Interpolation is previous-value hold. A gap larger than
     /// `max_gap_micros` contributes neither coverage nor energy.
-    #[must_use]
-    pub fn build(points: &[Point], resolution_micros: i64, max_gap_micros: i64) -> Self {
-        assert!(resolution_micros > 0, "resolution must be positive");
-        assert!(max_gap_micros >= 0, "maximum gap must not be negative");
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] when `resolution_micros` is not
+    /// positive or `max_gap_micros` is negative.
+    pub fn build(points: &[Point], resolution_micros: i64, max_gap_micros: i64) -> Result<Self> {
+        if resolution_micros <= 0 {
+            return Err(Error::InvalidArgument(
+                "fixed rollup resolution must be positive",
+            ));
+        }
+        if max_gap_micros < 0 {
+            return Err(Error::InvalidArgument(
+                "fixed rollup maximum gap must not be negative",
+            ));
+        }
 
         let mut ordered = points.to_vec();
         ordered.sort_by_key(|point| point.valid_time);
@@ -224,10 +242,10 @@ impl FixedGaugeRollup {
             );
         }
 
-        Self {
+        Ok(Self {
             resolution_micros,
             buckets,
-        }
+        })
     }
 
     #[must_use]
@@ -345,11 +363,42 @@ fn option_max(left: Option<f64>, right: Option<f64>) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CalendarGaugeRollup, FixedGaugeRollup, calendar_bucket_bounds};
-    use crate::{CalendarUnit, Point};
+    use super::{CalendarGaugeRollup, FixedGaugeRollup, GaugeBucket, calendar_bucket_bounds};
+    use crate::{CalendarUnit, Error, Point};
     use jiff::civil::date;
 
     const SECOND: i64 = 1_000_000;
+
+    #[test]
+    fn invalid_build_arguments_error_instead_of_panicking() {
+        let points = [Point::actual(1, 0, 1.0)];
+        assert!(matches!(
+            FixedGaugeRollup::build(&points, 0, SECOND),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            FixedGaugeRollup::build(&points, -SECOND, SECOND),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            FixedGaugeRollup::build(&points, SECOND, -1),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            CalendarGaugeRollup::build(&points, CalendarUnit::Day, "Europe/Stockholm", -1),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn non_adjacent_bucket_merge_errors_instead_of_panicking() {
+        let left = GaugeBucket::empty(0, 5 * SECOND);
+        let right = GaugeBucket::empty(10 * SECOND, 15 * SECOND);
+        assert!(matches!(
+            left.merge_exact(right),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
 
     #[test]
     fn clips_integrals_at_bucket_edges() {
@@ -358,7 +407,7 @@ mod tests {
             Point::actual(1, 7 * SECOND, 4.0),
             Point::actual(1, 12 * SECOND, 8.0),
         ];
-        let rollup = FixedGaugeRollup::build(&points, 5 * SECOND, 60 * SECOND);
+        let rollup = FixedGaugeRollup::build(&points, 5 * SECOND, 60 * SECOND).unwrap();
         let buckets: Vec<_> = rollup.buckets().copied().collect();
 
         assert_eq!(buckets.len(), 3);
@@ -373,7 +422,7 @@ mod tests {
     #[test]
     fn negative_timestamps_use_euclidean_bucket_alignment() {
         let points = [Point::actual(1, -SECOND, 1.0)];
-        let rollup = FixedGaugeRollup::build(&points, 5 * SECOND, 5 * SECOND);
+        let rollup = FixedGaugeRollup::build(&points, 5 * SECOND, 5 * SECOND).unwrap();
         assert_eq!(rollup.buckets().next().unwrap().start, -5 * SECOND);
     }
 
@@ -384,9 +433,9 @@ mod tests {
             Point::actual(1, 5 * SECOND, 4.0),
             Point::actual(1, 10 * SECOND, 8.0),
         ];
-        let rollup = FixedGaugeRollup::build(&points, 5 * SECOND, 5 * SECOND);
+        let rollup = FixedGaugeRollup::build(&points, 5 * SECOND, 5 * SECOND).unwrap();
         let buckets: Vec<_> = rollup.buckets().copied().collect();
-        let merged = buckets[0].merge_exact(buckets[1]);
+        let merged = buckets[0].merge_exact(buckets[1]).unwrap();
         assert_eq!(merged.start, 0);
         assert_eq!(merged.end, 10 * SECOND);
         assert_eq!(merged.covered_micros, 10 * SECOND);

@@ -875,7 +875,7 @@ fn materialize(
                     "fixed rollup resolution must be positive".to_owned(),
                 ));
             }
-            Ok(FixedGaugeRollup::build(points, *micros, max_gap_micros)
+            Ok(FixedGaugeRollup::build(points, *micros, max_gap_micros)?
                 .buckets()
                 .copied()
                 .collect())

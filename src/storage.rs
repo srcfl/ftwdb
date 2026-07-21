@@ -585,7 +585,11 @@ impl Database {
 
     /// Materializes fixed UTC gauge buckets from the winning revisions in a
     /// range. Persistent background rollups will use the same bucket state.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] when `resolution_micros` is not
+    /// positive or `max_gap_micros` is negative.
     pub fn rollup_gauge(
         &self,
         series_id: u64,
@@ -593,7 +597,7 @@ impl Database {
         end: i64,
         resolution_micros: i64,
         max_gap_micros: i64,
-    ) -> FixedGaugeRollup {
+    ) -> Result<FixedGaugeRollup> {
         FixedGaugeRollup::build(
             &self.query_latest(series_id, start, end),
             resolution_micros,
@@ -1158,6 +1162,29 @@ mod tests {
         assert_eq!(latest.len(), 2);
         assert_eq!(latest[0].value, 3.0);
         assert_eq!(database.query_as_of(7, 0, 1_000, 15)[0].value, 1.0);
+    }
+
+    #[test]
+    fn rollup_gauge_rejects_invalid_arguments_instead_of_panicking() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("rollup-arguments.ftwdb");
+        let mut database = Database::open(&path).unwrap();
+        database.append(&[point(100, 10, 11, 1.0)]).unwrap();
+
+        assert!(matches!(
+            database.rollup_gauge(7, 0, 1_000, 0, 10),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            database.rollup_gauge(7, 0, 1_000, -5, 10),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            database.rollup_gauge(7, 0, 1_000, 300, -1),
+            Err(Error::InvalidArgument(_))
+        ));
+        let rollup = database.rollup_gauge(7, 0, 1_000, 300, 10).unwrap();
+        assert_eq!(rollup.buckets().len(), 1);
     }
 
     #[test]
