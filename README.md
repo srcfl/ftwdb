@@ -46,6 +46,13 @@ Inspect a database file:
 cargo run --release -- inspect ./data.wattdb
 ```
 
+Verify or snapshot a directory store:
+
+```sh
+cargo run --release -- check-store ./energy.wattdb
+cargo run --release -- backup ./energy.wattdb ./backups/energy-2026-07-21.wattdb
+```
+
 ## Design documents
 
 - [Architecture and invariants](docs/architecture.md)
@@ -53,6 +60,7 @@ cargo run --release -- inspect ./data.wattdb
 - [Storage format v1](docs/format.md)
 - [Immutable segment format](docs/segment-format.md)
 - [Persistent rollups and retention](docs/rollups.md)
+- [Integrity checks and backup](docs/operations.md)
 - [OSS database research](docs/research.md)
 - [Benchmark protocol](docs/benchmarking.md)
 - [Deterministic energy workload](docs/workload.md)

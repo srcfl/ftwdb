@@ -74,5 +74,7 @@ machine-readable WattDB runner, and exact WattDB/SQLite native comparison are
 implemented. The pinned server registry is explicitly marked compose/smoke-only
 until each adapter verifies results. VictoriaMetrics now has a result-verified
 telemetry-subset adapter, but not a full-domain or equal-durability comparison.
-ARM64 SD, full-disk, soak, backup/salvage, the remaining adapters, and physical
-power-cut work remain open and are required for the M4 exit.
+ARM64 SD, full-disk, soak, remote backup/salvage, the remaining adapters, and physical
+power-cut work remain open and are required for the M4 exit. Local snapshot
+backup plus post-publication integrity verification is implemented; remote
+backup policy and corruption salvage remain open.

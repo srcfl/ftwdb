@@ -15,6 +15,8 @@ fn main() -> ExitCode {
     let arguments: Vec<_> = env::args().collect();
     let result = match arguments.get(1).map(String::as_str) {
         Some("inspect") => inspect(&arguments[2..]),
+        Some("check-store") => check_store(&arguments[2..]),
+        Some("backup") => backup(&arguments[2..]),
         Some("generate") => generate(&arguments[2..]),
         Some("bench-wattdb") => bench_wattdb(&arguments[2..]),
         _ => {
@@ -29,6 +31,39 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn check_store(arguments: &[String]) -> Result<()> {
+    if arguments.len() != 1 {
+        return Err(invalid("check-store requires one store directory"));
+    }
+    let store = Store::open(&arguments[0])?;
+    let report = store.check_integrity()?;
+    println!(
+        "{{\"format\":\"wattdb-integrity-v1\",\"manifest_generation\":{},\"raw_points\":{},\"raw_commits\":{},\"active_rollup_files\":{},\"active_rollup_buckets\":{},\"active_rollup_bytes\":{}}}",
+        report.manifest_generation,
+        report.raw_points,
+        report.raw_commits,
+        report.active_rollup_files,
+        report.active_rollup_buckets,
+        report.active_rollup_bytes
+    );
+    Ok(())
+}
+
+fn backup(arguments: &[String]) -> Result<()> {
+    if arguments.len() != 2 {
+        return Err(invalid(
+            "backup requires source and absent destination directories",
+        ));
+    }
+    let mut store = Store::open(&arguments[0])?;
+    let report = store.backup_to(&arguments[1])?;
+    println!(
+        "{{\"format\":\"wattdb-backup-v1\",\"files\":{},\"bytes\":{},\"manifest_generation\":{}}}",
+        report.files, report.bytes, report.manifest_generation
+    );
+    Ok(())
 }
 
 fn inspect(arguments: &[String]) -> Result<()> {
@@ -214,6 +249,6 @@ fn invalid(reason: impl Into<String>) -> Error {
 
 fn usage(program: &str) {
     eprintln!(
-        "usage:\n  {program} inspect <database-file>\n  {program} generate <output-directory> [--seed N] [--sites N] [--days N] [--cadence-seconds N] [--start-micros N]\n  {program} bench-wattdb <workload-directory> <empty-database-directory> [--durability always|manual] [--batch-points N]"
+        "usage:\n  {program} inspect <database-file>\n  {program} check-store <store-directory>\n  {program} backup <store-directory> <absent-destination>\n  {program} generate <output-directory> [--seed N] [--sites N] [--days N] [--cadence-seconds N] [--start-micros N]\n  {program} bench-wattdb <workload-directory> <empty-database-directory> [--durability always|manual] [--batch-points N]"
     );
 }

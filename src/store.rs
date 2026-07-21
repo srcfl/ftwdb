@@ -46,6 +46,23 @@ pub struct MaintenanceReport {
     pub retention_gates: Vec<RetentionGate>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IntegrityReport {
+    pub manifest_generation: u64,
+    pub raw_points: u64,
+    pub raw_commits: u64,
+    pub active_rollup_files: usize,
+    pub active_rollup_buckets: u64,
+    pub active_rollup_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BackupReport {
+    pub files: usize,
+    pub bytes: u64,
+    pub manifest_generation: u64,
+}
+
 /// A directory-level WattDB store with a commit log and durable rollup
 /// generations. Maintenance is explicit so an embedded caller can schedule it
 /// around flash, CPU, and power constraints.
@@ -430,6 +447,89 @@ impl Store {
         self.flush()
     }
 
+    /// Re-opens and verifies every active immutable rollup in the selected
+    /// manifest. Opening the Store has already recovered/validated the raw log.
+    pub fn check_integrity(&self) -> Result<IntegrityReport> {
+        self.ensure_healthy()?;
+        let raw = self.database.stats()?;
+        let mut report = IntegrityReport {
+            manifest_generation: self.manifest.generation,
+            raw_points: raw.points,
+            raw_commits: raw.commits,
+            ..IntegrityReport::default()
+        };
+        for descriptor in self.active_rollups() {
+            let segment = RollupSegment::open(self.rollup_directory.join(&descriptor.file))?;
+            let stats = segment.stats();
+            if stats.min_start.is_none_or(|start| start < descriptor.start)
+                || stats.max_end.is_none_or(|end| end > descriptor.end)
+                || descriptor.source_points > raw.points
+            {
+                return Err(Error::Corruption {
+                    offset: 0,
+                    reason: format!(
+                        "active rollup {} does not match its manifest coverage/source",
+                        descriptor.file
+                    ),
+                });
+            }
+            report.active_rollup_files += 1;
+            report.active_rollup_buckets += u64::from(stats.buckets);
+            report.active_rollup_bytes += stats.stored_bytes;
+        }
+        Ok(report)
+    }
+
+    /// Creates a self-contained point-in-time backup and publishes the target
+    /// directory only after every copied/linkable file and directory is synced.
+    pub fn backup_to(&mut self, destination: impl AsRef<Path>) -> Result<BackupReport> {
+        self.ensure_healthy()?;
+        let destination = destination.as_ref();
+        if destination.exists() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "backup destination already exists",
+            )));
+        }
+        let parent = destination.parent().ok_or(Error::InvalidConfig(
+            "backup destination must have a parent directory",
+        ))?;
+        std::fs::create_dir_all(parent)?;
+        self.database.flush()?;
+        self.check_integrity()?;
+
+        let name = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(Error::InvalidConfig("backup destination must be UTF-8"))?;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temporary = parent.join(format!(".{name}.backup-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&temporary)?;
+        let result = self.write_backup(&temporary);
+        let mut report = match result {
+            Ok(report) => report,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&temporary);
+                return Err(error);
+            }
+        };
+        if let Err(error) = std::fs::rename(&temporary, destination) {
+            let _ = std::fs::remove_dir_all(&temporary);
+            return Err(Error::Io(error));
+        }
+        sync_directory(parent)?;
+
+        // Opening the published copy exercises raw recovery, manifest parsing,
+        // and every active segment before the caller treats it as a backup.
+        let backup = Self::open(destination)?;
+        backup.check_integrity()?;
+        report.bytes = directory_bytes(destination)?;
+        Ok(report)
+    }
+
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
@@ -487,6 +587,39 @@ impl Store {
         let mut buckets = materialize(&points, resolution, max_gap_micros)?;
         buckets.retain(|bucket| bucket.start >= start && bucket.end <= end);
         Ok(buckets)
+    }
+
+    fn write_backup(&self, temporary: &Path) -> Result<BackupReport> {
+        let manifests = temporary.join(MANIFEST_DIRECTORY);
+        let rollups = temporary.join(ROLLUP_DIRECTORY);
+        std::fs::create_dir(&manifests)?;
+        std::fs::create_dir(&rollups)?;
+        let mut report = BackupReport {
+            manifest_generation: self.manifest.generation,
+            ..BackupReport::default()
+        };
+
+        // Never hard-link the active log: future appends to the source inode
+        // must not mutate the backup snapshot.
+        copy_and_sync(&self.root.join(ACTIVE_LOG), &temporary.join(ACTIVE_LOG))?;
+        report.files += 1;
+        for descriptor in self.active_rollups() {
+            hard_link_or_copy(
+                &self.rollup_directory.join(&descriptor.file),
+                &rollups.join(&descriptor.file),
+            )?;
+            report.files += 1;
+        }
+        if self.manifest.generation > 0 {
+            let file = format!("MANIFEST.{:020}", self.manifest.generation);
+            hard_link_or_copy(&self.manifest_directory.join(&file), &manifests.join(&file))?;
+            report.files += 1;
+        }
+        sync_directory(&manifests)?;
+        sync_directory(&rollups)?;
+        sync_directory(temporary)?;
+        report.bytes = directory_bytes(temporary)?;
+        Ok(report)
     }
 
     fn verify_and_reconcile_manifest(&mut self) -> Result<()> {
@@ -750,6 +883,33 @@ fn sync_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn copy_and_sync(source: &Path, destination: &Path) -> Result<u64> {
+    let bytes = std::fs::copy(source, destination)?;
+    std::fs::File::open(destination)?.sync_all()?;
+    Ok(bytes)
+}
+
+fn hard_link_or_copy(source: &Path, destination: &Path) -> Result<()> {
+    if std::fs::hard_link(source, destination).is_err() {
+        copy_and_sync(source, destination)?;
+    }
+    Ok(())
+}
+
+fn directory_bytes(path: &Path) -> Result<u64> {
+    let mut total = 0_u64;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        total = total.saturating_add(if metadata.is_dir() {
+            directory_bytes(&entry.path())?
+        } else {
+            metadata.len()
+        });
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{RollupSource, Store};
@@ -991,5 +1151,45 @@ mod tests {
                 .source,
             RollupSource::Materialized
         );
+    }
+
+    #[test]
+    fn backup_is_verified_and_raw_log_is_independent() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("backup");
+        let resolution = RollupResolution::FixedMicros(5 * SECOND);
+        let mut store = Store::open(&source).unwrap();
+        initialize(
+            &mut store,
+            vec![RollupTier {
+                resolution: resolution.clone(),
+                retain_for_micros: None,
+            }],
+            None,
+        );
+        let mut transaction = Transaction::new();
+        transaction.append_points(points());
+        store.commit(transaction).unwrap();
+        store.maintain(DAY).unwrap();
+        let report = store.backup_to(&destination).unwrap();
+        assert!(report.files >= 3);
+        assert!(report.bytes > 0);
+
+        let backup = Store::open(&destination).unwrap();
+        assert_eq!(
+            backup
+                .query_gauge(1, 0, 20 * SECOND, &resolution)
+                .unwrap()
+                .source,
+            RollupSource::Materialized
+        );
+        let backup_points = backup.database().stats().unwrap().points;
+
+        let mut transaction = Transaction::new();
+        transaction.append_points(vec![Point::actual(1, 30 * SECOND, 30.0)]);
+        store.commit(transaction).unwrap();
+        assert_eq!(backup.database().stats().unwrap().points, backup_points);
+        assert_eq!(store.database().stats().unwrap().points, backup_points + 1);
     }
 }
