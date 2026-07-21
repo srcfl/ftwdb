@@ -88,6 +88,13 @@ SQLite's “powersafe overwrite” property. Therefore new data is appended, eve
 frame is checksummed, immutable outputs are fully written and synced before
 publication, and manifest replacement includes a directory sync.
 
+FTWDB v0.1 supports Unix targets only. Ubuntu Linux and macOS run the same root
+and SD-emulator checks in CI. Every directory-entry durability point uses one
+shared helper that opens and syncs the directory after a create, link, rename,
+or removal. Non-Unix builds fail instead of replacing this step with a no-op
+and claiming the same durability. The privileged NBD filesystem test remains a
+separate Linux-only check.
+
 The test matrix must include process kill, arbitrary frame truncation, payload
 bit flips, full-disk errors, failed sync, stale manifests, and real power-cut
 testing on representative SD hardware. Process tests alone cannot prove power
