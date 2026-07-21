@@ -1,0 +1,15 @@
+adapter,status,telemetry,revisions_3d,catalog,plans,dst_calendar,notes
+wattdb,implemented,implemented,implemented,implemented,implemented,implemented,CLI JSON runner and Criterion
+sqlite,implemented_native,implemented,stored,stored,stored,query_baseline,Exact native result verification
+victoriametrics,smoke_only,smoke_tested,unsupported_native,unsupported_native,unsupported_native,not_implemented,Compose startup verified; energy adapter pending
+questdb,compose_only,pending,pending,pending,pending,pending,Adapter not yet result-verified
+timescaledb,compose_only,pending,pending,pending,pending,pending,Adapter not yet result-verified
+clickhouse,compose_only,pending,pending,pending,pending,pending,Adapter not yet result-verified
+greptimedb,compose_only,pending,pending,pending,pending,pending,Adapter not yet result-verified
+iotdb,compose_only,pending,pending,pending,pending,pending,Adapter not yet result-verified
+influxdb3,compose_only,pending,pending,pending,pending,pending,Adapter not yet result-verified
+tdengine,compose_only,pending,pending,pending,pending,pending,Adapter not yet result-verified
+tsink,registry_only,pending,pending,pending,pending,pending,Native adapter pending
+duckdb,registry_only,pending,pending,pending,pending,pending,Native adapter pending
+rrdtool,registry_only,pending,unsupported_native,unsupported_native,unsupported_native,pending,Telemetry rollup comparison only
+reductstore,registry_only,pending,pending,pending,pending,pending,Native adapter pending

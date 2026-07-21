@@ -16,6 +16,7 @@ mod segment;
 mod storage;
 mod store;
 mod transaction;
+mod workload;
 
 pub use aggregate::{CounterAggregate, GaugeAggregate, Sample};
 pub use catalog::{Catalog, CatalogStats};
@@ -32,3 +33,4 @@ pub use segment::{Segment, SegmentStats};
 pub use storage::{Commit, Config, Database, Durability, PlanOutcome, Point, Stats};
 pub use store::{MaintenanceReport, RetentionGate, RollupQuery, RollupSource, Store};
 pub use transaction::Transaction;
+pub use workload::{EnergyWorkload, WorkloadConfig, WorkloadSummary, gauge_bucket_checksum};

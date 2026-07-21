@@ -23,3 +23,19 @@ durability, and run one engine at a time. `tsink`, RRDtool, SQLite, DuckDB, and
 ReductStore are native/embedded adapters and therefore are not defined as
 server containers here.
 
+`capabilities.csv` is the honesty gate for published charts. `compose_only`
+means an image is pinned but no result-verified energy adapter exists yet;
+`smoke_only` must never appear in a performance ranking. Generate the shared
+input with:
+
+```sh
+cargo run --release -- generate bench-results/workload \
+  --sites 1 --days 7 --cadence-seconds 60 --seed 42
+```
+
+The checked-in native WattDB/SQLite comparison uses the same mixed-domain
+generator and rejects unequal 5-minute results:
+
+```sh
+cargo bench --bench energy_compare -- --quick
+```

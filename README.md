@@ -30,6 +30,14 @@ power-cut evidence has not yet been collected.
 cargo test --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
 cargo bench --bench storage
+cargo bench --bench energy_compare -- --quick
+```
+
+Generate one deterministic portable workload and run WattDB against it:
+
+```sh
+cargo run --release -- generate ./bench-results/workload --sites 1 --days 7 --cadence-seconds 60 --seed 42
+cargo run --release -- bench-wattdb ./bench-results/workload ./bench-results/wattdb-manual --durability manual
 ```
 
 Inspect a database file:
@@ -47,6 +55,7 @@ cargo run --release -- inspect ./data.wattdb
 - [Persistent rollups and retention](docs/rollups.md)
 - [OSS database research](docs/research.md)
 - [Benchmark protocol](docs/benchmarking.md)
+- [Deterministic energy workload](docs/workload.md)
 - [Bootstrap benchmark result](docs/results/2026-07-21-macos-arm64.md)
 - [Roadmap](docs/roadmap.md)
 

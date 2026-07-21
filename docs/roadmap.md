@@ -67,3 +67,9 @@ and physical log reclamation remain hardening work.
 
 Exit: reproducible, result-verified reports with no unexplained durability or
 configuration asymmetry.
+
+Initial progress: the deterministic mixed energy generator, portable bundle,
+machine-readable WattDB runner, and exact WattDB/SQLite native comparison are
+implemented. The pinned server registry is explicitly marked compose/smoke-only
+until each adapter verifies results. ARM64 SD, full-disk, soak, backup/salvage,
+and physical power-cut work remain open and are required for the M4 exit.

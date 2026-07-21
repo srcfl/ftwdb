@@ -1,38 +1,219 @@
 use std::env;
+use std::path::Path;
 use std::process::ExitCode;
-use wattdb::Database;
+use std::time::Instant;
+use wattdb::{
+    Config, Database, Durability, EnergyWorkload, Error, Result, RollupResolution, Store,
+    Transaction, WorkloadConfig, gauge_bucket_checksum,
+};
+
+const SECOND: i64 = 1_000_000;
+const DAY: i64 = 86_400 * SECOND;
+const FIVE_MINUTES: i64 = 300 * SECOND;
 
 fn main() -> ExitCode {
-    let mut arguments = env::args();
-    let program = arguments.next().unwrap_or_else(|| "wattdb".to_owned());
-    let Some(command) = arguments.next() else {
-        eprintln!("usage: {program} inspect <database-path>");
-        return ExitCode::from(2);
-    };
-    let Some(path) = arguments.next() else {
-        eprintln!("usage: {program} inspect <database-path>");
-        return ExitCode::from(2);
-    };
-
-    if command != "inspect" || arguments.next().is_some() {
-        eprintln!("usage: {program} inspect <database-path>");
-        return ExitCode::from(2);
-    }
-
-    match Database::open(path).and_then(|database| database.stats()) {
-        Ok(stats) => {
-            println!("format: wattdb-v1");
-            println!("points: {}", stats.points);
-            println!("commits: {}", stats.commits);
-            println!("series: {}", stats.series);
-            println!("catalog_records: {}", stats.catalog_records);
-            println!("file_bytes: {}", stats.file_bytes);
-            println!("recovered_tail_bytes: {}", stats.recovered_tail_bytes);
-            ExitCode::SUCCESS
+    let arguments: Vec<_> = env::args().collect();
+    let result = match arguments.get(1).map(String::as_str) {
+        Some("inspect") => inspect(&arguments[2..]),
+        Some("generate") => generate(&arguments[2..]),
+        Some("bench-wattdb") => bench_wattdb(&arguments[2..]),
+        _ => {
+            usage(arguments.first().map_or("wattdb", String::as_str));
+            return ExitCode::from(2);
         }
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error}");
             ExitCode::FAILURE
         }
     }
+}
+
+fn inspect(arguments: &[String]) -> Result<()> {
+    if arguments.len() != 1 {
+        return Err(invalid("inspect requires one database file"));
+    }
+    let stats = Database::open(&arguments[0]).and_then(|database| database.stats())?;
+    println!("format: wattdb-v1");
+    println!("points: {}", stats.points);
+    println!("commits: {}", stats.commits);
+    println!("series: {}", stats.series);
+    println!("catalog_records: {}", stats.catalog_records);
+    println!("file_bytes: {}", stats.file_bytes);
+    println!("recovered_tail_bytes: {}", stats.recovered_tail_bytes);
+    Ok(())
+}
+
+fn generate(arguments: &[String]) -> Result<()> {
+    let Some(output) = arguments.first() else {
+        return Err(invalid("generate requires an output directory"));
+    };
+    let mut config = WorkloadConfig::default();
+    let mut index = 1;
+    while index < arguments.len() {
+        let option = &arguments[index];
+        let value = arguments
+            .get(index + 1)
+            .ok_or_else(|| invalid(format!("missing value for {option}")))?;
+        match option.as_str() {
+            "--seed" => config.seed = parse(value, option)?,
+            "--sites" => config.sites = parse(value, option)?,
+            "--days" => config.days = parse(value, option)?,
+            "--cadence-seconds" => config.cadence_seconds = parse(value, option)?,
+            "--start-micros" => config.start_micros = parse(value, option)?,
+            _ => return Err(invalid(format!("unknown generate option {option}"))),
+        }
+        index += 2;
+    }
+    let workload = EnergyWorkload::generate(config)?;
+    let summary = workload.write_bundle(output)?;
+    println!(
+        "{{\"format\":\"wattdb-energy-workload-v1\",\"seed\":{},\"entities\":{},\"series\":{},\"runs\":{},\"plans\":{},\"points\":{},\"crc32\":\"{:08x}\"}}",
+        config.seed,
+        summary.entities,
+        summary.series,
+        summary.runs,
+        summary.plans,
+        summary.points,
+        summary.crc32
+    );
+    Ok(())
+}
+
+fn bench_wattdb(arguments: &[String]) -> Result<()> {
+    if arguments.len() < 2 {
+        return Err(invalid(
+            "bench-wattdb requires workload and empty database directories",
+        ));
+    }
+    let workload_directory = Path::new(&arguments[0]);
+    let database_directory = Path::new(&arguments[1]);
+    if database_directory.exists() && std::fs::read_dir(database_directory)?.next().is_some() {
+        return Err(invalid(
+            "benchmark database directory must be absent or empty",
+        ));
+    }
+    let mut durability = Durability::Always;
+    let mut durability_name = "always";
+    let mut batch_points = 10_000_usize;
+    let mut index = 2;
+    while index < arguments.len() {
+        let option = &arguments[index];
+        let value = arguments
+            .get(index + 1)
+            .ok_or_else(|| invalid(format!("missing value for {option}")))?;
+        match option.as_str() {
+            "--durability" if value == "always" => {
+                durability = Durability::Always;
+                durability_name = "always";
+            }
+            "--durability" if value == "manual" => {
+                durability = Durability::Manual;
+                durability_name = "manual";
+            }
+            "--durability" => {
+                return Err(invalid("durability must be always or manual"));
+            }
+            "--batch-points" => batch_points = parse(value, option)?,
+            _ => return Err(invalid(format!("unknown benchmark option {option}"))),
+        }
+        index += 2;
+    }
+    if batch_points == 0 || batch_points > Config::default().max_batch_points {
+        return Err(invalid("batch-points is outside the configured limit"));
+    }
+
+    let workload = EnergyWorkload::read_bundle(workload_directory)?;
+    let summary = workload.summary();
+    let mut store = Store::open_with(
+        database_directory,
+        Config {
+            durability,
+            ..Config::default()
+        },
+    )?;
+    let ingest_started = Instant::now();
+    store.commit(workload.metadata_transaction())?;
+    for points in workload.points.chunks(batch_points) {
+        let mut transaction = Transaction::new();
+        transaction.append_points(points.to_vec());
+        store.commit(transaction)?;
+    }
+    store.flush()?;
+    let ingest_seconds = ingest_started.elapsed().as_secs_f64();
+
+    let end = workload
+        .config
+        .start_micros
+        .checked_add(i64::from(workload.config.days) * DAY)
+        .ok_or_else(|| invalid("workload end timestamp overflow"))?;
+    let maintenance_started = Instant::now();
+    let maintenance = store.maintain(end)?;
+    let maintenance_seconds = maintenance_started.elapsed().as_secs_f64();
+    let resolution = RollupResolution::FixedMicros(FIVE_MINUTES);
+    let cold_query_started = Instant::now();
+    let query = store.query_gauge(1, workload.config.start_micros, end, &resolution)?;
+    let cold_query_seconds = cold_query_started.elapsed().as_secs_f64();
+    let result_crc = gauge_bucket_checksum(&query.buckets);
+    let warm_query_started = Instant::now();
+    let warm_query = store.query_gauge(1, workload.config.start_micros, end, &resolution)?;
+    let warm_query_seconds = warm_query_started.elapsed().as_secs_f64();
+    if gauge_bucket_checksum(&warm_query.buckets) != result_crc {
+        return Err(invalid("cold and warm rollup query results differ"));
+    }
+    let stored_bytes = directory_bytes(database_directory)?;
+    let points_per_second = summary.points as f64 / ingest_seconds;
+
+    println!(
+        "{{\"format\":\"wattdb-benchmark-result-v1\",\"engine\":\"wattdb\",\"durability\":\"{}\",\"dataset_crc32\":\"{:08x}\",\"result_crc32\":\"{:08x}\",\"points\":{},\"batch_points\":{},\"ingest_seconds\":{:.9},\"points_per_second\":{:.3},\"maintenance_seconds\":{:.9},\"rollup_files_written\":{},\"cold_query_seconds\":{:.9},\"warm_query_seconds\":{:.9},\"query_buckets\":{},\"stored_bytes\":{}}}",
+        durability_name,
+        summary.crc32,
+        result_crc,
+        summary.points,
+        batch_points,
+        ingest_seconds,
+        points_per_second,
+        maintenance_seconds,
+        maintenance.rollup_files_written,
+        cold_query_seconds,
+        warm_query_seconds,
+        query.buckets.len(),
+        stored_bytes
+    );
+    Ok(())
+}
+
+fn directory_bytes(path: &Path) -> Result<u64> {
+    let mut total = 0_u64;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            total = total.saturating_add(directory_bytes(&entry.path())?);
+        } else {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
+}
+
+fn parse<T>(value: &str, option: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+{
+    value
+        .parse()
+        .map_err(|_| invalid(format!("invalid value for {option}: {value}")))
+}
+
+fn invalid(reason: impl Into<String>) -> Error {
+    Error::InvalidModel(reason.into())
+}
+
+fn usage(program: &str) {
+    eprintln!(
+        "usage:\n  {program} inspect <database-file>\n  {program} generate <output-directory> [--seed N] [--sites N] [--days N] [--cadence-seconds N] [--start-micros N]\n  {program} bench-wattdb <workload-directory> <empty-database-directory> [--durability always|manual] [--batch-points N]"
+    );
 }

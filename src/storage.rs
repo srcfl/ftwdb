@@ -4,6 +4,7 @@ use crate::error::{Error, Result};
 use crate::segment::{Segment, SegmentStats};
 use crate::transaction::{Record, Transaction};
 use crc32fast::hash;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -35,7 +36,7 @@ const RECORD_POINTS: u8 = 6;
 /// the value applies, `knowledge_time` is when it became known, and
 /// `change_time` is when this revision was recorded. `valid_time_end` equals
 /// `valid_time` for an instant and is exclusive for interval values.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Point {
     pub series_id: u64,
     pub valid_time: i64,

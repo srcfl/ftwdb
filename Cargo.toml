@@ -35,6 +35,10 @@ harness = false
 name = "rollup"
 harness = false
 
+[[bench]]
+name = "energy_compare"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
