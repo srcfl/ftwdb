@@ -78,8 +78,10 @@ The TSBS IoT write adapter, fixed sanitized real-installation replay, model-quer
 benchmarks, process-kill test, and local full-disk evidence now cover more of the
 workload and failure surface. A deterministic NBD SD-card emulator and one ARM64
 Linux/ext4 smoke run add repeatable media-cache and power-loss checks, but the
-recorded cut happened after the load and host sync. Local snapshot backup plus
+recorded cut happened after the load and host sync. A repeatable 64 MiB
+Linux/NBD/ext4 run reached `ENOSPC` after 770,000 durable points in 77 commits;
+`check-store` and `inspect` passed on that prefix. Local snapshot backup plus
 post-publication integrity verification is implemented. Tests on the target
-board and SD cards, power cuts during commits, a repeatable full-disk test,
-soak runs, remote backup policy, restore drills, corruption salvage, and the
-remaining result-verified adapters stay open and are required for the M4 exit.
+board and SD cards, power cuts during commits, soak runs, remote backup policy,
+restore drills, corruption salvage, and the remaining result-verified adapters
+stay open and are required for the M4 exit.

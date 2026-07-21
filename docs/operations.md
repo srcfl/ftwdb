@@ -51,3 +51,19 @@ kind and its text and source also include the hard-link failure.
 This is a local consistent snapshot, not yet a remote backup policy. Encryption,
 incremental upload, retention, restore drills, and salvage of a corrupted source
 remain operational work.
+
+## Sync and full-disk checks
+
+The unit suite injects one sync failure into each `Durability::Always` writer
+path. Both `append` and `commit` must return the injected I/O error kind once,
+then reject every writer call as poisoned. The existing pipe-based `flush`
+test still exercises a real kernel sync failure. On Linux, a separate
+`/dev/full` test requires `StorageFull` and the same poisoned state; it skips
+only when `/dev/full` does not exist.
+
+The privileged
+[`linux-full-disk.sh`](../bench/sd-card-emulator/linux-full-disk.sh) test puts a
+real ext4 filesystem on the 64 MiB NBD profile, writes durable fixture batches
+until `ENOSPC`, then checks the readable durable prefix. See the emulator
+README for its command, output files, and pass result. This does not replace
+the M4 physical SD-card power-cut release gate.

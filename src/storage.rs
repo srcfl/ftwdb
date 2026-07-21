@@ -187,6 +187,26 @@ pub struct Database {
     poisoned: bool,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_NEXT_SYNC: std::cell::Cell<Option<std::io::ErrorKind>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn fail_next_sync(kind: std::io::ErrorKind) {
+    FAIL_NEXT_SYNC.with(|failure| failure.set(Some(kind)));
+}
+
+fn sync_database_file(file: &File) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(kind) = FAIL_NEXT_SYNC.with(std::cell::Cell::take) {
+        return Err(std::io::Error::new(kind, "injected sync failure"));
+    }
+    file.sync_data()
+}
+
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with(path, Config::default())
@@ -358,7 +378,7 @@ impl Database {
                 Durability::Manual => false,
             };
             if should_sync {
-                self.file.sync_data()?;
+                sync_database_file(&self.file)?;
                 self.bytes_since_sync = 0;
             }
             Ok(should_sync)
@@ -514,7 +534,7 @@ impl Database {
                 Durability::Manual => false,
             };
             if should_sync {
-                self.file.sync_data()?;
+                sync_database_file(&self.file)?;
                 self.bytes_since_sync = 0;
             }
             Ok(should_sync)
@@ -536,7 +556,7 @@ impl Database {
         if self.poisoned {
             return Err(Error::Poisoned);
         }
-        let sync_result = self.file.sync_data();
+        let sync_result = sync_database_file(&self.file);
         if let Err(error) = sync_result {
             // A failed fsync may still have marked the dirty pages clean, so
             // a retried sync could succeed without the data ever reaching
@@ -1181,7 +1201,7 @@ fn decode_point(raw: &[u8]) -> Point {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, Database, Durability, Point};
+    use super::{Config, Database, Durability, Point, fail_next_sync};
     use crate::{
         Entity, EntityId, Error, Plan, PlanStatus, RollupPolicy, Run, RunId, RunKind, RunStatus,
         SeriesDefinition, SeriesSemantics, Transaction,
@@ -1635,6 +1655,101 @@ mod tests {
         ));
         assert!(matches!(
             database.commit(Transaction::new()),
+            Err(Error::Poisoned)
+        ));
+        drop(real_file);
+    }
+
+    #[test]
+    fn always_append_sync_failure_preserves_kind_and_poisons_writer() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("append-sync-failure.ftwdb");
+        let mut database = Database::open_with(
+            &path,
+            Config {
+                durability: Durability::Always,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+
+        fail_next_sync(std::io::ErrorKind::StorageFull);
+        match database.append(&[point(1, 1, 1, 1.0)]) {
+            Err(Error::Io(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::StorageFull)
+            }
+            other => panic!("expected injected append sync error, got {other:?}"),
+        }
+        assert!(matches!(
+            database.append(&[point(2, 2, 2, 2.0)]),
+            Err(Error::Poisoned)
+        ));
+        assert!(matches!(database.flush(), Err(Error::Poisoned)));
+    }
+
+    #[test]
+    fn always_commit_sync_failure_preserves_kind_and_poisons_writer() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("commit-sync-failure.ftwdb");
+        let mut database = Database::open_with(
+            &path,
+            Config {
+                durability: Durability::Always,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        let mut transaction = Transaction::new();
+        transaction.upsert_entity(home());
+
+        fail_next_sync(std::io::ErrorKind::PermissionDenied);
+        match database.commit(transaction) {
+            Err(Error::Io(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied)
+            }
+            other => panic!("expected injected commit sync error, got {other:?}"),
+        }
+        assert!(matches!(
+            database.commit(Transaction::new()),
+            Err(Error::Poisoned)
+        ));
+        assert!(matches!(database.flush(), Err(Error::Poisoned)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dev_full_write_reports_storage_full_and_poisons_writer() {
+        let full = std::path::Path::new("/dev/full");
+        if !full.exists() {
+            eprintln!("skipping /dev/full test: /dev/full is absent");
+            return;
+        }
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("dev-full.ftwdb");
+        let mut database = Database::open_with(
+            &path,
+            Config {
+                durability: Durability::Always,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        let full_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(full)
+            .unwrap();
+        let real_file = std::mem::replace(&mut database.file, full_file);
+
+        match database.append(&[point(1, 1, 1, 1.0)]) {
+            Err(Error::Io(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::StorageFull)
+            }
+            other => panic!("expected /dev/full storage error, got {other:?}"),
+        }
+        assert!(matches!(
+            database.append(&[point(2, 2, 2, 2.0)]),
             Err(Error::Poisoned)
         ));
         drop(real_file);
