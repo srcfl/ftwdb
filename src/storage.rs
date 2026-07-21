@@ -966,6 +966,10 @@ fn scan_and_recover(
     })
 }
 
+/// How many sidecar names `quarantine_corrupt_tail` tries before giving up:
+/// the base `<dbfile>.quarantine-<offset>` name plus numbered siblings.
+const MAX_QUARANTINE_SIDECARS: u32 = 8;
+
 /// Best-effort copy of a checksum-corrupt final frame into a
 /// `<dbfile>.quarantine-<offset>` sidecar before the tail is truncated, so
 /// media corruption remains available for forensics instead of being
@@ -974,13 +978,38 @@ fn scan_and_recover(
 /// medium is already misbehaving — refusing to open the database because a
 /// diagnostic could not be saved would turn recoverable corruption into an
 /// outage. Read-only opens never call this (they must not write anything).
+///
+/// Each candidate is opened with `create_new`, which never truncates an
+/// existing file and refuses to follow a symlink: an existing sidecar is
+/// prior forensic evidence (the same offset corrupting again after an
+/// earlier recovery) or a planted link in a shared-writable directory, and
+/// neither may be overwritten. On collision the write moves to a numbered
+/// sibling (`<base>-2`, `<base>-3`, ...) and, past a small bound, gives up
+/// silently — still best-effort, never a recovery failure.
 fn quarantine_corrupt_tail(path: &Path, offset: u64, frame_header: &[u8], payload: &[u8]) {
-    let mut sidecar = path.as_os_str().to_owned();
-    sidecar.push(format!(".quarantine-{offset}"));
     let mut removed = Vec::with_capacity(frame_header.len() + payload.len());
     removed.extend_from_slice(frame_header);
     removed.extend_from_slice(payload);
-    let _ = std::fs::write(sidecar, removed);
+    let mut base = path.as_os_str().to_owned();
+    base.push(format!(".quarantine-{offset}"));
+    for attempt in 1..=MAX_QUARANTINE_SIDECARS {
+        let mut sidecar = base.clone();
+        if attempt > 1 {
+            sidecar.push(format!("-{attempt}"));
+        }
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&sidecar)
+        {
+            Ok(mut file) => {
+                let _ = file.write_all(&removed);
+                return;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return,
+        }
+    }
 }
 
 /// Makes a directory's entries durable, exactly like segment and manifest
@@ -1646,6 +1675,44 @@ mod tests {
             .path()
             .join(format!("bit-rot.ftwdb.quarantine-{first_length}"));
         assert_eq!(std::fs::read(sidecar).unwrap(), removed_bytes);
+    }
+
+    #[test]
+    fn quarantine_never_overwrites_an_existing_sidecar() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("bit-rot-again.ftwdb");
+        let first_length;
+        {
+            let mut database = Database::open(&path).unwrap();
+            database.append(&[point(1, 1, 1, 1.0)]).unwrap();
+            first_length = database.stats().unwrap().file_bytes;
+            database.append(&[point(2, 2, 2, 2.0)]).unwrap();
+            database.close().unwrap();
+        }
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(first_length + 24 + 8)).unwrap();
+        file.write_all(&[0xFF]).unwrap();
+        file.sync_data().unwrap();
+        drop(file);
+        let removed_bytes = std::fs::read(&path).unwrap()[first_length as usize..].to_vec();
+
+        // A sidecar from an earlier recovery of the same offset already
+        // exists; it is forensic evidence and must survive byte-for-byte.
+        let sidecar = directory
+            .path()
+            .join(format!("bit-rot-again.ftwdb.quarantine-{first_length}"));
+        let sentinel = b"prior forensic evidence".to_vec();
+        std::fs::write(&sidecar, &sentinel).unwrap();
+
+        let database = Database::open(&path).unwrap();
+        let stats = database.stats().unwrap();
+        assert_eq!(stats.recovered_tail, super::RecoveredTail::ChecksumMismatch);
+
+        assert_eq!(std::fs::read(&sidecar).unwrap(), sentinel);
+        let sibling = directory
+            .path()
+            .join(format!("bit-rot-again.ftwdb.quarantine-{first_length}-2"));
+        assert_eq!(std::fs::read(sibling).unwrap(), removed_bytes);
     }
 
     #[test]
