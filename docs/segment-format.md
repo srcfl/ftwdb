@@ -20,7 +20,9 @@ block byte in sorted `(series_id, min_valid_time)` order.
 
 Each block belongs to one series and stores min/max valid time, point count,
 encoding/compression IDs, encoded/stored sizes, a payload CRC32, and a header
-CRC32. A query scans the small index and reads only overlapping blocks.
+CRC32. A block holds at most 262,144 points, which bounds both decompression and
+the decoded point vector even when valid data reaches LZ4's maximum compression
+ratio. A query scans the small index and reads only overlapping blocks.
 
 ## Column encoding
 
@@ -49,4 +51,3 @@ Segment creation sorts a snapshot in memory. Reads are bounded per compressed
 block plus returned result, but large compactions still need an external/streamed
 merge path. Segments currently contain raw points only; catalog state remains
 in the commit log and the M3 manifest coordinates segment publication.
-

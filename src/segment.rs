@@ -20,6 +20,10 @@ const INDEX_VERSION: u16 = 1;
 const INDEX_HEADER_BYTES: usize = 16;
 const INDEX_ENTRY_BYTES: usize = 40;
 const COLUMN_COUNT: usize = 7;
+/// Hard ceiling for one decoded block. This matches the default append batch
+/// limit and keeps a valid, highly compressible block from expanding into a
+/// multi-gigabyte `Vec<Point>`.
+const MAX_BLOCK_POINTS: u32 = 262_144;
 /// Every encoded point consumes at least one varint byte in each of the
 /// timestamp, valid-end, knowledge, change, run-id, and value columns plus two
 /// in the quality/flags column, so eight bytes is a hard lower bound per point.
@@ -64,9 +68,9 @@ impl Segment {
         points: &[Point],
         block_points: usize,
     ) -> Result<SegmentStats> {
-        if block_points == 0 || block_points > u32::MAX as usize {
+        if block_points == 0 || block_points > MAX_BLOCK_POINTS as usize {
             return Err(Error::InvalidConfig(
-                "segment block_points must be in 1..=u32::MAX",
+                "segment block_points must be in 1..=262144",
             ));
         }
         let path = path.as_ref();
@@ -630,6 +634,7 @@ fn validate_index(index: &[IndexEntry], index_offset: u64, point_count: u64) -> 
     let mut expected_offset = SEGMENT_HEADER_BYTES as u64;
     for entry in index {
         if entry.points == 0
+            || entry.points > MAX_BLOCK_POINTS
             || entry.min_time > entry.max_time
             || entry.offset != expected_offset
             || entry
@@ -792,7 +797,7 @@ fn corrupt_error(offset: u64, reason: &str) -> Error {
 mod tests {
     use super::{
         BLOCK_HEADER_BYTES, COMPRESSION_LZ4, INDEX_ENTRY_BYTES, INDEX_HEADER_BYTES,
-        SEGMENT_HEADER_BYTES, Segment,
+        MAX_BLOCK_POINTS, SEGMENT_HEADER_BYTES, Segment,
     };
     use crate::{Error, Point};
     use crc32fast::hash;
@@ -914,6 +919,23 @@ mod tests {
         // Claim u32::MAX points in one small block; opening must fail with a
         // corruption error instead of reserving tens of gigabytes on query.
         claim_first_block_points(&path, u32::MAX);
+        assert!(matches!(
+            Segment::open(&path),
+            Err(Error::Corruption { .. })
+        ));
+    }
+
+    #[test]
+    fn block_point_limit_bounds_writer_and_reader_allocations() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("bounded.seg");
+        assert!(matches!(
+            Segment::create(&path, &points(10), MAX_BLOCK_POINTS as usize + 1),
+            Err(Error::InvalidConfig(_))
+        ));
+
+        Segment::create(&path, &points(100), 1_000).unwrap();
+        claim_first_block_points(&path, MAX_BLOCK_POINTS + 1);
         assert!(matches!(
             Segment::open(&path),
             Err(Error::Corruption { .. })
