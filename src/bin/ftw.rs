@@ -232,10 +232,12 @@ fn check_store(arguments: &[String]) -> Result<()> {
     let store = Store::open_read_only(&arguments[0])?;
     let report = store.check_integrity()?;
     println!(
-        "{{\"format\":\"ftwdb-integrity-v1\",\"manifest_generation\":{},\"raw_points\":{},\"raw_commits\":{},\"active_rollup_files\":{},\"active_rollup_buckets\":{},\"active_rollup_bytes\":{},\"stale_rollup_files\":{}}}",
+        "{{\"format\":\"ftwdb-integrity-v1\",\"manifest_generation\":{},\"raw_points\":{},\"raw_commits\":{},\"raw_recovered_tail_bytes\":{},\"raw_recovered_tail\":\"{}\",\"active_rollup_files\":{},\"active_rollup_buckets\":{},\"active_rollup_bytes\":{},\"stale_rollup_files\":{}}}",
         report.manifest_generation,
         report.raw_points,
         report.raw_commits,
+        report.raw_recovered_tail_bytes,
+        report.raw_recovered_tail,
         report.active_rollup_files,
         report.active_rollup_buckets,
         report.active_rollup_bytes,
@@ -274,6 +276,7 @@ fn inspect(arguments: &[String]) -> Result<()> {
     println!("catalog_records: {}", stats.catalog_records);
     println!("file_bytes: {}", stats.file_bytes);
     println!("recovered_tail_bytes: {}", stats.recovered_tail_bytes);
+    println!("recovered_tail: {}", stats.recovered_tail);
     Ok(())
 }
 

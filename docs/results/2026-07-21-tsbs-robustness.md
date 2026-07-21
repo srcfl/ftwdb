@@ -190,10 +190,9 @@ backup, retention, and salvage from a damaged source.
 
 ## Risks found at the tested commit
 
-1. A complete final frame with a bad payload CRC is treated as an interrupted
-   tail and removed. That rule can hide bit rot in a batch already acknowledged
-   by `Durability::Always`. Normal open should fail on a complete bad frame; a
-   separate repair command may choose to remove it.
+1. At the tested commit, a complete final frame with a bad payload CRC was
+   treated as an interrupted tail and removed. PR #25 changed both writable and
+   read-only open to report corruption and leave the bytes intact.
 2. At the tested commit, FTWDB had no process lock. PR #18 added shared and
    exclusive file locks after this run.
 3. At the tested commit, the new active log did not sync its parent directory
@@ -208,7 +207,7 @@ backup, retention, and salvage from a damaged source.
 
 FTWDB has good logical batch recovery, explicit full-disk failure, fast stored
 Gauge rollups, a working local backup, a fixed real-data replay, and a
-repeatable SD fault model. It is not ready for unattended SD-card use. The
-last-frame CRC policy, missing model query paths, and lack of target-hardware
-power-cut evidence remain release blockers. The writer lock and parent-directory
-sync findings above were fixed after this run.
+repeatable SD fault model. It is not ready for unattended SD-card use. Missing
+model query paths and lack of target-hardware power-cut evidence remain release
+blockers. The final-frame CRC policy, writer lock, and parent-directory sync
+findings above were fixed after this run.
