@@ -204,6 +204,7 @@ impl Catalog {
     }
 
     fn validate_points(&self, points: &[Point]) -> Result<()> {
+        validate_point_intervals(points)?;
         for point in points {
             if !self.series.contains_key(&point.series_id) {
                 return invalid(format!(
@@ -211,15 +212,25 @@ impl Catalog {
                     point.series_id
                 ));
             }
-            if point.valid_time_end < point.valid_time {
-                return invalid("point interval ends before it starts".to_owned());
-            }
             if point.run_id != 0 && !self.runs.contains_key(&RunId(point.run_id)) {
                 return invalid(format!("point refers to missing run {}", point.run_id));
             }
         }
         Ok(())
     }
+}
+
+/// The catalog-independent point invariants. Transaction commits enforce
+/// these through `validate_points`; the legacy catalog-less `append` path
+/// enforces exactly this subset so both writers reject a malformed interval
+/// with the same error.
+pub(crate) fn validate_point_intervals(points: &[Point]) -> Result<()> {
+    for point in points {
+        if point.valid_time_end < point.valid_time {
+            return invalid("point interval ends before it starts".to_owned());
+        }
+    }
+    Ok(())
 }
 
 fn validate_entity(entity: &Entity) -> Result<()> {

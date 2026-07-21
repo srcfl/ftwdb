@@ -389,6 +389,7 @@ mod tests {
             Point::actual(1, 10_000_000, 8.0),
         ];
         FixedGaugeRollup::build(&points, 5_000_000, 5_000_000)
+            .unwrap()
             .buckets()
             .copied()
             .collect()

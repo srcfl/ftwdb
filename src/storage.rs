@@ -236,6 +236,14 @@ impl Database {
     }
 
     /// Appends one atomic, checksummed batch.
+    ///
+    /// This is the catalog-less fast path: points may refer to series and
+    /// runs that no catalog record defines, because callers ingesting raw
+    /// telemetry use it without ever creating a catalog. Only the
+    /// catalog-independent point invariants are enforced — an interval must
+    /// not end before it starts, rejected with the same error a transaction
+    /// commit gives. Series existence and run provenance are checked
+    /// exclusively by [`Database::commit`].
     pub fn append(&mut self, points: &[Point]) -> Result<Commit> {
         if self.read_only {
             return Err(Error::ReadOnly);
@@ -249,6 +257,7 @@ impl Database {
                 maximum: self.config.max_batch_points,
             });
         }
+        crate::catalog::validate_point_intervals(points)?;
         if points.is_empty() {
             return Ok(Commit {
                 frame_offset: self.file.seek(SeekFrom::End(0))?,
@@ -585,7 +594,11 @@ impl Database {
 
     /// Materializes fixed UTC gauge buckets from the winning revisions in a
     /// range. Persistent background rollups will use the same bucket state.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] when `resolution_micros` is not
+    /// positive or `max_gap_micros` is negative.
     pub fn rollup_gauge(
         &self,
         series_id: u64,
@@ -593,7 +606,7 @@ impl Database {
         end: i64,
         resolution_micros: i64,
         max_gap_micros: i64,
-    ) -> FixedGaugeRollup {
+    ) -> Result<FixedGaugeRollup> {
         FixedGaugeRollup::build(
             &self.query_latest(series_id, start, end),
             resolution_micros,
@@ -1158,6 +1171,85 @@ mod tests {
         assert_eq!(latest.len(), 2);
         assert_eq!(latest[0].value, 3.0);
         assert_eq!(database.query_as_of(7, 0, 1_000, 15)[0].value, 1.0);
+    }
+
+    #[test]
+    fn append_rejects_inverted_intervals_with_the_commit_error() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("append-validation.ftwdb");
+        let mut database = Database::open(&path).unwrap();
+        let mut inverted = point(100, 10, 11, 1.0);
+        inverted.valid_time_end = 50;
+
+        let before = database.stats().unwrap().file_bytes;
+        let append_error = match database.append(&[point(1, 1, 1, 1.0), inverted]) {
+            Err(error @ Error::InvalidModel(_)) => error,
+            other => panic!("expected Error::InvalidModel, got {other:?}"),
+        };
+        // The whole batch is rejected before anything reaches the log.
+        assert_eq!(database.stats().unwrap().file_bytes, before);
+        assert_eq!(database.stats().unwrap().points, 0);
+
+        // A transaction commit rejects the same point with the same error.
+        let mut transaction = Transaction::new();
+        transaction
+            .upsert_entity(home())
+            .define_series(power_series())
+            .upsert_run(optimization_run());
+        database.commit(transaction).unwrap();
+        let mut committed = Transaction::new();
+        let mut invalid = inverted;
+        invalid.series_id = 7;
+        invalid.run_id = 9;
+        committed.append_points(vec![invalid]);
+        let commit_error = match database.commit(committed) {
+            Err(error @ Error::InvalidModel(_)) => error,
+            other => panic!("expected Error::InvalidModel, got {other:?}"),
+        };
+        assert_eq!(append_error.to_string(), commit_error.to_string());
+    }
+
+    #[test]
+    fn append_remains_a_catalog_less_fast_path() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("append-catalog-less.ftwdb");
+        {
+            let mut database = Database::open(&path).unwrap();
+            // No catalog exists: the series is undefined and the run
+            // unresolvable, yet the legacy path accepts the batch because
+            // only commit() enforces catalog references.
+            let mut telemetry = point(100, 10, 11, 1.0);
+            telemetry.run_id = 42;
+            database.append(&[telemetry]).unwrap();
+            database.close().unwrap();
+        }
+        // The legacy frame recovers unchanged on reopen.
+        let database = Database::open(&path).unwrap();
+        assert_eq!(database.stats().unwrap().points, 1);
+        assert_eq!(database.query_latest(7, 0, 1_000).len(), 1);
+    }
+
+    #[test]
+    fn rollup_gauge_rejects_invalid_arguments_instead_of_panicking() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("rollup-arguments.ftwdb");
+        let mut database = Database::open(&path).unwrap();
+        database.append(&[point(100, 10, 11, 1.0)]).unwrap();
+
+        assert!(matches!(
+            database.rollup_gauge(7, 0, 1_000, 0, 10),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            database.rollup_gauge(7, 0, 1_000, -5, 10),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            database.rollup_gauge(7, 0, 1_000, 300, -1),
+            Err(Error::InvalidArgument(_))
+        ));
+        let rollup = database.rollup_gauge(7, 0, 1_000, 300, 10).unwrap();
+        assert_eq!(rollup.buckets().len(), 1);
     }
 
     #[test]
