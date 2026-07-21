@@ -1086,10 +1086,24 @@ fn copy_and_sync(source: &Path, destination: &Path) -> Result<u64> {
     Ok(bytes)
 }
 
+/// Publishes `source` at `destination` by hard link when both live on the
+/// same filesystem, falling back to a full copy-and-sync otherwise. The
+/// hard-link error is intentionally swallowed when the copy succeeds:
+/// crossing a filesystem boundary is the expected, legitimate reason to fall
+/// back, and the copy provides the same immutable snapshot. When the copy
+/// also fails, the returned error carries both causes, so the operator sees
+/// why neither route worked instead of only the second-choice failure.
 fn hard_link_or_copy(source: &Path, destination: &Path) -> Result<()> {
-    if std::fs::hard_link(source, destination).is_err() {
-        copy_and_sync(source, destination)?;
-    }
+    let link_error = match std::fs::hard_link(source, destination) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    copy_and_sync(source, destination).map_err(|copy_error| {
+        Error::Io(std::io::Error::other(format!(
+            "backup fallback copy of {} failed: {copy_error} (hard link failed first: {link_error})",
+            source.display()
+        )))
+    })?;
     Ok(())
 }
 
@@ -1626,6 +1640,24 @@ mod tests {
                 .unwrap()
                 .source,
             RollupSource::Materialized
+        );
+    }
+
+    #[test]
+    fn failed_link_and_copy_reports_both_causes() {
+        let directory = tempdir().unwrap();
+        // A missing source fails the hard link and then the fallback copy;
+        // the error must preserve the first-choice failure as context.
+        let error = super::hard_link_or_copy(
+            &directory.path().join("absent"),
+            &directory.path().join("destination"),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("fallback copy"), "message: {message}");
+        assert!(
+            message.contains("hard link failed first"),
+            "message: {message}"
         );
     }
 

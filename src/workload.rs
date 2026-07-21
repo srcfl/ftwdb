@@ -16,6 +16,9 @@ const HOUR: i64 = 60 * MINUTE;
 const DAY: i64 = 24 * HOUR;
 const FIVE_MINUTES: i64 = 5 * MINUTE;
 
+/// Upper bound for a `workload.postcard` snapshot accepted by `read_bundle`.
+const MAX_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
+
 const GRID_POWER: u64 = 1;
 const SOLAR_POWER: u64 = 2;
 const BATTERY_POWER: u64 = 3;
@@ -202,9 +205,17 @@ impl EnergyWorkload {
     pub fn read_bundle(directory: impl AsRef<Path>) -> Result<Self> {
         let path = directory.as_ref().join("workload.postcard");
         let metadata = path.metadata()?;
-        if metadata.len() > 8 * 1024 * 1024 * 1024 {
+        // The whole snapshot is materialized in memory (one read plus the
+        // decoded point vector), so the reader refuses anything
+        // disproportionate for bench tooling before allocating. One GiB is
+        // several times the benchmark protocol's largest documented run — a
+        // year of one site at 60-second cadence encodes to a few hundred
+        // MiB — while the old 8 GiB guard admitted files no bench host
+        // could realistically decode twice over in RAM. A larger file almost
+        // certainly means the wrong path was passed, not a real workload.
+        if metadata.len() > MAX_BUNDLE_BYTES {
             return Err(Error::InvalidConfig(
-                "workload bundle exceeds the 8 GiB reader limit",
+                "workload bundle exceeds the 1 GiB reader limit",
             ));
         }
         let encoded = std::fs::read(path)?;
@@ -784,6 +795,19 @@ mod tests {
             store.database().catalog().plans().len(),
             workload.plans.len()
         );
+    }
+
+    #[test]
+    fn oversized_bundle_is_rejected_before_reading() {
+        let directory = tempdir().unwrap();
+        // A sparse file provides the oversized length without writing a GiB.
+        let file = std::fs::File::create(directory.path().join("workload.postcard")).unwrap();
+        file.set_len(super::MAX_BUNDLE_BYTES + 1).unwrap();
+        drop(file);
+        assert!(matches!(
+            EnergyWorkload::read_bundle(directory.path()),
+            Err(crate::Error::InvalidConfig(_))
+        ));
     }
 
     #[test]
