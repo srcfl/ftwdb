@@ -61,6 +61,7 @@ Verify or snapshot a directory store:
 ```sh
 cargo run --release -- check-store ./energy.ftwdb
 cargo run --release -- backup ./energy.ftwdb ./backups/energy-2026-07-21.ftwdb
+cargo run --release -- restore ./backups/energy-2026-07-21.ftwdb ./restored-energy.ftwdb
 ```
 
 ## Design documents
@@ -70,7 +71,7 @@ cargo run --release -- backup ./energy.ftwdb ./backups/energy-2026-07-21.ftwdb
 - [Storage format v1](docs/format.md)
 - [Immutable segment format](docs/segment-format.md)
 - [Persistent rollups and retention](docs/rollups.md)
-- [Integrity checks and backup](docs/operations.md)
+- [Integrity checks, backup, and restore](docs/operations.md)
 - [OSS database research](docs/research.md)
 - [Benchmark protocol](docs/benchmarking.md)
 - [Deterministic energy workload](docs/workload.md)

@@ -67,8 +67,12 @@ docker run --rm --privileged \
 
 The script installs `nbd-client` and `e2fsprogs` in the disposable container.
 It writes raw results under the ignored `bench-results/linux-nbd-smoke`
-directory. It uses the checked-in real-installation fixture and rejects a
-changed active-log checksum or recovered FTWDB watermark.
+directory, which must be absent or empty when the run starts. It uses the
+checked-in real-installation fixture and rejects a
+changed active-log checksum or recovered FTWDB watermark. After recovery, it
+backs up the checked store outside the emulated card, restores that backup to a
+new store on the card, and compares checked counts, snapshot CRCs, and active
+log SHA-256 values.
 
 ```sh
 mkdir -p bench-results/sd-emulator

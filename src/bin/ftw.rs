@@ -1,7 +1,8 @@
 use flate2::read::GzDecoder;
 use ftwdb::{
-    BackupReport, Config, Database, Durability, EnergyWorkload, Error, RollupResolution, Store,
-    Transaction, WorkloadConfig, gauge_bucket_checksum, load_real_fixture, load_tsbs_iot,
+    BackupReport, Config, Database, Durability, EnergyWorkload, Error, RestoreReport,
+    RollupResolution, Store, Transaction, WorkloadConfig, gauge_bucket_checksum, load_real_fixture,
+    load_tsbs_iot,
 };
 use std::env;
 use std::fs::File;
@@ -40,6 +41,7 @@ fn main() -> ExitCode {
         Some("inspect") => inspect(&arguments[2..]),
         Some("check-store") => check_store(&arguments[2..]),
         Some("backup") => backup(&arguments[2..]),
+        Some("restore") => restore(&arguments[2..]),
         Some("generate") => generate(&arguments[2..]),
         Some("bench-ftwdb") => bench_ftwdb(&arguments[2..]),
         Some("bench-real-fixture") => bench_real_fixture(&arguments[2..]),
@@ -290,6 +292,30 @@ fn backup(arguments: &[String]) -> CliResult<()> {
     let report = store.backup_to(&arguments[1])?;
     println!("{}", backup_report_json(&report));
     Ok(())
+}
+
+fn restore(arguments: &[String]) -> CliResult<()> {
+    if arguments.len() != 2 {
+        return Err(usage_error(
+            "restore requires a backup and absent target directory",
+        ));
+    }
+    let report = Store::restore_from(&arguments[0], &arguments[1])?;
+    println!("{}", restore_report_json(&report));
+    Ok(())
+}
+
+fn restore_report_json(report: &RestoreReport) -> String {
+    format!(
+        "{{\"format\":\"ftwdb-restore-v1\",\"files\":{},\"bytes\":{},\"manifest_generation\":{},\"raw_commits\":{},\"raw_points\":{},\"source_snapshot_crc32\":\"{:08x}\",\"destination_snapshot_crc32\":\"{:08x}\"}}",
+        report.files,
+        report.bytes,
+        report.manifest_generation,
+        report.raw_commits,
+        report.raw_points,
+        report.source_snapshot_crc32,
+        report.destination_snapshot_crc32
+    )
 }
 
 fn backup_report_json(report: &BackupReport) -> String {
@@ -548,14 +574,14 @@ fn runtime_invalid(reason: impl Into<String>) -> CliError {
 
 fn usage(program: &str) {
     eprintln!(
-        "usage:\n  {program} inspect <database-file>\n  {program} check-store <store-directory>\n  {program} backup <store-directory> <absent-destination>\n  {program} generate <output-directory> [--seed N] [--sites N] [--days N] [--cadence-seconds N] [--start-micros N]\n  {program} bench-ftwdb <workload-directory> <empty-database-directory> [--durability always|manual] [--batch-points N]\n  {program} bench-real-fixture <points.csv.gz> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-points N]\n  {program} bench-tsbs-iot <influx-line-file|-> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-rows N]"
+        "usage:\n  {program} inspect <database-file>\n  {program} check-store <store-directory>\n  {program} backup <store-directory> <absent-destination>\n  {program} restore <backup-directory> <absent-target>\n  {program} generate <output-directory> [--seed N] [--sites N] [--days N] [--cadence-seconds N] [--start-micros N]\n  {program} bench-ftwdb <workload-directory> <empty-database-directory> [--durability always|manual] [--batch-points N]\n  {program} bench-real-fixture <points.csv.gz> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-points N]\n  {program} bench-tsbs-iot <influx-line-file|-> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-rows N]"
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::backup_report_json;
-    use ftwdb::BackupReport;
+    use super::{backup_report_json, restore_report_json};
+    use ftwdb::{BackupReport, RestoreReport};
 
     #[test]
     fn backup_json_uses_fixed_error_kind_names() {
@@ -572,6 +598,24 @@ mod tests {
         assert_eq!(
             backup_report_json(&report),
             "{\"format\":\"ftwdb-backup-v1\",\"files\":4,\"bytes\":123,\"manifest_generation\":7,\"linked_files\":2,\"copied_files\":2,\"hard_link_fallbacks\":1,\"hard_link_fallback_error_kinds\":[\"crosses-devices\"]}"
+        );
+    }
+
+    #[test]
+    fn restore_json_has_versioned_checksums_and_counts() {
+        let report = RestoreReport {
+            files: 4,
+            bytes: 123,
+            manifest_generation: 7,
+            raw_commits: 8,
+            raw_points: 9,
+            source_snapshot_crc32: 0x0123_abcd,
+            destination_snapshot_crc32: 0x0123_abcd,
+        };
+
+        assert_eq!(
+            restore_report_json(&report),
+            "{\"format\":\"ftwdb-restore-v1\",\"files\":4,\"bytes\":123,\"manifest_generation\":7,\"raw_commits\":8,\"raw_points\":9,\"source_snapshot_crc32\":\"0123abcd\",\"destination_snapshot_crc32\":\"0123abcd\"}"
         );
     }
 }

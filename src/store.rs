@@ -1,5 +1,9 @@
 use crate::manifest::{self, Manifest, RollupDescriptor};
 use crate::rollup::calendar_bucket_bounds;
+use crate::snapshot::{
+    PublicationStep, StagedDirectory, inject_checksum_mismatch, publication_checkpoint,
+    snapshot_digest,
+};
 use crate::storage::{sync_directory, sync_parent_directory};
 use crate::transaction::Record;
 use crate::{
@@ -72,6 +76,17 @@ pub struct BackupReport {
     pub copied_files: usize,
     pub hard_link_fallbacks: usize,
     pub hard_link_fallback_error_kinds: Vec<std::io::ErrorKind>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RestoreReport {
+    pub files: usize,
+    pub bytes: u64,
+    pub manifest_generation: u64,
+    pub raw_commits: u64,
+    pub raw_points: u64,
+    pub source_snapshot_crc32: u32,
+    pub destination_snapshot_crc32: u32,
 }
 
 impl BackupReport {
@@ -175,6 +190,9 @@ impl Store {
         let root = path.as_ref().to_path_buf();
         let manifest_directory = root.join(MANIFEST_DIRECTORY);
         let rollup_directory = root.join(ROLLUP_DIRECTORY);
+        require_real_directory(&root)?;
+        require_real_directory(&manifest_directory)?;
+        require_real_directory(&rollup_directory)?;
         let database = Database::open_read_only(root.join(ACTIVE_LOG))?;
         let manifest = Manifest::load(&manifest_directory)?;
         let mut store = Self {
@@ -601,16 +619,6 @@ impl Store {
     pub fn backup_to(&mut self, destination: impl AsRef<Path>) -> Result<BackupReport> {
         self.ensure_healthy()?;
         let destination = destination.as_ref();
-        if destination.exists() {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "backup destination already exists",
-            )));
-        }
-        let parent = destination.parent().ok_or(Error::InvalidConfig(
-            "backup destination must have a parent directory",
-        ))?;
-        std::fs::create_dir_all(parent)?;
         // Flushing is the only mutation `backup_to` performs on the source,
         // and a read-only handle has nothing buffered, so backups from a
         // read-only store are allowed and provably leave the source intact.
@@ -619,36 +627,123 @@ impl Store {
         }
         self.check_integrity()?;
 
-        let name = destination
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or(Error::InvalidConfig("backup destination must be UTF-8"))?;
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let temporary = parent.join(format!(".{name}.backup-{}-{nonce}", std::process::id()));
-        std::fs::create_dir(&temporary)?;
-        let result = self.write_backup(&temporary);
-        let mut report = match result {
-            Ok(report) => report,
-            Err(error) => {
-                let _ = std::fs::remove_dir_all(&temporary);
-                return Err(error);
+        let staged = StagedDirectory::create(destination, "backup")?;
+        let mut report = self.write_snapshot(staged.path())?;
+        // Hold the stage lock through publication and the destination check.
+        // A writer therefore cannot change the active log between them.
+        let stage = Self::open_read_only(staged.path())?;
+        stage.check_integrity()?;
+        let publication = staged.publish(destination)?;
+        let checked = (|| {
+            publication_checkpoint(PublicationStep::PostCheck)?;
+            // The backup check must not reconcile a stale manifest or prune
+            // files from the copy it is meant to verify.
+            let backup = Self::open_read_only(destination)?;
+            backup.check_integrity()?;
+            report.bytes = directory_bytes(destination)?;
+            Ok(report)
+        })();
+        match checked {
+            Ok(report) => {
+                drop(stage);
+                publication.commit();
+                Ok(report)
             }
-        };
-        if let Err(error) = std::fs::rename(&temporary, destination) {
-            let _ = std::fs::remove_dir_all(&temporary);
-            return Err(Error::Io(error));
+            Err(error) => {
+                let error = publication.rollback_after(error);
+                drop(stage);
+                Err(error)
+            }
         }
-        sync_directory(parent)?;
+    }
 
-        // Opening the published copy exercises raw recovery, manifest parsing,
-        // and every active segment before the caller treats it as a backup.
-        let backup = Self::open(destination)?;
-        backup.check_integrity()?;
-        report.bytes = directory_bytes(destination)?;
-        Ok(report)
+    /// Restores one fully valid, recovery-free snapshot into an absent target.
+    ///
+    /// The source stays open read-only under a shared lock. The target is built
+    /// and checked in a hidden sibling directory, compared with the source by
+    /// the versioned snapshot CRC32, and published with an atomic no-clobber
+    /// rename. No restore path overwrites an existing target.
+    pub fn restore_from(
+        backup: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> Result<RestoreReport> {
+        let backup = Self::open_read_only(backup)?;
+        backup.restore_to(destination.as_ref())
+    }
+
+    fn restore_to(&self, destination: &Path) -> Result<RestoreReport> {
+        self.ensure_healthy()?;
+        let source_integrity = self.check_integrity()?;
+        self.require_clean_restore_source(&source_integrity)?;
+        let relative_paths = self.selected_snapshot_paths();
+        let source_digest = snapshot_digest(&self.root, &relative_paths)?;
+
+        let staged = StagedDirectory::create(destination, "restore")?;
+        self.write_snapshot(staged.path())?;
+        let stage_digest =
+            inject_checksum_mismatch(snapshot_digest(staged.path(), &relative_paths)?);
+        if stage_digest != source_digest {
+            return Err(snapshot_mismatch(
+                "source",
+                source_digest,
+                "stage",
+                stage_digest,
+            ));
+        }
+
+        // Exercise raw replay, manifest selection, active rollup decoding, and
+        // descriptor checks before the directory gets a public name.
+        let stage = Self::open_read_only(staged.path())?;
+        let stage_integrity = stage.check_integrity()?;
+        stage.require_clean_restore_source(&stage_integrity)?;
+
+        let publication = staged.publish(destination)?;
+        let checked = (|| {
+            publication_checkpoint(PublicationStep::PostCheck)?;
+            let restored = Self::open_read_only(destination)?;
+            let destination_integrity = restored.check_integrity()?;
+            restored.require_clean_restore_source(&destination_integrity)?;
+            let destination_digest = snapshot_digest(destination, &relative_paths)?;
+            if destination_digest != source_digest {
+                return Err(snapshot_mismatch(
+                    "source",
+                    source_digest,
+                    "destination",
+                    destination_digest,
+                ));
+            }
+            if destination_integrity.raw_commits != source_integrity.raw_commits
+                || destination_integrity.raw_points != source_integrity.raw_points
+                || destination_integrity.manifest_generation != source_integrity.manifest_generation
+            {
+                return Err(Error::Corruption {
+                    offset: 0,
+                    reason: "restored store counts differ from the checked backup".to_owned(),
+                });
+            }
+
+            Ok(RestoreReport {
+                files: destination_digest.files,
+                bytes: destination_digest.bytes,
+                manifest_generation: destination_integrity.manifest_generation,
+                raw_commits: destination_integrity.raw_commits,
+                raw_points: destination_integrity.raw_points,
+                source_snapshot_crc32: source_digest.crc32,
+                destination_snapshot_crc32: destination_digest.crc32,
+            })
+        })();
+        match checked {
+            Ok(report) => {
+                drop(stage);
+                publication.commit();
+                Ok(report)
+            }
+            Err(error) => {
+                let error = publication.rollback_after(error);
+                drop(stage);
+                Err(error)
+            }
+        }
     }
 
     #[must_use]
@@ -714,7 +809,49 @@ impl Store {
         Ok(buckets)
     }
 
-    fn write_backup(&self, temporary: &Path) -> Result<BackupReport> {
+    fn selected_snapshot_paths(&self) -> Vec<String> {
+        let mut files = vec![ACTIVE_LOG.to_owned()];
+        files.extend(
+            self.active_rollups()
+                .map(|descriptor| format!("{ROLLUP_DIRECTORY}/{}", descriptor.file)),
+        );
+        if self.manifest.generation > 0 {
+            files.push(format!(
+                "{MANIFEST_DIRECTORY}/MANIFEST.{:020}",
+                self.manifest.generation
+            ));
+        }
+        files.sort();
+        files.dedup();
+        files
+    }
+
+    fn require_clean_restore_source(&self, report: &IntegrityReport) -> Result<()> {
+        if report.stale_rollup_files > 0 {
+            return Err(Error::Corruption {
+                offset: 0,
+                reason: format!(
+                    "restore requires a clean backup; {} active rollup files trail the raw log",
+                    report.stale_rollup_files
+                ),
+            });
+        }
+        if report.raw_recovered_tail_bytes == 0
+            && report.raw_recovered_tail == crate::RecoveredTail::None
+        {
+            return Ok(());
+        }
+        let physical_bytes = std::fs::metadata(self.root.join(ACTIVE_LOG))?.len();
+        Err(Error::Corruption {
+            offset: physical_bytes.saturating_sub(report.raw_recovered_tail_bytes),
+            reason: format!(
+                "restore requires a recovery-free backup; raw log has {} bytes of {}",
+                report.raw_recovered_tail_bytes, report.raw_recovered_tail
+            ),
+        })
+    }
+
+    fn write_snapshot(&self, temporary: &Path) -> Result<BackupReport> {
         let manifests = temporary.join(MANIFEST_DIRECTORY);
         let rollups = temporary.join(ROLLUP_DIRECTORY);
         std::fs::create_dir(&manifests)?;
@@ -726,6 +863,7 @@ impl Store {
 
         // Never hard-link the active log: future appends to the source inode
         // must not mutate the backup snapshot.
+        publication_checkpoint(PublicationStep::Copy)?;
         copy_and_sync(&self.root.join(ACTIVE_LOG), &temporary.join(ACTIVE_LOG))?;
         report.record_copy();
         for descriptor in self.active_rollups() {
@@ -741,6 +879,7 @@ impl Store {
                 hard_link_or_copy(&self.manifest_directory.join(&file), &manifests.join(&file))?;
             report.record_link_or_copy(outcome);
         }
+        publication_checkpoint(PublicationStep::Sync)?;
         sync_directory(&manifests)?;
         sync_directory(&rollups)?;
         sync_directory(temporary)?;
@@ -1184,9 +1323,35 @@ fn directory_bytes(path: &Path) -> Result<u64> {
     Ok(total)
 }
 
+fn require_real_directory(path: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(path)?.file_type().is_dir() {
+        return Ok(());
+    }
+    Err(Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("snapshot path is not a real directory: {}", path.display()),
+    )))
+}
+
+fn snapshot_mismatch(
+    left_name: &str,
+    left: crate::snapshot::SnapshotDigest,
+    right_name: &str,
+    right: crate::snapshot::SnapshotDigest,
+) -> Error {
+    Error::Corruption {
+        offset: 0,
+        reason: format!(
+            "snapshot mismatch: {left_name} files={} bytes={} crc32={:08x}, {right_name} files={} bytes={} crc32={:08x}",
+            left.files, left.bytes, left.crc32, right.files, right.bytes, right.crc32
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BackupReport, LinkOrCopy, RollupSource, Store, hard_link_or_copy_with};
+    use crate::snapshot::{PublicationStep, StagedDirectory, fail_next_publication_step};
     use crate::{
         CalendarUnit, Entity, EntityId, Point, RollupPolicy, RollupResolution, RollupTier,
         SeriesDefinition, SeriesSemantics, Transaction,
@@ -1352,6 +1517,143 @@ mod tests {
         (0..=20)
             .map(|second| Point::actual(1, second * SECOND, second as f64))
             .collect()
+    }
+
+    fn create_verified_backup(root: &Path, with_rollup: bool) -> std::path::PathBuf {
+        let source = root.join("source");
+        let backup = root.join("backup");
+        let mut store = Store::open(&source).unwrap();
+        let tiers = with_rollup
+            .then_some(vec![RollupTier {
+                resolution: RollupResolution::FixedMicros(5 * SECOND),
+                retain_for_micros: None,
+            }])
+            .unwrap_or_default();
+        initialize(&mut store, tiers, None);
+        let mut transaction = Transaction::new();
+        transaction.append_points(points());
+        store.commit(transaction).unwrap();
+        if with_rollup {
+            store.maintain(DAY).unwrap();
+        }
+        store.backup_to(&backup).unwrap();
+        backup
+    }
+
+    fn assert_io_kind(error: crate::Error, expected: std::io::ErrorKind) {
+        match error {
+            crate::Error::Io(error) => assert_eq!(error.kind(), expected),
+            other => panic!("expected I/O error {expected:?}, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_fifo(path: &Path) {
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn create_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path` is a live NUL-terminated string and mode has no
+        // platform-dependent bits beyond user read/write permissions.
+        let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        if result != 0 {
+            panic!("mkfifo failed: {}", std::io::Error::last_os_error());
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn create_fifo(_path: &Path) {
+        panic!("FIFO restore tests require Linux or macOS");
+    }
+
+    fn restore_with_deadline(
+        backup: std::path::PathBuf,
+        target: std::path::PathBuf,
+        fifo: &Path,
+    ) -> crate::Result<crate::RestoreReport> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender.send(Store::restore_from(backup, target)).unwrap();
+        });
+        let mut timed_out = false;
+        let result = match receiver.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                timed_out = true;
+                let writer = rustix::fs::open(
+                    fifo,
+                    rustix::fs::OFlags::WRONLY
+                        | rustix::fs::OFlags::CLOEXEC
+                        | rustix::fs::OFlags::NONBLOCK,
+                    rustix::fs::Mode::empty(),
+                )
+                .expect("a blocked FIFO reader must admit a nonblocking writer");
+                drop(writer);
+                receiver
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("restore worker must exit after its FIFO reader is released")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("restore worker disconnected without a result")
+            }
+        };
+        worker.join().unwrap();
+        assert!(!timed_out, "restore blocked while opening a selected FIFO");
+        result
+    }
+
+    fn flip_last_byte(path: &Path) {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.seek(SeekFrom::End(-1)).unwrap();
+        let mut byte = [0_u8; 1];
+        std::io::Read::read_exact(&mut file, &mut byte).unwrap();
+        file.seek(SeekFrom::End(-1)).unwrap();
+        file.write_all(&[byte[0] ^ 0xff]).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    fn overwrite_byte(path: &Path, offset: u64, byte: u8) {
+        let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&[byte]).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    fn restore_stages(parent: &Path, target_name: &str) -> Vec<String> {
+        let prefix = format!(".{target_name}.restore-");
+        stored_files(parent)
+            .into_iter()
+            .filter(|name| name.starts_with(&prefix))
+            .collect()
+    }
+
+    fn active_manifest_path(backup: &Path) -> std::path::PathBuf {
+        let store = Store::open_read_only(backup).unwrap();
+        let generation = store.manifest_generation();
+        drop(store);
+        backup
+            .join("manifests")
+            .join(format!("MANIFEST.{generation:020}"))
+    }
+
+    fn active_rollup_path(backup: &Path) -> std::path::PathBuf {
+        let store = Store::open_read_only(backup).unwrap();
+        let file = store.active_rollups().next().unwrap().file.clone();
+        drop(store);
+        backup.join("rollups").join(file)
     }
 
     #[test]
@@ -2074,5 +2376,326 @@ mod tests {
         store.commit(transaction).unwrap();
         assert_eq!(backup.database().stats().unwrap().points, backup_points);
         assert_eq!(store.database().stats().unwrap().points, backup_points + 1);
+    }
+
+    #[test]
+    fn restore_preserves_the_selected_snapshot_and_is_independent() {
+        let directory = tempdir().unwrap();
+        let backup = create_verified_backup(directory.path(), true);
+        let target = directory.path().join("restored");
+        let backup_before = directory_snapshot(&backup);
+
+        let report = Store::restore_from(&backup, &target).unwrap();
+        assert_eq!(report.files, 3);
+        assert!(report.bytes > 0);
+        assert_eq!(report.raw_commits, 2);
+        assert_eq!(report.raw_points, 21);
+        assert_eq!(
+            report.source_snapshot_crc32,
+            report.destination_snapshot_crc32
+        );
+        let restored = Store::open_read_only(&target).unwrap();
+        let integrity = restored.check_integrity().unwrap();
+        assert_eq!(integrity.raw_commits, report.raw_commits);
+        assert_eq!(integrity.raw_points, report.raw_points);
+        assert_eq!(integrity.manifest_generation, report.manifest_generation);
+        drop(restored);
+
+        let mut writable = Store::open(&target).unwrap();
+        let mut transaction = Transaction::new();
+        transaction.append_points(vec![Point::actual(1, 30 * SECOND, 30.0)]);
+        writable.commit(transaction).unwrap();
+        writable.close().unwrap();
+        assert_eq!(directory_snapshot(&backup), backup_before);
+        assert_eq!(
+            Store::open_read_only(&backup)
+                .unwrap()
+                .check_integrity()
+                .unwrap()
+                .raw_points,
+            21
+        );
+    }
+
+    #[test]
+    fn restore_never_changes_an_existing_empty_or_working_target() {
+        let directory = tempdir().unwrap();
+        let backup = create_verified_backup(directory.path(), false);
+
+        let empty = directory.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let empty_before = directory_snapshot(&empty);
+        assert_io_kind(
+            Store::restore_from(&backup, &empty).unwrap_err(),
+            std::io::ErrorKind::AlreadyExists,
+        );
+        assert_eq!(directory_snapshot(&empty), empty_before);
+
+        let working = directory.path().join("working");
+        let mut store = Store::open(&working).unwrap();
+        initialize(&mut store, Vec::new(), None);
+        store.close().unwrap();
+        let working_before = directory_snapshot(&working);
+        assert_io_kind(
+            Store::restore_from(&backup, &working).unwrap_err(),
+            std::io::ErrorKind::AlreadyExists,
+        );
+        assert_eq!(directory_snapshot(&working), working_before);
+
+        let dangling = directory.path().join("dangling");
+        std::os::unix::fs::symlink("missing-target", &dangling).unwrap();
+        assert_io_kind(
+            Store::restore_from(&backup, &dangling).unwrap_err(),
+            std::io::ErrorKind::AlreadyExists,
+        );
+        assert_eq!(
+            std::fs::read_link(&dangling).unwrap(),
+            Path::new("missing-target")
+        );
+    }
+
+    #[test]
+    fn simultaneous_restores_publish_exactly_one_complete_target() {
+        let directory = tempdir().unwrap();
+        let backup = create_verified_backup(directory.path(), true);
+        let target = directory.path().join("race-target");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+
+        let left_backup = backup.clone();
+        let left_target = target.clone();
+        let left_barrier = std::sync::Arc::clone(&barrier);
+        let left = std::thread::spawn(move || {
+            left_barrier.wait();
+            Store::restore_from(left_backup, left_target)
+        });
+        let right_backup = backup.clone();
+        let right_target = target.clone();
+        let right_barrier = std::sync::Arc::clone(&barrier);
+        let right = std::thread::spawn(move || {
+            right_barrier.wait();
+            Store::restore_from(right_backup, right_target)
+        });
+        barrier.wait();
+
+        let results = [left.join().unwrap(), right.join().unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let loser = results
+            .into_iter()
+            .find_map(std::result::Result::err)
+            .unwrap();
+        assert_io_kind(loser, std::io::ErrorKind::AlreadyExists);
+        let restored = Store::open_read_only(&target).unwrap();
+        let integrity = restored.check_integrity().unwrap();
+        assert_eq!(integrity.raw_commits, 2);
+        assert_eq!(integrity.raw_points, 21);
+        assert_eq!(integrity.active_rollup_files, 1);
+        assert!(restore_stages(directory.path(), "race-target").is_empty());
+    }
+
+    #[test]
+    fn stage_shared_lock_survives_rename_until_the_post_check_finishes() {
+        let directory = tempdir().unwrap();
+        let backup = create_verified_backup(directory.path(), true);
+        let target = directory.path().join("target");
+        let source = Store::open_read_only(&backup).unwrap();
+        let staged = StagedDirectory::create(&target, "restore").unwrap();
+        source.write_snapshot(staged.path()).unwrap();
+        let stage = Store::open_read_only(staged.path()).unwrap();
+
+        let publication = staged.publish(&target).unwrap();
+        match Store::open(&target) {
+            Err(crate::Error::Locked { path }) => {
+                assert_eq!(path, target.join("active.wlog"));
+            }
+            Err(other) => panic!("expected writer lock refusal, got {other:?}"),
+            Ok(_) => panic!("writer opened before the post-check finished"),
+        }
+        Store::open_read_only(&target)
+            .unwrap()
+            .check_integrity()
+            .unwrap();
+        drop(stage);
+        publication.commit();
+
+        Store::open(&target).unwrap().close().unwrap();
+    }
+
+    #[test]
+    fn restore_rejects_corrupt_and_incomplete_selected_files() {
+        for case in ["raw-crc", "raw-format", "raw-short", "manifest", "rollup"] {
+            let directory = tempdir().unwrap();
+            let backup = create_verified_backup(directory.path(), true);
+            let target = directory.path().join("target");
+            match case {
+                "raw-crc" => flip_last_byte(&backup.join("active.wlog")),
+                "raw-format" => overwrite_byte(&backup.join("active.wlog"), 0, 0),
+                "raw-short" => {
+                    let mut file = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(backup.join("active.wlog"))
+                        .unwrap();
+                    file.write_all(b"partial").unwrap();
+                    file.sync_all().unwrap();
+                }
+                "manifest" => flip_last_byte(&active_manifest_path(&backup)),
+                "rollup" => flip_last_byte(&active_rollup_path(&backup)),
+                _ => unreachable!(),
+            }
+
+            assert!(
+                Store::restore_from(&backup, &target).is_err(),
+                "restore accepted {case} corruption"
+            );
+            assert!(!target.exists(), "restore published {case} corruption");
+            assert!(restore_stages(directory.path(), "target").is_empty());
+        }
+    }
+
+    #[test]
+    fn restore_rejects_stale_active_rollup_provenance() {
+        let directory = tempdir().unwrap();
+        let backup = create_verified_backup(directory.path(), true);
+        {
+            let mut database = crate::Database::open(backup.join("active.wlog")).unwrap();
+            let mut transaction = Transaction::new();
+            transaction.append_points(vec![Point::actual(1, 30 * SECOND, 30.0)]);
+            database.commit(transaction).unwrap();
+            database.close().unwrap();
+        }
+        assert_eq!(
+            Store::open_read_only(&backup)
+                .unwrap()
+                .check_integrity()
+                .unwrap()
+                .stale_rollup_files,
+            1
+        );
+
+        let target = directory.path().join("target");
+        let error = Store::restore_from(&backup, &target).unwrap_err();
+        assert!(error.to_string().contains("active rollup files trail"));
+        assert!(!target.exists());
+        assert!(restore_stages(directory.path(), "target").is_empty());
+    }
+
+    #[test]
+    fn restore_ignores_orphan_rollups_and_inactive_manifest_generations() {
+        let directory = tempdir().unwrap();
+        let backup = create_verified_backup(directory.path(), true);
+        let first = directory.path().join("first");
+        let baseline = Store::restore_from(&backup, &first).unwrap();
+
+        std::fs::write(backup.join("rollups/orphan.rseg"), b"not selected").unwrap();
+        std::fs::write(
+            backup.join("manifests/MANIFEST.00000000000000000000"),
+            b"inactive generation",
+        )
+        .unwrap();
+        let second = directory.path().join("second");
+        let restored = Store::restore_from(&backup, &second).unwrap();
+
+        assert_eq!(
+            restored.source_snapshot_crc32,
+            baseline.source_snapshot_crc32
+        );
+        assert_eq!(
+            restored.destination_snapshot_crc32,
+            baseline.destination_snapshot_crc32
+        );
+        assert!(!second.join("rollups/orphan.rseg").exists());
+        assert!(
+            !second
+                .join("manifests/MANIFEST.00000000000000000000")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn restore_rejects_a_selected_symlink() {
+        let directory = tempdir().unwrap();
+        let backup = create_verified_backup(directory.path(), false);
+        let external = directory.path().join("external.wlog");
+        std::fs::rename(backup.join("active.wlog"), &external).unwrap();
+        std::os::unix::fs::symlink(&external, backup.join("active.wlog")).unwrap();
+
+        let target = directory.path().join("target");
+        let error = Store::restore_from(&backup, &target).unwrap_err();
+        assert!(error.to_string().contains("not a regular file"));
+        assert!(!target.exists());
+        assert!(restore_stages(directory.path(), "target").is_empty());
+    }
+
+    #[test]
+    fn restore_rejects_selected_special_files_without_blocking() {
+        for selected in ["active", "manifest", "rollup"] {
+            let directory = tempdir().unwrap();
+            let backup = create_verified_backup(directory.path(), true);
+            let path = match selected {
+                "active" => backup.join("active.wlog"),
+                "manifest" => active_manifest_path(&backup),
+                "rollup" => active_rollup_path(&backup),
+                _ => unreachable!(),
+            };
+            std::fs::remove_file(&path).unwrap();
+            create_fifo(&path);
+
+            let target = directory.path().join("target");
+            let error = restore_with_deadline(backup, target.clone(), &path).unwrap_err();
+            assert!(
+                error.to_string().contains("not a regular file"),
+                "wrong {selected} special-file error: {error}"
+            );
+            assert!(!target.exists());
+            assert!(restore_stages(directory.path(), "target").is_empty());
+        }
+    }
+
+    #[test]
+    fn restore_failures_clean_the_stage_and_leave_no_target() {
+        for step in [
+            PublicationStep::Copy,
+            PublicationStep::Sync,
+            PublicationStep::ChecksumMismatch,
+            PublicationStep::Publish,
+            PublicationStep::ParentSync,
+            PublicationStep::PostCheck,
+        ] {
+            let directory = tempdir().unwrap();
+            let backup = create_verified_backup(directory.path(), true);
+            let target = directory.path().join("target");
+            fail_next_publication_step(step);
+
+            assert!(
+                Store::restore_from(&backup, &target).is_err(),
+                "injected {step:?} failure did not fail"
+            );
+            assert!(!target.exists(), "{step:?} failure left a target");
+            assert!(
+                restore_stages(directory.path(), "target").is_empty(),
+                "{step:?} failure left a stage"
+            );
+        }
+    }
+
+    #[test]
+    fn backup_rolls_back_final_parent_sync_and_post_check_failures() {
+        for step in [PublicationStep::ParentSync, PublicationStep::PostCheck] {
+            let directory = tempdir().unwrap();
+            let source = directory.path().join("source");
+            let target = directory.path().join("backup");
+            let mut store = Store::open(&source).unwrap();
+            initialize(&mut store, Vec::new(), None);
+            fail_next_publication_step(step);
+
+            assert!(store.backup_to(&target).is_err());
+            assert!(!target.exists(), "{step:?} failure left a backup");
+            let prefix = ".backup.backup-";
+            assert!(
+                stored_files(directory.path())
+                    .iter()
+                    .all(|name| !name.starts_with(prefix)),
+                "{step:?} failure left a backup stage"
+            );
+        }
     }
 }

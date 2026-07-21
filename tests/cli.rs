@@ -190,6 +190,9 @@ fn usage_errors_exit_two_on_stderr_without_creating_files() {
         &["backup"],
         &["backup", "source"],
         &["backup", "source", "destination", "extra"],
+        &["restore"],
+        &["restore", "backup"],
+        &["restore", "backup", "target", "extra"],
         &["generate"],
         &["bench-ftwdb"],
         &["bench-ftwdb", "workload"],
@@ -400,6 +403,7 @@ fn generated_store_commands_round_trip_without_read_only_mutation() {
     let workload = directory.path().join("workload");
     let store = directory.path().join("store");
     let backup = directory.path().join("backup");
+    let restored = directory.path().join("restored");
 
     let generated = ftw(
         directory.path(),
@@ -524,6 +528,103 @@ fn generated_store_commands_round_trip_without_read_only_mutation() {
         generated_commits,
     );
     assert_eq!(snapshot_tree(&backup), before_backup_check);
+
+    let before_restore = snapshot_tree(&backup);
+    let restore = ftw(
+        directory.path(),
+        &["restore", path_str(&backup), path_str(&restored)],
+    );
+    restore.assert_success();
+    let restore_json = json_record(&restore);
+    assert_eq!(json_string(&restore_json, "format"), "ftwdb-restore-v1");
+    assert_eq!(json_u64(&restore_json, "files"), files);
+    assert_eq!(json_u64(&restore_json, "raw_points"), generated_points);
+    assert_eq!(json_u64(&restore_json, "raw_commits"), generated_commits);
+    assert_eq!(
+        json_u64(&restore_json, "manifest_generation"),
+        manifest_generation
+    );
+    let source_crc = json_string(&restore_json, "source_snapshot_crc32");
+    let destination_crc = json_string(&restore_json, "destination_snapshot_crc32");
+    assert_eq!(source_crc.len(), 8);
+    assert_eq!(source_crc, destination_crc);
+    let restored_tree = snapshot_tree(&restored);
+    assert_eq!(restored_tree, before_restore);
+    let restored_bytes: u64 = restored_tree
+        .iter()
+        .filter_map(|(_, entry)| match entry {
+            TreeEntry::File(bytes) => Some(bytes.len() as u64),
+            TreeEntry::Directory => None,
+        })
+        .sum();
+    assert_eq!(json_u64(&restore_json, "bytes"), restored_bytes);
+    check_store(
+        directory.path(),
+        &restored,
+        generated_points,
+        generated_commits,
+    );
+    assert_eq!(snapshot_tree(&backup), before_restore);
+
+    let existing = directory.path().join("existing-target");
+    fs::create_dir(&existing).unwrap();
+    let existing_before = snapshot_tree(&existing);
+    let refused = ftw(
+        directory.path(),
+        &["restore", path_str(&backup), path_str(&existing)],
+    );
+    assert_runtime_error(&refused);
+    assert!(refused.stderr.contains("already exists"));
+    assert_eq!(snapshot_tree(&existing), existing_before);
+
+    let relative = ftw(
+        directory.path(),
+        &["restore", path_str(&backup), "relative-restored"],
+    );
+    relative.assert_success();
+    check_store(
+        directory.path(),
+        &directory.path().join("relative-restored"),
+        generated_points,
+        generated_commits,
+    );
+}
+
+#[test]
+fn restore_corruption_is_a_runtime_error_and_publishes_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source");
+    let backup = directory.path().join("backup");
+    let target = directory.path().join("target");
+
+    let generated = ftw(
+        directory.path(),
+        &["generate", "workload", "--sites", "1", "--days", "1"],
+    );
+    generated.assert_success();
+    let loaded = ftw(
+        directory.path(),
+        &["bench-ftwdb", "workload", path_str(&source)],
+    );
+    loaded.assert_success();
+    let backed_up = ftw(
+        directory.path(),
+        &["backup", path_str(&source), path_str(&backup)],
+    );
+    backed_up.assert_success();
+    let mut active = fs::OpenOptions::new()
+        .append(true)
+        .open(backup.join("active.wlog"))
+        .unwrap();
+    active.write_all(b"partial").unwrap();
+    active.sync_all().unwrap();
+
+    let output = ftw(
+        directory.path(),
+        &["restore", path_str(&backup), path_str(&target)],
+    );
+    assert_runtime_error(&output);
+    assert!(!target.exists());
 }
 
 #[test]

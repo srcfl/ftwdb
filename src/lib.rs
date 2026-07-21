@@ -17,6 +17,7 @@ mod real_fixture;
 mod rollup;
 mod rollup_segment;
 mod segment;
+mod snapshot;
 mod storage;
 mod store;
 mod transaction;
@@ -38,8 +39,8 @@ pub use rollup_segment::{RollupSegment, RollupSegmentStats};
 pub use segment::{Segment, SegmentStats};
 pub use storage::{Commit, Config, Database, Durability, PlanOutcome, Point, RecoveredTail, Stats};
 pub use store::{
-    BackupReport, IntegrityReport, MaintenanceReport, RetentionGate, RollupQuery, RollupSource,
-    Store,
+    BackupReport, IntegrityReport, MaintenanceReport, RestoreReport, RetentionGate, RollupQuery,
+    RollupSource, Store,
 };
 pub use transaction::Transaction;
 pub use tsbs::{TsbsIotLoadReport, load_tsbs_iot};
