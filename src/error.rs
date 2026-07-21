@@ -12,6 +12,8 @@ pub enum Error {
     Corruption { offset: u64, reason: String },
     BatchTooLarge { points: usize, maximum: usize },
     InvalidConfig(&'static str),
+    InvalidModel(String),
+    Serialization(String),
     Poisoned,
 }
 
@@ -30,6 +32,8 @@ impl fmt::Display for Error {
                 write!(f, "batch has {points} points; maximum is {maximum}")
             }
             Self::InvalidConfig(reason) => write!(f, "invalid configuration: {reason}"),
+            Self::InvalidModel(reason) => write!(f, "invalid energy model: {reason}"),
+            Self::Serialization(reason) => write!(f, "serialization error: {reason}"),
             Self::Poisoned => write!(
                 f,
                 "database writer is poisoned after a failed write; close and reopen it"

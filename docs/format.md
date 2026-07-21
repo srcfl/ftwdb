@@ -18,8 +18,8 @@ uncompressed; it is a durability test vehicle, not the final segment format.
 |---:|---:|---|
 | 0 | 4 | ASCII `WBAT` |
 | 4 | 2 | frame version (`1`) |
-| 6 | 2 | reserved flags |
-| 8 | 4 | point count |
+| 6 | 2 | frame kind: `0` legacy points, `1` mixed transaction |
+| 8 | 4 | item count: points or transaction records |
 | 12 | 4 | payload bytes |
 | 16 | 4 | CRC32 of payload |
 | 20 | 4 | CRC32 of header bytes 0..20 |
@@ -42,6 +42,17 @@ The complete batch frame is the recovery unit. An incomplete final header or
 payload is truncated on open. A checksum failure in the final frame discards
 that frame. A checksum failure before a later frame is reported as corruption.
 
+## Mixed transaction payload
+
+A frame of kind `1` begins with `WTXN`, a transaction version, reserved flags,
+and a record count. Each record has a kind, record version, byte length, and
+body. Version 1 record kinds are entity, relation, series definition, run,
+plan, and fixed-width point batch. Metadata bodies use version-pinned Postcard
+encoding; point bodies retain the explicit 72-byte layout above.
+
+All records in the frame are validated against the resulting catalog before
+the frame is appended. Recovery applies either every record and point or none.
+Unknown frame/record versions fail closed rather than being skipped.
+
 The immutable segment format will be separately versioned and use per-column
 encoding, block checksums, sparse indexes, and footer redundancy.
-

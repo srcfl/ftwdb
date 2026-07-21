@@ -11,6 +11,8 @@ This repository currently contains the first executable storage slice:
 - configurable durability (`Always`, byte-grouped sync, or explicit sync);
 - recovery that removes a torn final batch but reports earlier corruption;
 - three-dimensional time (`valid`, `knowledge`, and `change`) plus `run_id`;
+- atomic mixed transactions for assets, topology, series, runs, plans, and points;
+- persistent catalog recovery and exact-time plan-versus-actual queries;
 - latest-revision and point-in-time queries;
 - mergeable gauge, energy-integral, and reset-aware counter aggregates;
 - tests, property tests, Criterion benchmarks, and a competitor benchmark plan.

@@ -28,9 +28,10 @@ database rather than requiring PostgreSQL beside a TSDB.
   `run_id`. Actual outcomes use the same physical series identity or an
   explicitly related outcome series, making plan-versus-actual joins cheap.
 
-A transaction must eventually be able to create run metadata and its first
-point batches atomically. A run is immutable after completion; corrections
-append a new version or superseding run.
+A transaction can create run metadata and its first point batches atomically.
+Completed runs are immutable; corrections append a new version or superseding
+run. Plan status transitions and catalog references are validated before the
+transaction frame is written.
 
 ## Three-dimensional time
 
@@ -96,4 +97,3 @@ corrected point adds the affected source interval to a durable invalidation
 set. Queries fall back to finer data for invalid buckets until they are rebuilt.
 Raw retention is blocked while a required bucket is invalid or not durably
 published.
-

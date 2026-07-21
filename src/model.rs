@@ -1,15 +1,16 @@
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct EntityId(pub u128);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct RelationId(pub u128);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct RunId(pub u128);
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum PropertyValue {
     Null,
     Bool(bool),
@@ -21,7 +22,7 @@ pub enum PropertyValue {
 pub type Properties = BTreeMap<String, PropertyValue>;
 
 /// An asset, site, portfolio, meter, market, or other stable domain object.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Entity {
     pub id: EntityId,
     pub kind: String,
@@ -33,7 +34,7 @@ pub struct Entity {
 }
 
 /// A typed topological or logical edge between entities.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Relation {
     pub id: RelationId,
     pub kind: String,
@@ -44,7 +45,7 @@ pub struct Relation {
     pub properties: Properties,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum SeriesSemantics {
     Gauge,
     IntervalTotal,
@@ -53,14 +54,14 @@ pub enum SeriesSemantics {
     Event,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum CalendarUnit {
     Day,
     Month,
     Year,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RollupResolution {
     FixedMicros(i64),
     Calendar {
@@ -69,21 +70,21 @@ pub enum RollupResolution {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RollupTier {
     pub resolution: RollupResolution,
     /// `None` retains this tier forever.
     pub retain_for_micros: Option<i64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RollupPolicy {
     pub raw_retain_for_micros: Option<i64>,
     pub tiers: Vec<RollupTier>,
 }
 
 /// Catalog metadata that determines how values are interpreted and rolled up.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SeriesDefinition {
     pub id: u64,
     pub owner_entity: Option<EntityId>,
@@ -136,7 +137,7 @@ impl SeriesDefinition {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RunKind {
     Forecast,
     Optimization,
@@ -145,7 +146,7 @@ pub enum RunKind {
     Reconciliation,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RunStatus {
     Pending,
     Running,
@@ -155,7 +156,7 @@ pub enum RunStatus {
 }
 
 /// Provenance shared by forecast values, plans, imports, and outcomes.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Run {
     pub id: RunId,
     pub kind: RunKind,
@@ -170,7 +171,7 @@ pub struct Run {
     pub attributes: Properties,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum PlanStatus {
     Candidate,
     Approved,
@@ -181,7 +182,7 @@ pub enum PlanStatus {
 
 /// Optimization-plan metadata. Schedules and setpoints are interval points
 /// whose `run_id` refers to this plan's run.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Plan {
     pub id: u128,
     pub run_id: RunId,

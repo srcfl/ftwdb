@@ -6,12 +6,15 @@
 //! mergeable energy aggregates. It is not yet production-ready.
 
 mod aggregate;
+mod catalog;
 mod error;
 mod model;
 mod rollup;
 mod storage;
+mod transaction;
 
 pub use aggregate::{CounterAggregate, GaugeAggregate, Sample};
+pub use catalog::{Catalog, CatalogStats};
 pub use error::{Error, Result};
 pub use model::{
     CalendarUnit, Entity, EntityId, Plan, PlanStatus, Properties, PropertyValue, Relation,
@@ -19,4 +22,5 @@ pub use model::{
     SeriesDefinition, SeriesSemantics,
 };
 pub use rollup::{FixedGaugeRollup, GaugeBucket};
-pub use storage::{Commit, Config, Database, Durability, Point, Stats};
+pub use storage::{Commit, Config, Database, Durability, PlanOutcome, Point, Stats};
+pub use transaction::Transaction;

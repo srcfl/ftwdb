@@ -11,7 +11,7 @@
 
 Exit: recovery invariants pass under randomized truncation and bit flips.
 
-## M1: catalog, plans, and transactional records
+## M1: catalog, plans, and transactional records — complete
 
 - database directory and manifest generations;
 - typed entities, topology relations, series definitions, units, runs,
@@ -20,8 +20,9 @@ Exit: recovery invariants pass under randomized truncation and bit flips.
 - plan-versus-outcome query API;
 - schema migration/version rules.
 
-Exit: an optimization run, its planned schedules, and subsequent actuals
-round-trip and survive injected crashes as one consistent history.
+Exit met: an optimization run, plan metadata, scheduled points, and subsequent
+actuals round-trip; torn mixed frames expose neither partial catalog state nor
+partial points.
 
 ## M2: immutable compressed raw segments
 
@@ -56,4 +57,3 @@ tests prove raw data is never deleted before valid durable rollups exist.
 
 Exit: reproducible, result-verified reports with no unexplained durability or
 configuration asymmetry.
-

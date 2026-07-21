@@ -25,6 +25,7 @@ fn main() -> ExitCode {
             println!("points: {}", stats.points);
             println!("commits: {}", stats.commits);
             println!("series: {}", stats.series);
+            println!("catalog_records: {}", stats.catalog_records);
             println!("file_bytes: {}", stats.file_bytes);
             println!("recovered_tail_bytes: {}", stats.recovered_tail_bytes);
             ExitCode::SUCCESS
