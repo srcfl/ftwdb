@@ -18,7 +18,7 @@ uncompressed; it is a durability test vehicle, not the final segment format.
 |---:|---:|---|
 | 0 | 4 | ASCII `WBAT` |
 | 4 | 2 | frame version (`1`) |
-| 6 | 2 | frame kind: `0` legacy points, `1` mixed transaction |
+| 6 | 2 | frame kind: `0` legacy points, `1` mixed transaction, `2` identified mixed transaction |
 | 8 | 4 | item count: points or transaction records |
 | 12 | 4 | payload bytes |
 | 16 | 4 | CRC32 of payload |
@@ -53,6 +53,23 @@ encoding; point bodies retain the explicit 72-byte layout above.
 All records in the frame are validated against the resulting catalog before
 the frame is appended. Recovery applies either every record and point or none.
 Unknown frame/record versions fail closed rather than being skipped.
+
+## Identified transaction payload
+
+A frame of kind `2` is a mixed transaction carrying a client-supplied
+idempotency identifier: 16 bytes of little-endian `u128` commit identifier
+followed by an unmodified kind `1` transaction payload. Format evolution uses
+a new frame kind — the established mechanism, kinds `0` and `1` already
+coexist — so logs written before this kind existed decode unchanged, and
+transactions without an identifier still produce byte-identical kind `1`
+frames. The identifier shares the frame's checksummed durable unit with the
+records it protects; a separate identifier frame could tear away from its
+transaction and reopen the duplicate-on-retry window this kind closes.
+
+Recovery collects every identifier seen during the log scan, and a commit
+whose identifier is already present writes nothing and reports deduplication.
+A duplicate identifier encountered in the log itself is reported as
+corruption, since the writer never appends one.
 
 The immutable segment format will be separately versioned and use per-column
 encoding, block checksums, sparse indexes, and footer redundancy.

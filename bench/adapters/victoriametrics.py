@@ -12,6 +12,7 @@ import argparse
 import csv
 import json
 import math
+import re
 import time
 import urllib.parse
 import urllib.request
@@ -45,7 +46,12 @@ def wait_ready(base_url: str) -> None:
 def dataset_crc(bundle: Path) -> str:
     for line in (bundle / "summary.txt").read_text().splitlines():
         if line.startswith("crc32="):
-            return line.split("=", 1)[1]
+            crc = line.split("=", 1)[1]
+            if not re.fullmatch(r"[0-9a-f]{8}", crc):
+                raise RuntimeError(
+                    f"bundle summary has a malformed crc32: {crc!r}"
+                )
+            return crc
     raise RuntimeError("bundle summary has no crc32")
 
 

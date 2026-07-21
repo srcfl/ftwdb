@@ -5,8 +5,8 @@ use crate::segment::{Segment, SegmentStats};
 use crate::transaction::{Record, Transaction};
 use crc32fast::hash;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
-use std::fs::{File, OpenOptions};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -19,6 +19,18 @@ const FRAME_HEADER_BYTES: usize = 24;
 const POINT_BYTES: usize = 72;
 const FRAME_KIND_LEGACY_POINTS: u16 = 0;
 const FRAME_KIND_TRANSACTION: u16 = 1;
+/// A transaction frame carrying a client-supplied idempotency identifier.
+///
+/// Format evolution follows the existing frame-kind precedent (kinds 0 and 1
+/// already coexist): a new kind keeps every old log byte-for-byte decodable
+/// and keeps identifier-less commits writing exactly the kind-1 frames they
+/// always wrote. The payload is the 16-byte little-endian commit identifier
+/// followed by an unmodified kind-1 transaction payload, so the identifier
+/// lives in the same checksummed durable unit as the records it protects —
+/// a separate identifier frame would reintroduce the torn-window problem
+/// this feature exists to close.
+const FRAME_KIND_IDENTIFIED_TRANSACTION: u16 = 2;
+const COMMIT_ID_BYTES: usize = 16;
 const TRANSACTION_MAGIC: &[u8; 4] = b"WTXN";
 const TRANSACTION_VERSION: u16 = 1;
 const TRANSACTION_HEADER_BYTES: usize = 12;
@@ -104,6 +116,11 @@ pub struct Commit {
     pub records: usize,
     pub bytes_written: u64,
     pub durable: bool,
+    /// True when the transaction's [`Transaction::with_commit_id`] identifier
+    /// was already committed, so this call wrote nothing: the original
+    /// commit's records and points are stored exactly once. `points`,
+    /// `records`, and `bytes_written` are zero for such a replayed commit.
+    pub deduplicated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,8 +146,15 @@ pub struct PlanOutcome {
 pub struct Database {
     file: File,
     config: Config,
+    read_only: bool,
     index: HashMap<u64, Vec<Point>>,
     catalog: Catalog,
+    /// Every client-supplied commit identifier in the log, rebuilt on open by
+    /// `scan_and_recover` so idempotency survives a crash or reopen. Growth is
+    /// one `u128` plus hash overhead per identified commit for the life of the
+    /// log — acceptable because the whole log is already replayed into memory
+    /// by design (the README acknowledges that ceiling).
+    commit_ids: HashSet<u128>,
     commits: u64,
     points: u64,
     catalog_records: u64,
@@ -145,28 +169,87 @@ impl Database {
     }
 
     pub fn open_with(path: impl AsRef<Path>, config: Config) -> Result<Self> {
-        validate_config(config)?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(path)?;
+        Self::open_mode(path.as_ref(), config, false)
+    }
 
-        if file.metadata()?.len() == 0 {
+    /// Opens an existing database without any possibility of mutating it.
+    ///
+    /// The file is opened without write access and is never created, torn-tail
+    /// recovery is simulated in memory instead of physically truncating the
+    /// file, and every writer API (`append`, `commit`, `flush`) fails with
+    /// [`Error::ReadOnly`]. A shared advisory lock replaces the exclusive one,
+    /// so concurrent read-only openers coexist while a live exclusive writer
+    /// still blocks (and is blocked by) read-only opens, preventing reads of a
+    /// mid-write file.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_mode(path.as_ref(), Config::default(), true)
+    }
+
+    fn open_mode(path: &Path, config: Config, read_only: bool) -> Result<Self> {
+        validate_config(config)?;
+        let mut file = if read_only {
+            OpenOptions::new().read(true).open(path)?
+        } else {
+            OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(path)?
+        };
+
+        // Take an advisory lock before recovery so a writer and a reader can
+        // never interleave: the exclusive writer lock keeps a second opener
+        // from interleaving frames or truncating this handle's in-flight
+        // tail, while the shared read-only lock admits other inspectors but
+        // excludes any exclusive writer. The lock lives exactly as long as
+        // the handle: closing or dropping the database releases it, even on
+        // panic or crash.
+        let lock_result = if read_only {
+            file.try_lock_shared()
+        } else {
+            file.try_lock()
+        };
+        match lock_result {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(Error::Locked {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(TryLockError::Error(error)) => return Err(Error::Io(error)),
+        }
+
+        if read_only {
+            // A writable open initializes an empty file; a read-only open
+            // must instead reject anything too short to hold a header.
+            if file.metadata()?.len() < DATABASE_HEADER_BYTES as u64 {
+                return Err(Error::InvalidHeader);
+            }
+        } else if file.metadata()?.len() == 0 {
             write_database_header(&mut file)?;
+            // The header is durable inside the file, but a freshly created
+            // file only survives power loss once its parent directory entry
+            // is synced as well — otherwise a database that acknowledged
+            // durable commits can vanish wholesale. A pre-existing empty
+            // file takes the same path, which at worst repeats a directory
+            // sync that was already durable.
+            sync_parent_directory(path)?;
         }
 
         let scan = scan_and_recover(
             &mut file,
             config.max_batch_points,
             config.max_transaction_bytes,
+            read_only,
         )?;
         Ok(Self {
             file,
             config,
+            read_only,
             index: scan.index,
             catalog: scan.catalog,
+            commit_ids: scan.commit_ids,
             commits: scan.commits,
             points: scan.points,
             catalog_records: scan.catalog_records,
@@ -177,7 +260,18 @@ impl Database {
     }
 
     /// Appends one atomic, checksummed batch.
+    ///
+    /// This is the catalog-less fast path: points may refer to series and
+    /// runs that no catalog record defines, because callers ingesting raw
+    /// telemetry use it without ever creating a catalog. Only the
+    /// catalog-independent point invariants are enforced — an interval must
+    /// not end before it starts, rejected with the same error a transaction
+    /// commit gives. Series existence and run provenance are checked
+    /// exclusively by [`Database::commit`].
     pub fn append(&mut self, points: &[Point]) -> Result<Commit> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
         if self.poisoned {
             return Err(Error::Poisoned);
         }
@@ -187,6 +281,7 @@ impl Database {
                 maximum: self.config.max_batch_points,
             });
         }
+        crate::catalog::validate_point_intervals(points)?;
         if points.is_empty() {
             return Ok(Commit {
                 frame_offset: self.file.seek(SeekFrom::End(0))?,
@@ -194,6 +289,7 @@ impl Database {
                 records: 0,
                 bytes_written: 0,
                 durable: self.bytes_since_sync == 0,
+                deduplicated: false,
             });
         }
 
@@ -263,13 +359,39 @@ impl Database {
             records: 1,
             bytes_written,
             durable,
+            deduplicated: false,
         })
     }
 
     /// Atomically commits catalog changes and point batches in one frame.
+    ///
+    /// When the transaction carries a [`Transaction::with_commit_id`]
+    /// identifier that is already in the log, nothing is validated or
+    /// written and the returned commit reports
+    /// [`Commit::deduplicated`]: the identifier is checked before any other
+    /// work, so a retried commit can never duplicate points. The check keys
+    /// on the identifier alone — a retry that reuses an identifier with
+    /// different records is also answered from the original commit. An empty
+    /// transaction writes no frame, so its identifier (if any) is not
+    /// recorded; there is nothing a replay could duplicate.
     pub fn commit(&mut self, transaction: Transaction) -> Result<Commit> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
         if self.poisoned {
             return Err(Error::Poisoned);
+        }
+        if let Some(commit_id) = transaction.commit_id
+            && self.commit_ids.contains(&commit_id)
+        {
+            return Ok(Commit {
+                frame_offset: self.file.seek(SeekFrom::End(0))?,
+                points: 0,
+                records: 0,
+                bytes_written: 0,
+                durable: self.bytes_since_sync == 0,
+                deduplicated: true,
+            });
         }
         if transaction.is_empty() {
             return Ok(Commit {
@@ -278,6 +400,7 @@ impl Database {
                 records: 0,
                 bytes_written: 0,
                 durable: self.bytes_since_sync == 0,
+                deduplicated: false,
             });
         }
         let point_count = transaction.point_count();
@@ -301,12 +424,13 @@ impl Database {
             .map_err(|_| Error::Serialization("transaction exceeds u32 length".to_owned()))?;
         let record_count = u32::try_from(transaction.record_count())
             .map_err(|_| Error::Serialization("too many transaction records".to_owned()))?;
-        let frame_header = encode_frame_header(
-            FRAME_KIND_TRANSACTION,
-            record_count,
-            payload_len,
-            hash(&payload),
-        );
+        let frame_kind = if transaction.commit_id.is_some() {
+            FRAME_KIND_IDENTIFIED_TRANSACTION
+        } else {
+            FRAME_KIND_TRANSACTION
+        };
+        let frame_header =
+            encode_frame_header(frame_kind, record_count, payload_len, hash(&payload));
         let bytes_written = (FRAME_HEADER_BYTES + payload.len()) as u64;
         let frame_offset = self.file.seek(SeekFrom::End(0))?;
         let durable = self.write_frame(&frame_header, &payload, bytes_written)?;
@@ -319,6 +443,9 @@ impl Database {
             }
         }
         self.catalog = candidate_catalog;
+        if let Some(commit_id) = transaction.commit_id {
+            self.commit_ids.insert(commit_id);
+        }
         self.commits += 1;
         self.points += point_count as u64;
         let metadata_records = transaction.record_count()
@@ -335,7 +462,15 @@ impl Database {
             records: transaction.record_count(),
             bytes_written,
             durable,
+            deduplicated: false,
         })
+    }
+
+    /// Whether a [`Transaction::with_commit_id`] identifier has been applied
+    /// by this handle — recovered from the log on open or committed since.
+    #[must_use]
+    pub fn contains_commit_id(&self, commit_id: u128) -> bool {
+        self.commit_ids.contains(&commit_id)
     }
 
     fn write_frame(
@@ -370,17 +505,38 @@ impl Database {
 
     /// Makes all prior appends durable according to the operating system.
     pub fn flush(&mut self) -> Result<()> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
         if self.poisoned {
             return Err(Error::Poisoned);
         }
-        self.file.sync_data()?;
+        let sync_result = self.file.sync_data();
+        if let Err(error) = sync_result {
+            // A failed fsync may still have marked the dirty pages clean, so
+            // a retried sync could succeed without the data ever reaching
+            // media (fsyncgate). Poison the writer, exactly as a failed
+            // frame write does, so durability can only be claimed again by
+            // reopening and re-reading what is actually on disk.
+            self.poisoned = true;
+            return Err(Error::Io(error));
+        }
         self.bytes_since_sync = 0;
         Ok(())
     }
 
-    /// Flushes and closes the database.
+    /// Flushes and closes the database. A read-only handle has nothing to
+    /// flush and simply releases its shared lock.
     pub fn close(mut self) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
         self.flush()
+    }
+
+    #[must_use]
+    pub const fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     #[must_use]
@@ -499,7 +655,11 @@ impl Database {
 
     /// Materializes fixed UTC gauge buckets from the winning revisions in a
     /// range. Persistent background rollups will use the same bucket state.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] when `resolution_micros` is not
+    /// positive or `max_gap_micros` is negative.
     pub fn rollup_gauge(
         &self,
         series_id: u64,
@@ -507,7 +667,7 @@ impl Database {
         end: i64,
         resolution_micros: i64,
         max_gap_micros: i64,
-    ) -> FixedGaugeRollup {
+    ) -> Result<FixedGaugeRollup> {
         FixedGaugeRollup::build(
             &self.query_latest(series_id, start, end),
             resolution_micros,
@@ -528,12 +688,21 @@ impl Database {
     }
 
     pub fn stats(&self) -> Result<Stats> {
+        // A read-only open leaves a torn tail on disk, so its physical length
+        // is reduced by the simulated truncation to report the same logical
+        // length a writable recovery would have left behind.
+        let physical_bytes = self.file.metadata()?.len();
+        let file_bytes = if self.read_only {
+            physical_bytes.saturating_sub(self.recovered_tail_bytes)
+        } else {
+            physical_bytes
+        };
         Ok(Stats {
             points: self.points,
             commits: self.commits,
             series: self.index.len(),
             catalog_records: self.catalog_records,
-            file_bytes: self.file.metadata()?.len(),
+            file_bytes,
             recovered_tail_bytes: self.recovered_tail_bytes,
         })
     }
@@ -572,16 +741,21 @@ fn write_database_header(file: &mut File) -> Result<()> {
 struct Scan {
     index: HashMap<u64, Vec<Point>>,
     catalog: Catalog,
+    commit_ids: HashSet<u128>,
     commits: u64,
     points: u64,
     catalog_records: u64,
     recovered_tail_bytes: u64,
 }
 
+/// Replays the log, recovering from a torn tail. With `simulate_recovery` the
+/// torn tail is skipped and accounted exactly as if it had been truncated, but
+/// the file is never written; without it the tail is physically removed.
 fn scan_and_recover(
     file: &mut File,
     max_batch_points: usize,
     max_transaction_bytes: usize,
+    simulate_recovery: bool,
 ) -> Result<Scan> {
     let mut database_header = [0_u8; DATABASE_HEADER_BYTES];
     file.seek(SeekFrom::Start(0))?;
@@ -602,6 +776,7 @@ fn scan_and_recover(
     let mut offset = DATABASE_HEADER_BYTES as u64;
     let mut index = HashMap::<u64, Vec<Point>>::new();
     let mut catalog = Catalog::default();
+    let mut commit_ids = HashSet::<u128>::new();
     let mut commits = 0_u64;
     let mut points = 0_u64;
     let mut catalog_records = 0_u64;
@@ -611,7 +786,9 @@ fn scan_and_recover(
         let remaining = original_len - offset;
         if remaining < FRAME_HEADER_BYTES as u64 {
             recovered_tail_bytes = remaining;
-            truncate_recovered_tail(file, offset)?;
+            if !simulate_recovery {
+                truncate_recovered_tail(file, offset)?;
+            }
             break;
         }
 
@@ -645,9 +822,14 @@ fn scan_and_recover(
             if item_count > max_batch_points || payload_len != expected_payload_len {
                 return corruption(offset, "invalid legacy point frame size");
             }
-        } else if frame_kind == FRAME_KIND_TRANSACTION {
+        } else if frame_kind == FRAME_KIND_TRANSACTION
+            || frame_kind == FRAME_KIND_IDENTIFIED_TRANSACTION
+        {
             if payload_len > max_transaction_bytes {
                 return corruption(offset, "transaction frame exceeds configured maximum");
+            }
+            if frame_kind == FRAME_KIND_IDENTIFIED_TRANSACTION && payload_len < COMMIT_ID_BYTES {
+                return corruption(offset, "identified transaction frame is too short");
             }
         } else {
             return corruption(offset, "unknown frame kind");
@@ -656,7 +838,9 @@ fn scan_and_recover(
         let frame_len = FRAME_HEADER_BYTES as u64 + payload_len as u64;
         if remaining < frame_len {
             recovered_tail_bytes = remaining;
-            truncate_recovered_tail(file, offset)?;
+            if !simulate_recovery {
+                truncate_recovered_tail(file, offset)?;
+            }
             break;
         }
 
@@ -665,7 +849,9 @@ fn scan_and_recover(
         if hash(&payload) != payload_checksum {
             if remaining == frame_len {
                 recovered_tail_bytes = frame_len;
-                truncate_recovered_tail(file, offset)?;
+                if !simulate_recovery {
+                    truncate_recovered_tail(file, offset)?;
+                }
                 break;
             }
             return corruption(offset, "payload checksum mismatch before valid tail");
@@ -678,7 +864,20 @@ fn scan_and_recover(
             }
             points += item_count as u64;
         } else {
-            let records = decode_transaction(&payload, item_count, offset)?;
+            let transaction_payload = if frame_kind == FRAME_KIND_IDENTIFIED_TRANSACTION {
+                let commit_id = u128::from_le_bytes(payload[..COMMIT_ID_BYTES].try_into().unwrap());
+                // The writer refuses to append a frame whose identifier is
+                // already in the log, so a duplicate here can only come from
+                // tampering (say, concatenated logs); failing closed keeps
+                // the exactly-once promise instead of silently replaying.
+                if !commit_ids.insert(commit_id) {
+                    return corruption(offset, "duplicate commit identifier");
+                }
+                &payload[COMMIT_ID_BYTES..]
+            } else {
+                &payload[..]
+            };
+            let records = decode_transaction(transaction_payload, item_count, offset)?;
             catalog.apply_recovered(&records, offset)?;
             let recovered_point_count: usize = records
                 .iter()
@@ -709,11 +908,36 @@ fn scan_and_recover(
     Ok(Scan {
         index,
         catalog,
+        commit_ids,
         commits,
         points,
         catalog_records,
         recovered_tail_bytes,
     })
+}
+
+/// Makes a directory's entries durable, exactly like segment and manifest
+/// publication do for their parents. Opening the directory and syncing it is
+/// Unix semantics; Windows support is tracked separately (issue #15).
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+/// Syncs the directory whose entry makes `path` durable. Only this one level
+/// is synced, matching what segment and manifest publication guarantee.
+pub(crate) fn sync_parent_directory(path: &Path) -> Result<()> {
+    sync_directory(parent_directory(path))
+}
+
+/// The directory that holds `path`'s entry. A bare file name lives in the
+/// current directory, which `Path::parent` reports as an empty path that
+/// cannot be opened.
+fn parent_directory(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
 }
 
 fn truncate_recovered_tail(file: &mut File, length: u64) -> Result<()> {
@@ -751,6 +975,12 @@ fn encode_transaction(transaction: &Transaction) -> Result<Vec<u8>> {
     let record_count = u32::try_from(transaction.record_count())
         .map_err(|_| Error::Serialization("too many transaction records".to_owned()))?;
     let mut payload = Vec::new();
+    // An identified transaction (frame kind 2) is the 16-byte little-endian
+    // commit identifier followed by the unchanged kind-1 payload, keeping the
+    // identifier in the same checksummed durable unit as the records.
+    if let Some(commit_id) = transaction.commit_id {
+        payload.extend_from_slice(&commit_id.to_le_bytes());
+    }
     payload.extend_from_slice(TRANSACTION_MAGIC);
     payload.extend_from_slice(&TRANSACTION_VERSION.to_le_bytes());
     payload.extend_from_slice(&0_u16.to_le_bytes());
@@ -1032,6 +1262,233 @@ mod tests {
     }
 
     #[test]
+    fn append_rejects_inverted_intervals_with_the_commit_error() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("append-validation.ftwdb");
+        let mut database = Database::open(&path).unwrap();
+        let mut inverted = point(100, 10, 11, 1.0);
+        inverted.valid_time_end = 50;
+
+        let before = database.stats().unwrap().file_bytes;
+        let append_error = match database.append(&[point(1, 1, 1, 1.0), inverted]) {
+            Err(error @ Error::InvalidModel(_)) => error,
+            other => panic!("expected Error::InvalidModel, got {other:?}"),
+        };
+        // The whole batch is rejected before anything reaches the log.
+        assert_eq!(database.stats().unwrap().file_bytes, before);
+        assert_eq!(database.stats().unwrap().points, 0);
+
+        // A transaction commit rejects the same point with the same error.
+        let mut transaction = Transaction::new();
+        transaction
+            .upsert_entity(home())
+            .define_series(power_series())
+            .upsert_run(optimization_run());
+        database.commit(transaction).unwrap();
+        let mut committed = Transaction::new();
+        let mut invalid = inverted;
+        invalid.series_id = 7;
+        invalid.run_id = 9;
+        committed.append_points(vec![invalid]);
+        let commit_error = match database.commit(committed) {
+            Err(error @ Error::InvalidModel(_)) => error,
+            other => panic!("expected Error::InvalidModel, got {other:?}"),
+        };
+        assert_eq!(append_error.to_string(), commit_error.to_string());
+    }
+
+    #[test]
+    fn append_remains_a_catalog_less_fast_path() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("append-catalog-less.ftwdb");
+        {
+            let mut database = Database::open(&path).unwrap();
+            // No catalog exists: the series is undefined and the run
+            // unresolvable, yet the legacy path accepts the batch because
+            // only commit() enforces catalog references.
+            let mut telemetry = point(100, 10, 11, 1.0);
+            telemetry.run_id = 42;
+            database.append(&[telemetry]).unwrap();
+            database.close().unwrap();
+        }
+        // The legacy frame recovers unchanged on reopen.
+        let database = Database::open(&path).unwrap();
+        assert_eq!(database.stats().unwrap().points, 1);
+        assert_eq!(database.query_latest(7, 0, 1_000).len(), 1);
+    }
+
+    #[test]
+    fn rollup_gauge_rejects_invalid_arguments_instead_of_panicking() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("rollup-arguments.ftwdb");
+        let mut database = Database::open(&path).unwrap();
+        database.append(&[point(100, 10, 11, 1.0)]).unwrap();
+
+        assert!(matches!(
+            database.rollup_gauge(7, 0, 1_000, 0, 10),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            database.rollup_gauge(7, 0, 1_000, -5, 10),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            database.rollup_gauge(7, 0, 1_000, 300, -1),
+            Err(Error::InvalidArgument(_))
+        ));
+        let rollup = database.rollup_gauge(7, 0, 1_000, 300, 10).unwrap();
+        assert_eq!(rollup.buckets().len(), 1);
+    }
+
+    #[test]
+    fn parent_directory_resolves_nested_and_bare_paths() {
+        use super::parent_directory;
+        use std::path::Path;
+        assert_eq!(
+            parent_directory(Path::new("/store/active.wlog")),
+            Path::new("/store")
+        );
+        assert_eq!(
+            parent_directory(Path::new("relative/active.wlog")),
+            Path::new("relative")
+        );
+        // `Path::parent` reports an unopenable empty parent for a bare file
+        // name; the creation sync must target the current directory instead.
+        assert_eq!(parent_directory(Path::new("active.wlog")), Path::new("."));
+    }
+
+    #[test]
+    fn pre_created_empty_file_is_initialized_like_a_new_database() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("pre-created.ftwdb");
+        drop(std::fs::File::create(&path).unwrap());
+        // A zero-length file takes the same creation path as a brand-new
+        // database: header write, then the parent directory entry sync.
+        {
+            let mut database = Database::open(&path).unwrap();
+            database.append(&[point(1, 1, 1, 1.0)]).unwrap();
+            database.close().unwrap();
+        }
+        let database = Database::open(&path).unwrap();
+        assert_eq!(database.stats().unwrap().points, 1);
+    }
+
+    #[test]
+    fn second_opener_fails_until_the_first_handle_closes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("locked.ftwdb");
+        let first = Database::open(&path).unwrap();
+        match Database::open(&path) {
+            Err(Error::Locked { path: reported }) => assert_eq!(reported, path),
+            Err(other) => panic!("expected Error::Locked, got {other:?}"),
+            Ok(_) => panic!("expected Error::Locked, got a second open database"),
+        }
+        drop(first);
+        let mut reopened = Database::open(&path).unwrap();
+        reopened.append(&[point(1, 1, 1, 1.0)]).unwrap();
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn read_only_open_simulates_recovery_without_mutating_the_file() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("read-only-torn.ftwdb");
+        let first_length;
+        {
+            let mut database = Database::open_with(
+                &path,
+                Config {
+                    durability: Durability::Manual,
+                    ..Config::default()
+                },
+            )
+            .unwrap();
+            database.append(&[point(1, 1, 1, 1.0)]).unwrap();
+            database.flush().unwrap();
+            first_length = database.stats().unwrap().file_bytes;
+            database.append(&[point(2, 2, 2, 2.0)]).unwrap();
+        }
+        let full_length = std::fs::metadata(&path).unwrap().len();
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(full_length - 10).unwrap();
+        drop(file);
+        let bytes_before = std::fs::read(&path).unwrap();
+
+        let database = Database::open_read_only(&path).unwrap();
+        let stats = database.stats().unwrap();
+        assert!(stats.recovered_tail_bytes > 0);
+        assert_eq!(stats.file_bytes, first_length);
+        assert_eq!(database.query_latest(7, 0, 10).len(), 1);
+        database.close().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
+    }
+
+    #[test]
+    fn read_only_open_does_not_create_a_missing_file() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("absent.ftwdb");
+        match Database::open_read_only(&path) {
+            Err(Error::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+            Err(other) => panic!("expected a not-found error, got {other:?}"),
+            Ok(_) => panic!("expected a not-found error, got an open database"),
+        }
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn writer_apis_fail_cleanly_on_a_read_only_handle() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("read-only-writers.ftwdb");
+        {
+            let mut database = Database::open(&path).unwrap();
+            database.append(&[point(1, 1, 1, 1.0)]).unwrap();
+            database.close().unwrap();
+        }
+        let mut database = Database::open_read_only(&path).unwrap();
+        assert!(database.is_read_only());
+        assert!(matches!(
+            database.append(&[point(2, 2, 2, 2.0)]),
+            Err(Error::ReadOnly)
+        ));
+        assert!(matches!(
+            database.commit(Transaction::new()),
+            Err(Error::ReadOnly)
+        ));
+        assert!(matches!(database.flush(), Err(Error::ReadOnly)));
+        assert_eq!(database.query_latest(7, 0, 10).len(), 1);
+        database.close().unwrap();
+    }
+
+    #[test]
+    fn shared_and_exclusive_locks_exclude_each_other() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("lock-interplay.ftwdb");
+        {
+            let mut database = Database::open(&path).unwrap();
+            database.append(&[point(1, 1, 1, 1.0)]).unwrap();
+            database.close().unwrap();
+        }
+
+        // Read-only openers share the lock with each other...
+        let first_reader = Database::open_read_only(&path).unwrap();
+        let second_reader = Database::open_read_only(&path).unwrap();
+        // ...but exclude an exclusive writer.
+        assert!(matches!(Database::open(&path), Err(Error::Locked { .. })));
+        drop(first_reader);
+        assert!(matches!(Database::open(&path), Err(Error::Locked { .. })));
+        drop(second_reader);
+
+        // A live exclusive writer excludes read-only openers.
+        let writer = Database::open(&path).unwrap();
+        assert!(matches!(
+            Database::open_read_only(&path),
+            Err(Error::Locked { .. })
+        ));
+        drop(writer);
+        Database::open_read_only(&path).unwrap().close().unwrap();
+    }
+
+    #[test]
     fn incomplete_last_frame_is_removed_as_one_atomic_batch() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("torn-tail.ftwdb");
@@ -1058,6 +1515,45 @@ mod tests {
         assert_eq!(database.query_latest(7, 0, 10).len(), 1);
         assert_eq!(database.stats().unwrap().file_bytes, first_length);
         assert!(database.stats().unwrap().recovered_tail_bytes > 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_flush_poisons_the_writer_instead_of_permitting_a_retry() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("fsyncgate.ftwdb");
+        let mut database = Database::open_with(
+            &path,
+            Config {
+                durability: Durability::Manual,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        database.append(&[point(1, 1, 1, 1.0)]).unwrap();
+
+        // A pipe cannot be synchronized, so `sync_data` on it fails exactly
+        // where a dying disk would fail the real log file's fsync.
+        let (_reader, writer) = std::io::pipe().unwrap();
+        let real_file = std::mem::replace(
+            &mut database.file,
+            std::fs::File::from(std::os::fd::OwnedFd::from(writer)),
+        );
+
+        assert!(matches!(database.flush(), Err(Error::Io(_))));
+        // The kernel may have marked the unwritten pages clean during the
+        // failed sync, so no retry may be able to report durability: every
+        // writer API must now fail with `Error::Poisoned`.
+        assert!(matches!(database.flush(), Err(Error::Poisoned)));
+        assert!(matches!(
+            database.append(&[point(2, 2, 2, 2.0)]),
+            Err(Error::Poisoned)
+        ));
+        assert!(matches!(
+            database.commit(Transaction::new()),
+            Err(Error::Poisoned)
+        ));
+        drop(real_file);
     }
 
     #[test]
@@ -1120,6 +1616,149 @@ mod tests {
         assert_eq!(comparison.len(), 1);
         assert_eq!(comparison[0].difference, Some(-200.0));
         assert_eq!(database.stats().unwrap().catalog_records, 4);
+    }
+
+    #[test]
+    fn identified_commit_replays_as_a_no_op_after_reopen() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("idempotent.ftwdb");
+        let mut telemetry = point(100, 10, 10, 1.0);
+        telemetry.run_id = 0;
+        let build = |value: Point, commit_id: u128| {
+            let mut transaction = Transaction::new();
+            transaction
+                .upsert_entity(home())
+                .define_series(power_series())
+                .append_points(vec![value])
+                .with_commit_id(commit_id);
+            transaction
+        };
+        {
+            let mut database = Database::open(&path).unwrap();
+            // Zero is an ordinary identifier, not a sentinel.
+            let commit = database.commit(build(telemetry, 0)).unwrap();
+            assert!(!commit.deduplicated);
+            assert_eq!(commit.points, 1);
+            database.close().unwrap();
+        }
+
+        // The crash-and-retry scenario: the acknowledgement was lost, but the
+        // frame was durable, so the retried commit must not write again.
+        let mut database = Database::open(&path).unwrap();
+        assert!(database.contains_commit_id(0));
+        let commit = database.commit(build(telemetry, 0)).unwrap();
+        assert!(commit.deduplicated);
+        assert_eq!(commit.points, 0);
+        assert_eq!(commit.records, 0);
+        assert_eq!(commit.bytes_written, 0);
+        assert_eq!(database.stats().unwrap().points, 1);
+        assert_eq!(database.query_history(7, 0, 1_000).len(), 1);
+
+        // A different identifier is an independent commit; retrying it within
+        // the same session is deduplicated without a reopen.
+        let mut revision = point(100, 20, 20, 2.0);
+        revision.run_id = 0;
+        let mut second = Transaction::new();
+        second.append_points(vec![revision]).with_commit_id(1);
+        assert!(!database.commit(second.clone()).unwrap().deduplicated);
+        assert!(database.commit(second).unwrap().deduplicated);
+        assert_eq!(database.stats().unwrap().points, 2);
+        assert_eq!(database.query_history(7, 0, 1_000).len(), 2);
+        database.close().unwrap();
+    }
+
+    #[test]
+    fn identifier_less_commits_stay_at_least_once() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("at-least-once.ftwdb");
+        let mut database = Database::open(&path).unwrap();
+        let mut telemetry = point(100, 10, 10, 1.0);
+        telemetry.run_id = 0;
+        let mut first = Transaction::new();
+        first
+            .upsert_entity(home())
+            .define_series(power_series())
+            .append_points(vec![telemetry]);
+        database.commit(first).unwrap();
+        // Without an identifier there is no dedup key: an identical retried
+        // commit stores the point twice. This documented at-least-once path
+        // is exactly today's behavior.
+        let mut retry = Transaction::new();
+        retry.append_points(vec![telemetry]);
+        let commit = database.commit(retry).unwrap();
+        assert!(!commit.deduplicated);
+        assert_eq!(commit.points, 1);
+        assert_eq!(database.stats().unwrap().points, 2);
+        assert_eq!(database.query_history(7, 0, 1_000).len(), 2);
+    }
+
+    #[test]
+    fn torn_identified_frame_forgets_its_identifier() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("torn-identified.ftwdb");
+        let mut telemetry = point(100, 10, 10, 1.0);
+        telemetry.run_id = 0;
+        {
+            let mut database = Database::open(&path).unwrap();
+            let mut catalog = Transaction::new();
+            catalog.upsert_entity(home()).define_series(power_series());
+            database.commit(catalog).unwrap();
+            let mut identified = Transaction::new();
+            identified.append_points(vec![telemetry]).with_commit_id(77);
+            database.commit(identified).unwrap();
+            database.close().unwrap();
+        }
+        // Tear the identified frame: identifier and points vanish together,
+        // because they share one durable unit.
+        let full_length = std::fs::metadata(&path).unwrap().len();
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(full_length - 7).unwrap();
+        drop(file);
+
+        let mut database = Database::open(&path).unwrap();
+        assert!(!database.contains_commit_id(77));
+        assert_eq!(database.stats().unwrap().points, 0);
+        // The retry is a genuine first commit and stores the point once.
+        let mut retry = Transaction::new();
+        retry.append_points(vec![telemetry]).with_commit_id(77);
+        assert!(!database.commit(retry).unwrap().deduplicated);
+        assert_eq!(database.stats().unwrap().points, 1);
+        assert_eq!(database.query_history(7, 0, 1_000).len(), 1);
+    }
+
+    #[test]
+    fn identified_and_identifier_less_frames_coexist_in_one_log() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("mixed-kinds.ftwdb");
+        let mut telemetry = point(100, 10, 10, 1.0);
+        telemetry.run_id = 0;
+        {
+            let mut database = Database::open(&path).unwrap();
+            // Kind 0: the legacy point frame.
+            database.append(&[point(50, 5, 5, 0.5)]).unwrap();
+            // Kind 1: an identifier-less transaction, byte-identical to what
+            // the code wrote before identified frames existed.
+            let mut plain = Transaction::new();
+            plain
+                .upsert_entity(home())
+                .define_series(power_series())
+                .append_points(vec![telemetry]);
+            database.commit(plain).unwrap();
+            // Kind 2: an identified transaction.
+            let mut revision = point(100, 20, 20, 2.0);
+            revision.run_id = 0;
+            let mut identified = Transaction::new();
+            identified.append_points(vec![revision]).with_commit_id(9);
+            database.commit(identified).unwrap();
+            database.close().unwrap();
+        }
+        let database = Database::open(&path).unwrap();
+        let stats = database.stats().unwrap();
+        assert_eq!(stats.points, 3);
+        assert_eq!(stats.commits, 3);
+        assert_eq!(stats.catalog_records, 2);
+        assert!(database.contains_commit_id(9));
+        assert!(!database.contains_commit_id(77));
     }
 
     #[test]

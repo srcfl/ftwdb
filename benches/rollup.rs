@@ -78,6 +78,7 @@ fn rollup_benchmarks(criterion: &mut Criterion) {
     let raw: Vec<_> = store
         .database()
         .rollup_gauge(1, 0, end + 1, FIVE_MINUTES, 2 * MINUTE)
+        .unwrap()
         .range(0, end);
     assert_eq!(persisted.buckets, raw);
 
@@ -91,7 +92,8 @@ fn rollup_benchmarks(criterion: &mut Criterion) {
             black_box(
                 store
                     .database()
-                    .rollup_gauge(1, 0, end + 1, FIVE_MINUTES, 2 * MINUTE),
+                    .rollup_gauge(1, 0, end + 1, FIVE_MINUTES, 2 * MINUTE)
+                    .unwrap(),
             )
         })
     });
