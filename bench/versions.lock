@@ -1,4 +1,6 @@
 # Resolved 2026-07-21. The digest is the benchmark identity.
+# TSBS source revision used by the IoT generator and adapter.
+timescale/tsbs@8323e59c74027b108f4ad5ec5d3e498b0101a02e
 victoriametrics/victoria-metrics:v1.148.0@sha256:407013e902f9a0ba1d4b2d4c077c47bbaf917c893c52ff39b19efe83a654afda
 questdb/questdb:9.4.3@sha256:3fd139f9f16015afc1b064fe4591b271be26cdec10315415e5511e9d80a5919e
 timescale/timescaledb:2.28.3-pg18@sha256:2c718e700b1c75b93488085596f2254c991c3aa29584fc282ebbe62fd8335791
@@ -8,4 +10,3 @@ apache/iotdb:2.0.10-standalone@sha256:014c15f1c7154a2910bae205ae415c38883d26b686
 influxdb:3.10.0-core@sha256:b3e577f38c19963597170d8850a3a7f77af8f0cfa866c64cd13e5de0f238e114
 # TDengine did not publish a matching versioned Docker tag; digest is pinned.
 tdengine/tdengine@sha256:79d32ce8a42f64c7dbfc33946a36b3e176ea23c0cd695a1bc9e8aa889ca03b88
-

@@ -18,4 +18,6 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets --all-features
-
+      - run: cargo fmt --manifest-path bench/sd-card-emulator/Cargo.toml -- --check
+      - run: cargo clippy --manifest-path bench/sd-card-emulator/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path bench/sd-card-emulator/Cargo.toml --all-targets

@@ -1,0 +1,335 @@
+#![cfg(unix)]
+
+use ftwdb::{Config, Database, Durability, Point};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::Duration;
+use tempfile::tempdir;
+
+const DEFAULT_SEED: u64 = 0x4654_5744_4250_4354;
+const DEFAULT_ITERATIONS: usize = 32;
+const DEFAULT_BATCH_POINTS: usize = 16_384;
+const MAX_BATCHES: usize = 1_000_000;
+
+fn numbered_batch(batch: usize, points: usize) -> Vec<Point> {
+    (0..points)
+        .map(|index| {
+            let sequence = batch
+                .checked_mul(points)
+                .and_then(|base| base.checked_add(index))
+                .expect("test sequence must fit usize");
+            Point::actual(1, sequence as i64, sequence as f64)
+        })
+        .collect()
+}
+
+/// The ignored controller starts this test in a child process. Each ACK is
+/// emitted only after an `Always` commit has returned as durable.
+#[test]
+fn sigkill_worker_process() {
+    if std::env::var_os("FTWDB_POWER_CUT_WORKER").is_none() {
+        return;
+    }
+
+    let path = PathBuf::from(
+        std::env::var_os("FTWDB_POWER_CUT_DATABASE")
+            .expect("FTWDB_POWER_CUT_DATABASE must be set for the worker"),
+    );
+    let batch_points = environment_usize("FTWDB_POWER_CUT_BATCH_POINTS", DEFAULT_BATCH_POINTS);
+    let mut database = Database::open_with(
+        path,
+        Config {
+            durability: Durability::Always,
+            ..Config::default()
+        },
+    )
+    .unwrap();
+
+    println!("WORKER_READY");
+    std::io::stdout().flush().unwrap();
+    for batch in 0..MAX_BATCHES {
+        let points = numbered_batch(batch, batch_points);
+        println!("WORKER_BEGIN {batch}");
+        std::io::stdout().flush().unwrap();
+        let commit = database.append(&points).unwrap();
+        assert!(commit.durable, "Always commit {batch} was not durable");
+        println!("WORKER_ACK {batch}");
+        std::io::stdout().flush().unwrap();
+    }
+}
+
+/// This is a host-process crash test. It does not prove how an SD-card
+/// controller or filesystem handles lost writes. Run it explicitly and keep
+/// its JSONL result as evidence:
+///
+/// `cargo test --test power_cut always_recovers_every_acknowledged_batch_after_sigkill -- --ignored --nocapture`
+#[test]
+#[ignore = "process crash stress test; writes raw JSONL evidence under bench-results/power-cut"]
+fn always_recovers_every_acknowledged_batch_after_sigkill() {
+    let seed = environment_u64("FTWDB_POWER_CUT_SEED", DEFAULT_SEED);
+    let iterations = environment_usize("FTWDB_POWER_CUT_ITERATIONS", DEFAULT_ITERATIONS);
+    let batch_points = environment_usize("FTWDB_POWER_CUT_BATCH_POINTS", DEFAULT_BATCH_POINTS);
+    assert!(iterations > 0);
+    assert!(batch_points > 0 && batch_points <= Config::default().max_batch_points);
+
+    let result_path = result_path(seed);
+    let mut results = create_result_file(&result_path);
+    writeln!(
+        results,
+        "{{\"format\":\"ftwdb-sigkill-v1\",\"seed\":{seed},\"iterations\":{iterations},\"batch_points\":{batch_points}}}"
+    )
+    .unwrap();
+    results.flush().unwrap();
+
+    let mut random = XorShift64::new(seed);
+    for iteration in 0..iterations {
+        let directory = tempdir().unwrap();
+        let database_path = directory.path().join("power-cut.ftwdb");
+        let kill_batch = random.below(17) as usize;
+        let delay_micros = random.below(12_001);
+        let outcome = run_one_sigkill(&database_path, batch_points, kill_batch, delay_micros);
+
+        let reopened = match Database::open(&database_path) {
+            Ok(database) => database,
+            Err(error) => {
+                writeln!(
+                    results,
+                    "{{\"iteration\":{iteration},\"kill_batch\":{kill_batch},\"delay_micros\":{delay_micros},\"signal\":{},\"acknowledged_batches\":{},\"reopen\":\"error\",\"error\":\"{}\"}}",
+                    outcome.signal,
+                    outcome.acknowledged_batches,
+                    json_escape(&error.to_string()),
+                )
+                .unwrap();
+                results.flush().unwrap();
+                panic!("iteration {iteration} failed to reopen after SIGKILL: {error}");
+            }
+        };
+        let stats = reopened.stats().unwrap();
+        let points = reopened.query_history(1, i64::MIN, i64::MAX);
+        let recovered_batches = points.len() / batch_points;
+        let complete_batches = points.len().is_multiple_of(batch_points);
+        let sequence_is_exact = points.iter().enumerate().all(|(sequence, point)| {
+            point.valid_time == sequence as i64 && point.value == sequence as f64
+        });
+        let contains_every_ack = recovered_batches >= outcome.acknowledged_batches;
+        let has_at_most_one_unacknowledged =
+            recovered_batches <= outcome.acknowledged_batches.saturating_add(1);
+
+        writeln!(
+            results,
+            "{{\"iteration\":{iteration},\"kill_batch\":{kill_batch},\"delay_micros\":{delay_micros},\"signal\":{},\"acknowledged_batches\":{},\"recovered_batches\":{recovered_batches},\"recovered_points\":{},\"recovered_tail_bytes\":{},\"complete_batches\":{complete_batches},\"sequence_is_exact\":{sequence_is_exact},\"contains_every_ack\":{contains_every_ack},\"has_at_most_one_unacknowledged\":{has_at_most_one_unacknowledged}}}",
+            outcome.signal,
+            outcome.acknowledged_batches,
+            points.len(),
+            stats.recovered_tail_bytes,
+        )
+        .unwrap();
+        results.flush().unwrap();
+
+        assert!(
+            complete_batches,
+            "iteration {iteration} exposed a partial batch"
+        );
+        assert!(
+            sequence_is_exact,
+            "iteration {iteration} exposed a gap or corrupt point"
+        );
+        assert!(
+            contains_every_ack,
+            "iteration {iteration} lost an acknowledged batch"
+        );
+        assert!(
+            has_at_most_one_unacknowledged,
+            "iteration {iteration} recovered more than the one in-flight batch"
+        );
+    }
+    results.sync_all().unwrap();
+    println!("power-cut raw results: {}", result_path.display());
+}
+
+/// This records the current policy; it does not claim that the policy is
+/// safe for latent media corruption. A full final frame with bad payload CRC is
+/// indistinguishable from one kind of torn write in format v1, so changing this
+/// behavior needs an explicit compatibility and recovery decision.
+#[test]
+fn current_policy_discards_complete_final_frame_with_bad_payload_crc() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("final-crc.ftwdb");
+    let first = numbered_batch(0, 3);
+    let second = numbered_batch(1, 3);
+
+    let mut database = Database::open(&path).unwrap();
+    database.append(&first).unwrap();
+    let first_length = database.stats().unwrap().file_bytes;
+    database.append(&second).unwrap();
+    database.close().unwrap();
+    let full_length = std::fs::metadata(&path).unwrap().len();
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    file.seek(SeekFrom::End(-1)).unwrap();
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last).unwrap();
+    file.seek(SeekFrom::End(-1)).unwrap();
+    file.write_all(&[last[0] ^ 0xff]).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    let recovered = Database::open(&path).unwrap();
+    assert_eq!(recovered.query_history(1, i64::MIN, i64::MAX), first);
+    let stats = recovered.stats().unwrap();
+    assert_eq!(stats.file_bytes, first_length);
+    assert_eq!(stats.recovered_tail_bytes, full_length - first_length);
+}
+
+struct KillOutcome {
+    signal: i32,
+    acknowledged_batches: usize,
+}
+
+fn run_one_sigkill(
+    database_path: &Path,
+    batch_points: usize,
+    kill_batch: usize,
+    delay_micros: u64,
+) -> KillOutcome {
+    let executable = std::env::current_exe().unwrap();
+    let mut child = Command::new(executable)
+        .args([
+            "--exact",
+            "sigkill_worker_process",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("FTWDB_POWER_CUT_WORKER", "1")
+        .env("FTWDB_POWER_CUT_DATABASE", database_path)
+        .env("FTWDB_POWER_CUT_BATCH_POINTS", batch_points.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+
+    let stdout = child.stdout.take().unwrap();
+    let acknowledgements = Arc::new(Mutex::new(Vec::<usize>::new()));
+    let reader_acknowledgements = Arc::clone(&acknowledgements);
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (begin_tx, begin_rx) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let line = line.unwrap();
+            if line.contains("WORKER_READY") {
+                let _ = ready_tx.send(());
+            }
+            if let Some(raw_batch) = line.split("WORKER_BEGIN ").nth(1)
+                && let Some(token) = raw_batch.split_whitespace().next()
+                && let Ok(batch) = token.parse::<usize>()
+            {
+                let _ = begin_tx.send(batch);
+            }
+            if let Some(raw_ack) = line.split("WORKER_ACK ").nth(1)
+                && let Some(token) = raw_ack.split_whitespace().next()
+                && let Ok(batch) = token.parse::<usize>()
+            {
+                reader_acknowledgements.lock().unwrap().push(batch);
+            }
+        }
+    });
+
+    ready_rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("worker did not become ready");
+    for expected in 0..=kill_batch {
+        let begun = begin_rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("worker stopped starting commits");
+        assert_eq!(begun, expected);
+    }
+    thread::sleep(Duration::from_micros(delay_micros));
+    child.kill().unwrap();
+    let status = child.wait().unwrap();
+    assert!(
+        !status.success(),
+        "worker exited cleanly instead of being killed"
+    );
+    let signal = status.signal().expect("worker did not exit from a signal");
+    assert_eq!(signal, 9, "worker did not exit from SIGKILL");
+    reader.join().unwrap();
+
+    let acknowledgements = acknowledgements.lock().unwrap();
+    for (expected, acknowledged) in acknowledgements.iter().enumerate() {
+        assert_eq!(*acknowledged, expected, "worker ACK sequence has a gap");
+    }
+    KillOutcome {
+        signal,
+        acknowledged_batches: acknowledgements.len(),
+    }
+}
+
+fn result_path(seed: u64) -> PathBuf {
+    if let Some(path) = std::env::var_os("FTWDB_POWER_CUT_RESULTS") {
+        return PathBuf::from(path);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("bench-results/power-cut")
+        .join(format!(
+            "always-sigkill-seed-{seed}-pid-{}.jsonl",
+            std::process::id()
+        ))
+}
+
+fn create_result_file(path: &Path) -> File {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    File::create(path).unwrap()
+}
+
+fn environment_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn environment_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn json_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+struct XorShift64(u64);
+
+impl XorShift64 {
+    fn new(seed: u64) -> Self {
+        Self(seed.max(1))
+    }
+
+    fn next(&mut self) -> u64 {
+        let mut value = self.0;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.0 = value;
+        value
+    }
+
+    fn below(&mut self, upper: u64) -> u64 {
+        self.next() % upper
+    }
+}

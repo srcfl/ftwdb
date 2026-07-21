@@ -1,0 +1,13 @@
+diff --git a/pkg/targets/timescaledb/creator.go b/pkg/targets/timescaledb/creator.go
+--- a/pkg/targets/timescaledb/creator.go
++++ b/pkg/targets/timescaledb/creator.go
+@@ -199 +199 @@
+-		var partitionsOption string = "replication_factor => NULL"
++		var partitionsOption string
+@@ -223,0 +224,3 @@ func (d *dbCreator) createTableAndIndexes(dbBench *sql.DB, tableName string, fie
++		if partitionsOption != "" {
++			partitionsOption += ", "
++		}
+@@ -225 +228 @@ func (d *dbCreator) createTableAndIndexes(dbBench *sql.DB, tableName string, fie
+-			fmt.Sprintf("SELECT %s('%s'::regclass, 'time'::name, %s, chunk_time_interval => %d, create_default_indexes=>FALSE)",
++			fmt.Sprintf("SELECT %s('%s'::regclass, 'time'::name, %schunk_time_interval => %d, create_default_indexes=>FALSE)",

@@ -1,8 +1,11 @@
+use flate2::read::GzDecoder;
 use ftwdb::{
     Config, Database, Durability, EnergyWorkload, Error, Result, RollupResolution, Store,
-    Transaction, WorkloadConfig, gauge_bucket_checksum,
+    Transaction, WorkloadConfig, gauge_bucket_checksum, load_real_fixture, load_tsbs_iot,
 };
 use std::env;
+use std::fs::File;
+use std::io::{BufReader, stdin};
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -19,6 +22,8 @@ fn main() -> ExitCode {
         Some("backup") => backup(&arguments[2..]),
         Some("generate") => generate(&arguments[2..]),
         Some("bench-ftwdb") => bench_ftwdb(&arguments[2..]),
+        Some("bench-real-fixture") => bench_real_fixture(&arguments[2..]),
+        Some("bench-tsbs-iot") => bench_tsbs_iot(&arguments[2..]),
         _ => {
             usage(arguments.first().map_or("ftwdb", String::as_str));
             return ExitCode::from(2);
@@ -31,6 +36,192 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn bench_real_fixture(arguments: &[String]) -> Result<()> {
+    if arguments.len() < 2 {
+        return Err(invalid(
+            "bench-real-fixture requires a points.csv.gz file and empty database directory",
+        ));
+    }
+    let input = &arguments[0];
+    let database_directory = Path::new(&arguments[1]);
+    if database_directory.exists() && std::fs::read_dir(database_directory)?.next().is_some() {
+        return Err(invalid(
+            "benchmark database directory must be absent or empty",
+        ));
+    }
+
+    let mut durability = Durability::Always;
+    let mut durability_name = "always".to_owned();
+    let mut batch_points = 10_000_usize;
+    let mut index = 2;
+    while index < arguments.len() {
+        let option = &arguments[index];
+        let value = arguments
+            .get(index + 1)
+            .ok_or_else(|| invalid(format!("missing value for {option}")))?;
+        match option.as_str() {
+            "--batch-points" => batch_points = parse(value, option)?,
+            "--durability" if value == "always" => {
+                durability = Durability::Always;
+                durability_name = value.clone();
+            }
+            "--durability" if value == "manual" => {
+                durability = Durability::Manual;
+                durability_name = value.clone();
+            }
+            "--durability" if value.starts_with("every-bytes:") => {
+                let encoded = value.trim_start_matches("every-bytes:");
+                let bytes = parse(encoded, "--durability every-bytes")?;
+                durability = Durability::EveryBytes(bytes);
+                durability_name = format!("every-bytes:{bytes}");
+            }
+            "--durability" => {
+                return Err(invalid(
+                    "durability must be always, manual, or every-bytes:N",
+                ));
+            }
+            _ => return Err(invalid(format!("unknown benchmark option {option}"))),
+        }
+        index += 2;
+    }
+
+    let mut store = Store::open_with(
+        database_directory,
+        Config {
+            durability,
+            ..Config::default()
+        },
+    )?;
+    let file = File::open(input)?;
+    let reader = BufReader::new(GzDecoder::new(file));
+    let started = Instant::now();
+    let report = load_real_fixture(reader, &mut store, batch_points)?;
+    let ingest_seconds = started.elapsed().as_secs_f64();
+    let stored_bytes = directory_bytes(database_directory)?;
+    let points_per_second = report.points as f64 / ingest_seconds;
+    let bytes_per_point = if report.points == 0 {
+        0.0
+    } else {
+        stored_bytes as f64 / report.points as f64
+    };
+
+    println!(
+        "{{\"format\":\"ftwdb-real-fixture-load-v1\",\"engine\":\"ftwdb\",\"scope\":\"sanitized_real_installation_write\",\"durability\":\"{}\",\"batch_points\":{},\"points\":{},\"entities\":{},\"series\":{},\"commits\":{},\"commits_durable_immediately\":{},\"input_bytes\":{},\"input_crc32\":\"{:08x}\",\"points_crc32\":\"{:08x}\",\"first_offset_millis\":{},\"last_offset_millis\":{},\"ingest_seconds\":{:.9},\"points_per_second\":{:.3},\"stored_bytes\":{},\"bytes_per_point\":{:.3}}}",
+        durability_name,
+        batch_points,
+        report.points,
+        report.entities,
+        report.series,
+        report.commits,
+        report.commits_durable_immediately,
+        report.input_bytes,
+        report.input_crc32,
+        report.points_crc32,
+        report.first_offset_millis,
+        report.last_offset_millis,
+        ingest_seconds,
+        points_per_second,
+        stored_bytes,
+        bytes_per_point
+    );
+    Ok(())
+}
+
+fn bench_tsbs_iot(arguments: &[String]) -> Result<()> {
+    if arguments.len() < 2 {
+        return Err(invalid(
+            "bench-tsbs-iot requires an input file (or -) and empty database directory",
+        ));
+    }
+    let input = &arguments[0];
+    let database_directory = Path::new(&arguments[1]);
+    if database_directory.exists() && std::fs::read_dir(database_directory)?.next().is_some() {
+        return Err(invalid(
+            "benchmark database directory must be absent or empty",
+        ));
+    }
+
+    let mut durability = Durability::Always;
+    let mut durability_name = "always".to_owned();
+    let mut batch_rows = 10_000_usize;
+    let mut index = 2;
+    while index < arguments.len() {
+        let option = &arguments[index];
+        let value = arguments
+            .get(index + 1)
+            .ok_or_else(|| invalid(format!("missing value for {option}")))?;
+        match option.as_str() {
+            "--batch-rows" => batch_rows = parse(value, option)?,
+            "--durability" if value == "always" => {
+                durability = Durability::Always;
+                durability_name = value.clone();
+            }
+            "--durability" if value == "manual" => {
+                durability = Durability::Manual;
+                durability_name = value.clone();
+            }
+            "--durability" if value.starts_with("every-bytes:") => {
+                let encoded = value.trim_start_matches("every-bytes:");
+                let bytes = parse(encoded, "--durability every-bytes")?;
+                durability = Durability::EveryBytes(bytes);
+                durability_name = format!("every-bytes:{bytes}");
+            }
+            "--durability" => {
+                return Err(invalid(
+                    "durability must be always, manual, or every-bytes:N",
+                ));
+            }
+            _ => return Err(invalid(format!("unknown benchmark option {option}"))),
+        }
+        index += 2;
+    }
+
+    let mut store = Store::open_with(
+        database_directory,
+        Config {
+            durability,
+            ..Config::default()
+        },
+    )?;
+    let started = Instant::now();
+    let report = if input == "-" {
+        let input = stdin();
+        load_tsbs_iot(input.lock(), &mut store, batch_rows)?
+    } else {
+        load_tsbs_iot(BufReader::new(File::open(input)?), &mut store, batch_rows)?
+    };
+    let ingest_seconds = started.elapsed().as_secs_f64();
+    let stored_bytes = directory_bytes(database_directory)?;
+    let points_per_second = report.points as f64 / ingest_seconds;
+    let rows_per_second = report.rows as f64 / ingest_seconds;
+    let bytes_per_point = if report.points == 0 {
+        0.0
+    } else {
+        stored_bytes as f64 / report.points as f64
+    };
+
+    println!(
+        "{{\"format\":\"ftwdb-tsbs-iot-load-v1\",\"engine\":\"ftwdb\",\"scope\":\"tsbs_iot_write\",\"durability\":\"{}\",\"batch_rows\":{},\"rows\":{},\"points\":{},\"entities\":{},\"series\":{},\"commits\":{},\"commits_durable_immediately\":{},\"input_bytes\":{},\"input_crc32\":\"{:08x}\",\"points_crc32\":\"{:08x}\",\"ingest_seconds\":{:.9},\"rows_per_second\":{:.3},\"points_per_second\":{:.3},\"stored_bytes\":{},\"bytes_per_point\":{:.3}}}",
+        durability_name,
+        batch_rows,
+        report.rows,
+        report.points,
+        report.entities,
+        report.series,
+        report.commits,
+        report.commits_durable_immediately,
+        report.input_bytes,
+        report.input_crc32,
+        report.points_crc32,
+        ingest_seconds,
+        rows_per_second,
+        points_per_second,
+        stored_bytes,
+        bytes_per_point
+    );
+    Ok(())
 }
 
 fn check_store(arguments: &[String]) -> Result<()> {
@@ -249,6 +440,6 @@ fn invalid(reason: impl Into<String>) -> Error {
 
 fn usage(program: &str) {
     eprintln!(
-        "usage:\n  {program} inspect <database-file>\n  {program} check-store <store-directory>\n  {program} backup <store-directory> <absent-destination>\n  {program} generate <output-directory> [--seed N] [--sites N] [--days N] [--cadence-seconds N] [--start-micros N]\n  {program} bench-ftwdb <workload-directory> <empty-database-directory> [--durability always|manual] [--batch-points N]"
+        "usage:\n  {program} inspect <database-file>\n  {program} check-store <store-directory>\n  {program} backup <store-directory> <absent-destination>\n  {program} generate <output-directory> [--seed N] [--sites N] [--days N] [--cadence-seconds N] [--start-micros N]\n  {program} bench-ftwdb <workload-directory> <empty-database-directory> [--durability always|manual] [--batch-points N]\n  {program} bench-real-fixture <points.csv.gz> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-points N]\n  {program} bench-tsbs-iot <influx-line-file|-> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-rows N]"
     );
 }

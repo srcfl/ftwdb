@@ -1,0 +1,159 @@
+{
+  "format": "ftwdb-tsbs-robustness-summary-v1",
+  "date": "2026-07-21",
+  "commit": "f082cb2a6ca69412403c31d96e17895c7f7e193f",
+  "host": {
+    "cpu": "Apple M5",
+    "logical_cpus": 10,
+    "memory_bytes": 34359738368,
+    "os": "macOS 26.5.1 (25F80)",
+    "filesystem": "APFS",
+    "docker_client": "29.4.0",
+    "docker_server": "29.4.0 linux/arm64"
+  },
+  "sources": {
+    "tsbs_commit": "8323e59c74027b108f4ad5ec5d3e498b0101a02e",
+    "timescaledb_image": "timescale/timescaledb:2.28.3-pg18@sha256:2c718e700b1c75b93488085596f2254c991c3aa29584fc282ebbe62fd8335791",
+    "questdb_image": "questdb/questdb:9.4.3@sha256:3fd139f9f16015afc1b064fe4591b271be26cdec10315415e5511e9d80a5919e",
+    "sd_runner_image": "rust@sha256:99e09cb2284e2ddbb73a995deee3e91783fd04d177602ccf6eab326d778ee777"
+  },
+  "write_dataset": {
+    "use_case": "iot",
+    "seed": 42,
+    "scale": 500,
+    "start": "2026-01-01T00:00:00Z",
+    "end": "2026-01-01T06:00:00Z",
+    "interval": "10s",
+    "rows": 1944639,
+    "influx_fields": 15376101,
+    "timescaledb_metrics": 9723473,
+    "influx_sha256": "8455eaebfc7c506ecbd8167134e2c2bf1302375394bb56ff5476e7b82024542a",
+    "timescaledb_sha256": "5177a48f7689d3bae5d184d122e5850b879e2cb2f9aad6817dfbe7415053b253"
+  },
+  "write_rows_per_second": {
+    "ftwdb_manual": [392726.390, 411172.308, 416067.902, 411042.471, 408776.147],
+    "ftwdb_always": [338892.086, 341127.692, 337761.054, 337114.756, 337930.101],
+    "timescaledb": [722935.279, 842011.502, 864441.633, 879404.763, 866237.044],
+    "questdb_client_submit": [1869588.72, 3177356.58, 2509984.18, 2957639.35, 2370967.39]
+  },
+  "write_medians": {
+    "ftwdb_manual": 411042.471,
+    "ftwdb_always": 337930.101,
+    "timescaledb": 864441.633,
+    "questdb_client_submit": 2509984.18
+  },
+  "real_installation_fixture": {
+    "source_points": 9462903,
+    "fixture_points": 889978,
+    "fixture_series": 54,
+    "fixture_drivers": 2,
+    "fixture_gaps": 10,
+    "fixture_energy_rows": 546,
+    "fixture_sha256": "31d65e589f07b36faac8f4be3d2a2ca38aadef9390aa96d84c744cf13783f298",
+    "normalized_points_crc32": "9ebde920",
+    "stored_bytes": 64085678,
+    "manual_points_per_second": [
+      6453560.575,
+      6865227.055,
+      6796399.237,
+      6984618.109,
+      6966502.864
+    ],
+    "manual_median_points_per_second": 6865227.055,
+    "always_points_per_second": [
+      1688129.090,
+      1685050.450,
+      1816234.837,
+      1693409.508,
+      1755678.187
+    ],
+    "always_median_points_per_second": 1693409.508
+  },
+  "timescaledb_query_dataset": {
+    "scale": 100,
+    "duration": "24h",
+    "rows": 1555511,
+    "metrics": 7778685,
+    "database_bytes": 252671679,
+    "queries_per_type": 100,
+    "burn_in_per_type": 10,
+    "measured_per_type": 90
+  },
+  "timescaledb_query_latency_ms": {
+    "last-loc": {"p50": 0.246, "p95": 0.587, "p99": 0.653},
+    "low-fuel": {"p50": 0.221, "p95": 0.283, "p99": 0.301},
+    "high-load": {"p50": 0.214, "p95": 0.304, "p99": 0.341},
+    "stationary-trucks": {"p50": 0.870, "p95": 1.890, "p99": 2.151},
+    "long-driving-sessions": {"p50": 13.790, "p95": 14.413, "p99": 15.342},
+    "long-daily-sessions": {"p50": 62.283, "p95": 64.161, "p99": 73.187},
+    "avg-vs-projected-fuel-consumption": {"p50": 31.005, "p95": 34.323, "p99": 34.975},
+    "avg-daily-driving-duration": {"p50": 58.427, "p95": 67.979, "p99": 115.795},
+    "avg-daily-driving-session": {"p50": 60.683, "p95": 66.123, "p99": 98.347},
+    "avg-load": {"p50": 21.230, "p95": 23.748, "p99": 24.376},
+    "daily-activity": {"p50": 66.851, "p95": 70.255, "p99": 73.275},
+    "breakdown-frequency": {"p50": 61.499, "p95": 67.331, "p99": 69.383}
+  },
+  "ftwdb_model_query_median_ns": {
+    "latest": 1578901.016,
+    "history": 109009.479,
+    "as_of": 619582.195,
+    "run": 1153510.094,
+    "plan_outcome": 23672109.5,
+    "gauge_rollup_5m": 5291.725
+  },
+  "sd_simulation": {
+    "dataset_rows": 64941,
+    "dataset_points": 513478,
+    "slow_4mib_100iops_rows_per_second": 7289.422,
+    "slow_4mib_100iops_small_batches_rows_per_second": 7226.251,
+    "fast_20mib_500iops_rows_per_second": 36848.104,
+    "memory_limit_bytes": 536870912,
+    "cpus": 1
+  },
+  "sd_fault_emulator": {
+    "crate": "bench/sd-card-emulator",
+    "unit_and_protocol_tests": 10,
+    "profiles": [
+      "healthy",
+      "cheap-consumer",
+      "nearly-worn",
+      "sudden-power-loss"
+    ],
+    "linux_nbd_mount_run_on_this_host": true,
+    "linux_kernel": "7.0.11-orbstack-00360-gc9bc4d96ac70",
+    "filesystem": "ext4",
+    "profile": "healthy",
+    "fixture_points": 889978,
+    "fixture_commits": 89,
+    "points_per_second": 81668.019,
+    "power_loss_operation": 463,
+    "dropped_operations": 1,
+    "dropped_bytes": 4096,
+    "fsck_exit": 1,
+    "recovered_points": 889978,
+    "recovered_commits": 89,
+    "recovered_tail_bytes": 0,
+    "active_log_sha256": "04b9987229646214a45274e3d3245a25d50f5ead2b1c02185d55dd8a2b69dba3",
+    "verification_passed": true,
+    "cut_during_commit": false
+  },
+  "robustness": {
+    "native_sigkill_rounds": 32,
+    "native_sigkill_passed": 32,
+    "native_sigkill_seed": 5067771431380599636,
+    "sd_throttled_sigkill_exit": 137,
+    "sd_throttled_recovered_points": 118714,
+    "sd_throttled_recovered_commits": 15,
+    "enospc_writer_exit": 1,
+    "enospc_recovered_tail_bytes": 39535,
+    "enospc_recovered_points": 229308,
+    "enospc_recovered_commits": 29
+  },
+  "backup": {
+    "source_bytes": 1110199619,
+    "seconds": 4.18,
+    "source_points": 15376101,
+    "source_commits": 195,
+    "sha256": "29027557f99738fa03727251ac262352a1a9064226fe7e17ebec4081ae9cb0eb"
+  }
+}

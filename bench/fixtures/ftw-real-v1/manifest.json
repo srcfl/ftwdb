@@ -1,0 +1,47 @@
+{
+  "format": "ftwdb-sanitized-real-fixture-v1",
+  "source": {
+    "method": "read-only HTTP GET export",
+    "source_duration_days": 14,
+    "source_points": 9462903,
+    "source_active_series": 54,
+    "source_write_requests": 0,
+    "sanitized_export_sha256_manifest": "03c8066ae9f86dd010ae785720e53d6ebac1441cfac33341aeb7b0333a2a9ac7"
+  },
+  "privacy": {
+    "source_timestamps_removed": true,
+    "names_removed": true,
+    "identifiers_replaced": true,
+    "installation_address_removed": true,
+    "credentials_collected": false
+  },
+  "points": {
+    "file": "points.csv.gz",
+    "sha256": "31d65e589f07b36faac8f4be3d2a2ca38aadef9390aa96d84c744cf13783f298",
+    "decompressed_crc32": "130b64f4",
+    "normalized_points_crc32": "9ebde920",
+    "rows": 889978,
+    "drivers": 2,
+    "series": 54,
+    "duration_millis": 86400000,
+    "first_offset_millis": 581,
+    "last_offset_millis": 86399728,
+    "gap_count": 10,
+    "estimated_missing_nominal_slots": 506,
+    "maximum_gap_millis": 49605594,
+    "sort_order": ["offset_ms", "series_id"]
+  },
+  "energy": {
+    "file": "energy.csv.gz",
+    "sha256": "a176dc6908c2c8b7c5d7afc91cff257127f972bf7e6241bbe5bfc636b626287e",
+    "view": "system",
+    "rows": 546,
+    "quality_counts": {
+      "measured": 432,
+      "gap": 8,
+      "integrated": 80,
+      "recovered": 18,
+      "reset": 8
+    }
+  }
+}
