@@ -10,7 +10,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-const DATABASE_MAGIC: &[u8; 8] = b"WATTDB01";
+const DATABASE_MAGIC: &[u8; 8] = b"FTWDB001";
 const DATABASE_VERSION: u16 = 1;
 const DATABASE_HEADER_BYTES: usize = 16;
 const FRAME_MAGIC: &[u8; 4] = b"WBAT";
@@ -1010,7 +1010,7 @@ mod tests {
     #[test]
     fn round_trips_batches_and_revisions() {
         let directory = tempdir().unwrap();
-        let path = directory.path().join("round-trip.wattdb");
+        let path = directory.path().join("round-trip.ftwdb");
         {
             let mut database = Database::open(&path).unwrap();
             database
@@ -1034,7 +1034,7 @@ mod tests {
     #[test]
     fn incomplete_last_frame_is_removed_as_one_atomic_batch() {
         let directory = tempdir().unwrap();
-        let path = directory.path().join("torn-tail.wattdb");
+        let path = directory.path().join("torn-tail.ftwdb");
         let first_length;
         {
             let mut database = Database::open_with(
@@ -1063,7 +1063,7 @@ mod tests {
     #[test]
     fn corruption_before_the_tail_is_not_silently_discarded() {
         let directory = tempdir().unwrap();
-        let path = directory.path().join("corrupt.wattdb");
+        let path = directory.path().join("corrupt.ftwdb");
         {
             let mut database = Database::open(&path).unwrap();
             database.append(&[point(1, 1, 1, 1.0)]).unwrap();
@@ -1084,7 +1084,7 @@ mod tests {
     #[test]
     fn catalog_plan_and_points_commit_and_recover_atomically() {
         let directory = tempdir().unwrap();
-        let path = directory.path().join("transaction.wattdb");
+        let path = directory.path().join("transaction.ftwdb");
         let mut planned = point(100, 10, 10, 5_000.0);
         planned.valid_time_end = 110;
         planned.run_id = 9;
@@ -1125,7 +1125,7 @@ mod tests {
     #[test]
     fn invalid_catalog_reference_writes_nothing() {
         let directory = tempdir().unwrap();
-        let path = directory.path().join("invalid-transaction.wattdb");
+        let path = directory.path().join("invalid-transaction.ftwdb");
         let mut database = Database::open(&path).unwrap();
         let before = database.stats().unwrap().file_bytes;
         let mut transaction = Transaction::new();
@@ -1142,7 +1142,7 @@ mod tests {
     #[test]
     fn torn_mixed_transaction_leaves_neither_metadata_nor_points() {
         let directory = tempdir().unwrap();
-        let path = directory.path().join("torn-transaction.wattdb");
+        let path = directory.path().join("torn-transaction.ftwdb");
         let mut planned = point(100, 10, 10, 5_000.0);
         planned.valid_time_end = 110;
         planned.run_id = 9;

@@ -1,7 +1,7 @@
+use ftwdb::{Config, Database, Durability, Point, Segment};
 use proptest::prelude::*;
 use std::fs::OpenOptions;
 use tempfile::tempdir;
-use wattdb::{Config, Database, Durability, Point, Segment};
 
 fn point(series_id: u64, index: usize, value: f64) -> Point {
     Point {
@@ -24,7 +24,7 @@ proptest! {
         values in proptest::collection::vec(-1.0e12_f64..1.0e12_f64, 1..512),
     ) {
         let directory = tempdir().unwrap();
-        let path = directory.path().join("property.wattdb");
+        let path = directory.path().join("property.ftwdb");
         let expected: Vec<_> = values
             .iter()
             .enumerate()
@@ -56,7 +56,7 @@ proptest! {
         bytes_removed_seed in any::<usize>(),
     ) {
         let directory = tempdir().unwrap();
-        let path = directory.path().join("truncation.wattdb");
+        let path = directory.path().join("truncation.ftwdb");
         let first = point(1, 0, 1.0);
         let tail: Vec<_> = (0..tail_points)
             .map(|index| point(2, index, index as f64))

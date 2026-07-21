@@ -1,4 +1,4 @@
-//! WattDB is an experimental embedded time-series storage engine designed for
+//! FTWDB is an experimental embedded time-series storage engine designed for
 //! energy data and write-constrained edge storage.
 //!
 //! The current crate is a deliberately small vertical slice: an append-only,

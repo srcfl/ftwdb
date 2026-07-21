@@ -1,11 +1,11 @@
+use ftwdb::{
+    Config, Database, Durability, EnergyWorkload, Error, Result, RollupResolution, Store,
+    Transaction, WorkloadConfig, gauge_bucket_checksum,
+};
 use std::env;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
-use wattdb::{
-    Config, Database, Durability, EnergyWorkload, Error, Result, RollupResolution, Store,
-    Transaction, WorkloadConfig, gauge_bucket_checksum,
-};
 
 const SECOND: i64 = 1_000_000;
 const DAY: i64 = 86_400 * SECOND;
@@ -18,9 +18,9 @@ fn main() -> ExitCode {
         Some("check-store") => check_store(&arguments[2..]),
         Some("backup") => backup(&arguments[2..]),
         Some("generate") => generate(&arguments[2..]),
-        Some("bench-wattdb") => bench_wattdb(&arguments[2..]),
+        Some("bench-ftwdb") => bench_ftwdb(&arguments[2..]),
         _ => {
-            usage(arguments.first().map_or("wattdb", String::as_str));
+            usage(arguments.first().map_or("ftwdb", String::as_str));
             return ExitCode::from(2);
         }
     };
@@ -40,7 +40,7 @@ fn check_store(arguments: &[String]) -> Result<()> {
     let store = Store::open(&arguments[0])?;
     let report = store.check_integrity()?;
     println!(
-        "{{\"format\":\"wattdb-integrity-v1\",\"manifest_generation\":{},\"raw_points\":{},\"raw_commits\":{},\"active_rollup_files\":{},\"active_rollup_buckets\":{},\"active_rollup_bytes\":{}}}",
+        "{{\"format\":\"ftwdb-integrity-v1\",\"manifest_generation\":{},\"raw_points\":{},\"raw_commits\":{},\"active_rollup_files\":{},\"active_rollup_buckets\":{},\"active_rollup_bytes\":{}}}",
         report.manifest_generation,
         report.raw_points,
         report.raw_commits,
@@ -60,7 +60,7 @@ fn backup(arguments: &[String]) -> Result<()> {
     let mut store = Store::open(&arguments[0])?;
     let report = store.backup_to(&arguments[1])?;
     println!(
-        "{{\"format\":\"wattdb-backup-v1\",\"files\":{},\"bytes\":{},\"manifest_generation\":{}}}",
+        "{{\"format\":\"ftwdb-backup-v1\",\"files\":{},\"bytes\":{},\"manifest_generation\":{}}}",
         report.files, report.bytes, report.manifest_generation
     );
     Ok(())
@@ -71,7 +71,7 @@ fn inspect(arguments: &[String]) -> Result<()> {
         return Err(invalid("inspect requires one database file"));
     }
     let stats = Database::open(&arguments[0]).and_then(|database| database.stats())?;
-    println!("format: wattdb-v1");
+    println!("format: ftwdb-v1");
     println!("points: {}", stats.points);
     println!("commits: {}", stats.commits);
     println!("series: {}", stats.series);
@@ -105,7 +105,7 @@ fn generate(arguments: &[String]) -> Result<()> {
     let workload = EnergyWorkload::generate(config)?;
     let summary = workload.write_bundle(output)?;
     println!(
-        "{{\"format\":\"wattdb-energy-workload-v1\",\"seed\":{},\"entities\":{},\"series\":{},\"runs\":{},\"plans\":{},\"points\":{},\"crc32\":\"{:08x}\"}}",
+        "{{\"format\":\"ftwdb-energy-workload-v1\",\"seed\":{},\"entities\":{},\"series\":{},\"runs\":{},\"plans\":{},\"points\":{},\"crc32\":\"{:08x}\"}}",
         config.seed,
         summary.entities,
         summary.series,
@@ -117,10 +117,10 @@ fn generate(arguments: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn bench_wattdb(arguments: &[String]) -> Result<()> {
+fn bench_ftwdb(arguments: &[String]) -> Result<()> {
     if arguments.len() < 2 {
         return Err(invalid(
-            "bench-wattdb requires workload and empty database directories",
+            "bench-ftwdb requires workload and empty database directories",
         ));
     }
     let workload_directory = Path::new(&arguments[0]);
@@ -202,7 +202,7 @@ fn bench_wattdb(arguments: &[String]) -> Result<()> {
     let points_per_second = summary.points as f64 / ingest_seconds;
 
     println!(
-        "{{\"format\":\"wattdb-benchmark-result-v1\",\"engine\":\"wattdb\",\"durability\":\"{}\",\"dataset_crc32\":\"{:08x}\",\"result_crc32\":\"{:08x}\",\"points\":{},\"batch_points\":{},\"ingest_seconds\":{:.9},\"points_per_second\":{:.3},\"maintenance_seconds\":{:.9},\"rollup_files_written\":{},\"cold_query_seconds\":{:.9},\"warm_query_seconds\":{:.9},\"query_buckets\":{},\"stored_bytes\":{}}}",
+        "{{\"format\":\"ftwdb-benchmark-result-v1\",\"engine\":\"ftwdb\",\"durability\":\"{}\",\"dataset_crc32\":\"{:08x}\",\"result_crc32\":\"{:08x}\",\"points\":{},\"batch_points\":{},\"ingest_seconds\":{:.9},\"points_per_second\":{:.3},\"maintenance_seconds\":{:.9},\"rollup_files_written\":{},\"cold_query_seconds\":{:.9},\"warm_query_seconds\":{:.9},\"query_buckets\":{},\"stored_bytes\":{}}}",
         durability_name,
         summary.crc32,
         result_crc,
@@ -249,6 +249,6 @@ fn invalid(reason: impl Into<String>) -> Error {
 
 fn usage(program: &str) {
     eprintln!(
-        "usage:\n  {program} inspect <database-file>\n  {program} check-store <store-directory>\n  {program} backup <store-directory> <absent-destination>\n  {program} generate <output-directory> [--seed N] [--sites N] [--days N] [--cadence-seconds N] [--start-micros N]\n  {program} bench-wattdb <workload-directory> <empty-database-directory> [--durability always|manual] [--batch-points N]"
+        "usage:\n  {program} inspect <database-file>\n  {program} check-store <store-directory>\n  {program} backup <store-directory> <absent-destination>\n  {program} generate <output-directory> [--seed N] [--sites N] [--days N] [--cadence-seconds N] [--start-micros N]\n  {program} bench-ftwdb <workload-directory> <empty-database-directory> [--durability always|manual] [--batch-points N]"
     );
 }

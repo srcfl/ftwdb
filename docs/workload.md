@@ -25,7 +25,7 @@ and local-month rollups.
 
 ## Portable bundle
 
-`wattdb generate <directory>` writes:
+`ftwdb generate <directory>` writes:
 
 | File | Contents |
 |---|---|
@@ -37,7 +37,7 @@ and local-month rollups.
 | `workload.postcard` | canonical lossless benchmark input |
 | `summary.txt` | configuration counts and CRC32 identity |
 
-The WattDB runner emits one JSON result line with dataset CRC, result CRC,
+The FTWDB runner emits one JSON result line with dataset CRC, result CRC,
 ingest and maintenance duration, cold/warm query duration, stored bytes, and
 durability mode. It refuses a non-empty target directory to prevent accidental
 append-to-old-data results.
@@ -45,9 +45,9 @@ append-to-old-data results.
 ## Correctness before speed
 
 The native energy comparison loads catalog-like records and all points into
-both WattDB and SQLite. Before Criterion measures queries, the 5-minute vectors
+both FTWDB and SQLite. Before Criterion measures queries, the 5-minute vectors
 must match exactly on bucket time, count, sum, minimum, and maximum. Persistent
-WattDB query results also carry a checksum over their full energy aggregate
+FTWDB query results also carry a checksum over their full energy aggregate
 state, including integral and covered duration.
 
 Server adapters must report unsupported record classes instead of dropping

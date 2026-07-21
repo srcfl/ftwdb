@@ -1,5 +1,5 @@
 adapter,status,telemetry,revisions_3d,catalog,plans,dst_calendar,notes
-wattdb,implemented,implemented,implemented,implemented,implemented,implemented,CLI JSON runner and Criterion
+ftwdb,implemented,implemented,implemented,implemented,implemented,implemented,CLI JSON runner and Criterion
 sqlite,implemented_native,implemented,stored,stored,stored,query_baseline,Exact native result verification
 victoriametrics,implemented_subset,implemented,unsupported_native,unsupported_native,unsupported_native,not_implemented,Fresh-volume telemetry adapter verifies MetricsQL buckets
 questdb,compose_only,pending,pending,pending,pending,pending,Adapter not yet result-verified

@@ -14,11 +14,11 @@ uses a ClickHouse `MergeTree` ordered by series and all three time dimensions.
 [Rebase EnergyDB](https://github.com/rebase-energy/energydb) adds asset trees,
 grid edges, units, a series catalog, workflow/run provenance, and structural
 diffs in PostgreSQL. Those domain ideas are directly relevant. Requiring two
-server databases is not suitable for WattDB's embedded edge target.
+server databases is not suitable for FTWDB's embedded edge target.
 
 ## Storage designs reviewed
 
-| System | Useful pattern | WattDB implication |
+| System | Useful pattern | FTWDB implication |
 |---|---|---|
 | [VictoriaMetrics](https://docs.victoriametrics.com/victoriametrics/#storage) | immutable sorted parts, per-series blocks, atomic part publication, background merges | adopt immutable publication and free-space-aware merging; add checksums and explicitly measure merge writes |
 | [Prometheus TSDB](https://prometheus.io/docs/prometheus/latest/storage/) | WAL-protected head, immutable time blocks, chunk/index separation | good recovery/block model; two-hour head and metrics-only semantics are not the energy product model |
@@ -26,7 +26,7 @@ server databases is not suitable for WattDB's embedded edge target.
 | [QuestDB](https://questdb.com/docs/architecture/storage-engine/) | parallel WAL, column files, time partitions, explicit out-of-order merge path | partition late data and bound the rewritten range; keep hot write path row-oriented and cold reads columnar |
 | [ClickHouse MergeTree](https://clickhouse.com/docs/engines/table-engines/mergetree-family/mergetree) | sorted immutable parts, partition pruning, column codecs | model for analytic scans and Rebase's 3D ordering; too heavy as an embedded edge dependency |
 | [TimescaleDB](https://github.com/timescale/timescaledb) | time chunks, continuous aggregates, relational metadata | continuous-aggregate semantics and invalidation are key comparison points |
-| [RRDtool](https://www.rrdtool.org/rrdtool/doc/rrdtool.en.html) | fixed-size round-robin archives and continuous consolidation | bounded-storage mode is valuable, but WattDB must preserve revisions/plans and support raw retention policies |
+| [RRDtool](https://www.rrdtool.org/rrdtool/doc/rrdtool.en.html) | fixed-size round-robin archives and continuous consolidation | bounded-storage mode is valuable, but FTWDB must preserve revisions/plans and support raw retention policies |
 | [SQLite](https://sqlite.org/atomiccommit.html) | precisely documented atomic commit and storage assumptions | copy its rigor about filesystem assumptions; do not assume powersafe overwrite on SD cards |
 | [tsink](https://github.com/h2337/tsink) | Rust embedded/server modes, segmented WAL, leveled compaction, adaptive encodings | closest Rust/embedded comparison; include it in every engine benchmark stage |
 | [GreptimeDB](https://github.com/GreptimeTeam/greptimedb) | Rust distributed TSDB, regions, indexes, object storage | useful Rust implementation comparison, but operational scope differs radically |
@@ -48,7 +48,7 @@ server databases is not suitable for WattDB's embedded edge target.
 - [ALP](https://ir.cwi.nl/pub/33334/33334.pdf) is a vectorizable adaptive
   lossless float codec suitable for columnar blocks.
 - Rebase's ClickHouse schema uses Delta/DoubleDelta for IDs/timestamps, Gorilla
-  for values, and Zstd as a second layer. WattDB should benchmark codecs per
+  for values, and Zstd as a second layer. FTWDB should benchmark codecs per
   real energy series rather than selecting one globally.
 
 Candidate block policy: detect fixed step first; compare delta-varint and

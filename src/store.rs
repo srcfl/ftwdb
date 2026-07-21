@@ -63,7 +63,7 @@ pub struct BackupReport {
     pub manifest_generation: u64,
 }
 
-/// A directory-level WattDB store with a commit log and durable rollup
+/// A directory-level FTWDB store with a commit log and durable rollup
 /// generations. Maintenance is explicit so an embedded caller can schedule it
 /// around flash, CPU, and power constraints.
 pub struct Store {

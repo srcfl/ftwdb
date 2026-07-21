@@ -1,6 +1,6 @@
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
+use ftwdb::{Config, Database, Durability, Point};
 use tempfile::tempdir;
-use wattdb::{Config, Database, Durability, Point};
 
 fn batch(series: u64, start: i64, count: usize) -> Vec<Point> {
     (0..count)
@@ -17,7 +17,7 @@ fn storage_benchmarks(criterion: &mut Criterion) {
             || {
                 let directory = tempdir().unwrap();
                 let database = Database::open_with(
-                    directory.path().join("bench.wattdb"),
+                    directory.path().join("bench.ftwdb"),
                     Config {
                         durability: Durability::Manual,
                         ..Config::default()
@@ -34,7 +34,7 @@ fn storage_benchmarks(criterion: &mut Criterion) {
         bencher.iter_batched(
             || {
                 let directory = tempdir().unwrap();
-                let database = Database::open(directory.path().join("bench.wattdb")).unwrap();
+                let database = Database::open(directory.path().join("bench.ftwdb")).unwrap();
                 (directory, database)
             },
             |(_directory, mut database)| database.append(&points).unwrap(),
@@ -45,7 +45,7 @@ fn storage_benchmarks(criterion: &mut Criterion) {
 
     let directory = tempdir().unwrap();
     let mut database = Database::open_with(
-        directory.path().join("query.wattdb"),
+        directory.path().join("query.ftwdb"),
         Config {
             durability: Durability::Manual,
             ..Config::default()

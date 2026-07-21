@@ -1,6 +1,8 @@
-# WattDB
+# FTWDB
 
-WattDB is an experimental embedded database for energy systems. The goal is a
+**Forecasts, Telemetry & Watts.**
+
+FTWDB is an experimental embedded database for energy systems. The goal is a
 small Rust engine that is fast on time-window aggregates, survives abrupt power
 loss, and minimizes write amplification on SD cards and other constrained edge
 storage.
@@ -33,24 +35,24 @@ cargo bench --bench storage
 cargo bench --bench energy_compare -- --quick
 ```
 
-Generate one deterministic portable workload and run WattDB against it:
+Generate one deterministic portable workload and run FTWDB against it:
 
 ```sh
 cargo run --release -- generate ./bench-results/workload --sites 1 --days 7 --cadence-seconds 60 --seed 42
-cargo run --release -- bench-wattdb ./bench-results/workload ./bench-results/wattdb-manual --durability manual
+cargo run --release -- bench-ftwdb ./bench-results/workload ./bench-results/ftwdb-manual --durability manual
 ```
 
 Inspect a database file:
 
 ```sh
-cargo run --release -- inspect ./data.wattdb
+cargo run --release -- inspect ./data.ftwdb
 ```
 
 Verify or snapshot a directory store:
 
 ```sh
-cargo run --release -- check-store ./energy.wattdb
-cargo run --release -- backup ./energy.wattdb ./backups/energy-2026-07-21.wattdb
+cargo run --release -- check-store ./energy.ftwdb
+cargo run --release -- backup ./energy.ftwdb ./backups/energy-2026-07-21.ftwdb
 ```
 
 ## Design documents

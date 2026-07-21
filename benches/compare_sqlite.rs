@@ -1,7 +1,7 @@
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
+use ftwdb::{Config, Database, Durability, Point};
 use rusqlite::{Connection, params};
 use tempfile::{TempDir, tempdir};
-use wattdb::{Config, Database, Durability, Point};
 
 const POINTS: usize = 1_000;
 const SECOND: i64 = 1_000_000;
@@ -10,10 +10,10 @@ fn point(index: usize) -> Point {
     Point::actual(1, index as i64 * SECOND, (index % 100) as f64)
 }
 
-fn wattdb(durable: bool) -> (TempDir, Database) {
+fn ftwdb(durable: bool) -> (TempDir, Database) {
     let directory = tempdir().unwrap();
     let database = Database::open_with(
-        directory.path().join("database.wattdb"),
+        directory.path().join("database.ftwdb"),
         Config {
             durability: if durable {
                 Durability::Always
@@ -54,9 +54,9 @@ fn append_benchmarks(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("compare_append_1000");
     group.throughput(Throughput::Elements(POINTS as u64));
 
-    group.bench_function("wattdb_manual", |bencher| {
+    group.bench_function("ftwdb_manual", |bencher| {
         bencher.iter_batched(
-            || wattdb(false),
+            || ftwdb(false),
             |(_directory, mut database)| database.append(&points).unwrap(),
             BatchSize::SmallInput,
         );
@@ -85,9 +85,9 @@ fn append_benchmarks(criterion: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
-    group.bench_function("wattdb_sync", |bencher| {
+    group.bench_function("ftwdb_sync", |bencher| {
         bencher.iter_batched(
-            || wattdb(true),
+            || ftwdb(true),
             |(_directory, mut database)| database.append(&points).unwrap(),
             BatchSize::SmallInput,
         );

@@ -1,6 +1,6 @@
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
+use ftwdb::{Point, Segment};
 use tempfile::tempdir;
-use wattdb::{Point, Segment};
 
 const POINT_COUNT: usize = 100_000;
 

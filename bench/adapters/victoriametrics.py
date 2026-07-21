@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Result-verified VictoriaMetrics adapter for the telemetry subset.
 
-The engine cannot natively represent WattDB's catalog, plan records, or three
+The engine cannot natively represent FTWDB's catalog, plan records, or three
 time dimensions. This adapter therefore publishes a separately labelled
 telemetry-only result and must never be presented as a full-workload score.
 """
@@ -82,7 +82,7 @@ def import_rows(base_url: str, rows: list[dict[str, str]], crc: str) -> None:
     for row in rows:
         timestamp_ms = int(row["valid_time"]) // 1_000
         batch.append(
-            f'wattdb_value{{series_id="{row["series_id"]}",dataset_crc="{crc}"}} '
+            f'ftwdb_value{{series_id="{row["series_id"]}",dataset_crc="{crc}"}} '
             f'{row["value"]} {timestamp_ms}\n'
         )
         if len(batch) == 20_000:
@@ -95,7 +95,7 @@ def import_rows(base_url: str, rows: list[dict[str, str]], crc: str) -> None:
 def ensure_absent(base_url: str, crc: str, start_micros: int, end_micros: int) -> None:
     params = urllib.parse.urlencode(
         {
-            "match[]": f'wattdb_value{{dataset_crc="{crc}"}}',
+            "match[]": f'ftwdb_value{{dataset_crc="{crc}"}}',
             "start": f"{start_micros / 1_000_000:.3f}",
             "end": f"{end_micros / 1_000_000:.3f}",
         }
@@ -117,7 +117,7 @@ def metricsql(
     # Evaluate one millisecond before each right edge. The explicit 5m window
     # then represents [bucket_start,bucket_end), matching the portable spec.
     query = (
-        f'{function}(wattdb_value{{series_id="1",dataset_crc="{crc}"}}[5m])'
+        f'{function}(ftwdb_value{{series_id="1",dataset_crc="{crc}"}}[5m])'
     )
     params = urllib.parse.urlencode(
         {
@@ -205,7 +205,7 @@ def main() -> None:
     telemetry, grid = read_telemetry(arguments.bundle)
     start = min(int(row["valid_time"]) for row in grid)
     # The final generator point closes the previous interval and is excluded
-    # from the query horizon, like WattDB's benchmark runner.
+    # from the query horizon, like FTWDB's benchmark runner.
     end = max(int(row["valid_time"]) for row in grid)
     expected = expected_buckets(grid, start, end)
 
@@ -226,7 +226,7 @@ def main() -> None:
     print(
         json.dumps(
             {
-                "format": "wattdb-benchmark-result-v1",
+                "format": "ftwdb-benchmark-result-v1",
                 "engine": "victoriametrics",
                 "scope": "telemetry_subset",
                 "durability": "server_default",

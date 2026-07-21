@@ -21,9 +21,9 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(f, "I/O error: {error}"),
-            Self::InvalidHeader => write!(f, "invalid WattDB file header"),
+            Self::InvalidHeader => write!(f, "invalid FTWDB file header"),
             Self::UnsupportedVersion(version) => {
-                write!(f, "unsupported WattDB format version {version}")
+                write!(f, "unsupported FTWDB format version {version}")
             }
             Self::Corruption { offset, reason } => {
                 write!(f, "corruption at file offset {offset}: {reason}")

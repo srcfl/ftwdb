@@ -70,7 +70,7 @@ Exit: reproducible, result-verified reports with no unexplained durability or
 configuration asymmetry.
 
 Initial progress: the deterministic mixed energy generator, portable bundle,
-machine-readable WattDB runner, and exact WattDB/SQLite native comparison are
+machine-readable FTWDB runner, and exact FTWDB/SQLite native comparison are
 implemented. The pinned server registry is explicitly marked compose/smoke-only
 until each adapter verifies results. VictoriaMetrics now has a result-verified
 telemetry-subset adapter, but not a full-domain or equal-durability comparison.

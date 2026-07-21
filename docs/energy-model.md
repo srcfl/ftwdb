@@ -2,7 +2,7 @@
 
 ## Connected domain model
 
-WattDB will keep domain state and time-series values in one transactional
+FTWDB will keep domain state and time-series values in one transactional
 database rather than requiring PostgreSQL beside a TSDB.
 
 ### Asset and topology catalog

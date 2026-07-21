@@ -187,7 +187,7 @@ impl EnergyWorkload {
         file.sync_all()?;
         let summary = self.summary();
         let mut summary_file = BufWriter::new(File::create(directory.join("summary.txt"))?);
-        writeln!(summary_file, "format=wattdb-energy-workload-v1")?;
+        writeln!(summary_file, "format=ftwdb-energy-workload-v1")?;
         writeln!(summary_file, "seed={}", self.config.seed)?;
         writeln!(summary_file, "entities={}", summary.entities)?;
         writeln!(summary_file, "series={}", summary.series)?;

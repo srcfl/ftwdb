@@ -7,7 +7,7 @@ uncompressed; it is a durability test vehicle, not the final segment format.
 
 | Offset | Bytes | Field |
 |---:|---:|---|
-| 0 | 8 | ASCII `WATTDB01` |
+| 0 | 8 | ASCII `FTWDB001` |
 | 8 | 2 | format version (`1`) |
 | 10 | 2 | reserved flags |
 | 12 | 4 | CRC32 of bytes 0..12 |

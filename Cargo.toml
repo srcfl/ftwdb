@@ -1,10 +1,11 @@
 [package]
-name = "wattdb"
+name = "ftwdb"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
-description = "An SD-card-conscious embedded time-series engine for energy data"
+description = "Forecasts, Telemetry & Watts: an SD-card-conscious embedded energy database"
 license = "Apache-2.0"
+repository = "https://github.com/srcfl/ftwdb"
 
 [dependencies]
 crc32fast = "1.5.0"

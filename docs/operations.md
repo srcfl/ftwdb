@@ -2,7 +2,7 @@
 
 ## Integrity check
 
-`wattdb check-store <directory>` opens and recovers the active commit log,
+`ftwdb check-store <directory>` opens and recovers the active commit log,
 loads the highest valid manifest generation, and re-opens every active rollup
 segment. It validates checksums, encoded lengths, aggregate invariants,
 descriptor coverage, and raw-source watermarks. The command emits a single JSON
@@ -14,7 +14,7 @@ them before removal if historical manifest recovery must be retained.
 
 ## Snapshot backup
 
-`wattdb backup <source> <absent-destination>` uses this publication order:
+`ftwdb backup <source> <absent-destination>` uses this publication order:
 
 1. flush and integrity-check the source;
 2. create a hidden sibling directory;

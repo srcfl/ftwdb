@@ -33,7 +33,7 @@ cargo run --release -- generate bench-results/workload \
   --sites 1 --days 7 --cadence-seconds 60 --seed 42
 ```
 
-The checked-in native WattDB/SQLite comparison uses the same mixed-domain
+The checked-in native FTWDB/SQLite comparison uses the same mixed-domain
 generator and rejects unequal 5-minute results:
 
 ```sh

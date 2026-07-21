@@ -1,9 +1,9 @@
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use rusqlite::{Connection, params};
-use tempfile::{TempDir, tempdir};
-use wattdb::{
+use ftwdb::{
     Config, Durability, EnergyWorkload, RollupResolution, Store, Transaction, WorkloadConfig,
 };
+use rusqlite::{Connection, params};
+use tempfile::{TempDir, tempdir};
 
 const SECOND: i64 = 1_000_000;
 const FIVE_MINUTES: i64 = 300 * SECOND;
@@ -18,7 +18,7 @@ fn fixture() -> EnergyWorkload {
     .unwrap()
 }
 
-fn wattdb() -> (TempDir, Store) {
+fn ftwdb() -> (TempDir, Store) {
     let directory = tempdir().unwrap();
     let store = Store::open_with(
         directory.path(),
@@ -60,7 +60,7 @@ fn sqlite() -> (TempDir, Connection) {
     (directory, connection)
 }
 
-fn ingest_wattdb(store: &mut Store, workload: &EnergyWorkload) {
+fn ingest_ftwdb(store: &mut Store, workload: &EnergyWorkload) {
     store.commit(workload.metadata_transaction()).unwrap();
     for points in workload.points.chunks(10_000) {
         let mut transaction = Transaction::new();
@@ -147,10 +147,10 @@ fn energy_benchmarks(criterion: &mut Criterion) {
     let workload = fixture();
     let mut ingest = criterion.benchmark_group("energy_ingest_mixed");
     ingest.throughput(Throughput::Elements(workload.points.len() as u64));
-    ingest.bench_function("wattdb_manual", |bencher| {
+    ingest.bench_function("ftwdb_manual", |bencher| {
         bencher.iter_batched(
-            wattdb,
-            |(_directory, mut store)| ingest_wattdb(&mut store, &workload),
+            ftwdb,
+            |(_directory, mut store)| ingest_ftwdb(&mut store, &workload),
             BatchSize::LargeInput,
         )
     });
@@ -163,17 +163,17 @@ fn energy_benchmarks(criterion: &mut Criterion) {
     });
     ingest.finish();
 
-    let (_wattdb_directory, mut store) = wattdb();
-    ingest_wattdb(&mut store, &workload);
+    let (_ftwdb_directory, mut store) = ftwdb();
+    ingest_ftwdb(&mut store, &workload);
     let start = workload.config.start_micros;
     let end = start + DAY;
     store.maintain(end).unwrap();
     let resolution = RollupResolution::FixedMicros(FIVE_MINUTES);
-    let wattdb_result = store.query_gauge(1, start, end, &resolution).unwrap();
+    let ftwdb_result = store.query_gauge(1, start, end, &resolution).unwrap();
     let (_sqlite_directory, mut connection) = sqlite();
     ingest_sqlite(&mut connection, &workload);
     let sqlite_result = sqlite_5m(&connection, start, end);
-    let wattdb_samples: Vec<_> = wattdb_result
+    let ftwdb_samples: Vec<_> = ftwdb_result
         .buckets
         .iter()
         .filter(|bucket| bucket.count > 0)
@@ -187,11 +187,11 @@ fn energy_benchmarks(criterion: &mut Criterion) {
             )
         })
         .collect();
-    assert_eq!(wattdb_samples, sqlite_result);
+    assert_eq!(ftwdb_samples, sqlite_result);
 
     let mut query = criterion.benchmark_group("energy_query_1d_5m");
-    query.throughput(Throughput::Elements(wattdb_result.buckets.len() as u64));
-    query.bench_function("wattdb_persistent_cached", |bencher| {
+    query.throughput(Throughput::Elements(ftwdb_result.buckets.len() as u64));
+    query.bench_function("ftwdb_persistent_cached", |bencher| {
         bencher.iter(|| store.query_gauge(1, start, end, &resolution).unwrap())
     });
     query.bench_function("sqlite_group_by", |bencher| {

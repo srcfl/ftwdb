@@ -9,7 +9,7 @@ must point to those artifacts.
 
 ## Comparison registry
 
-The initial maintained set is WattDB, VictoriaMetrics, InfluxDB, QuestDB,
+The initial maintained set is FTWDB, VictoriaMetrics, InfluxDB, QuestDB,
 TimescaleDB, ClickHouse, tsink, GreptimeDB, Apache IoTDB, TDengine, SQLite,
 DuckDB, RRDtool, and ReductStore. TSBS-supported engines also run the standard
 TSBS IoT workload. Very large distributed systems are reported separately from

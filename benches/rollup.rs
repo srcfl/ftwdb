@@ -1,11 +1,11 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use std::collections::BTreeMap;
-use std::hint::black_box;
-use tempfile::tempdir;
-use wattdb::{
+use ftwdb::{
     CalendarUnit, Config, Durability, Entity, EntityId, Point, RollupPolicy, RollupResolution,
     RollupSource, RollupTier, SeriesDefinition, SeriesSemantics, Store, Transaction,
 };
+use std::collections::BTreeMap;
+use std::hint::black_box;
+use tempfile::tempdir;
 
 const MINUTE: i64 = 60_000_000;
 const FIVE_MINUTES: i64 = 5 * MINUTE;

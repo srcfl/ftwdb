@@ -2,7 +2,7 @@
 
 ## Product boundary
 
-WattDB is an embedded, single-node energy database first. It should run inside
+FTWDB is an embedded, single-node energy database first. It should run inside
 an ARM edge service with no separate database daemon. A server protocol can be
 added around the same library later. Distributed consensus, arbitrary SQL, and
 PromQL are explicitly outside the first storage milestones.
