@@ -9,8 +9,8 @@ descriptor coverage, and raw-source watermarks. The command emits a single JSON
 record with raw commit/point counts and active rollup file/bucket/byte counts.
 
 Inactive files are not required for the current database state and are not
-included in this check. A later offline scrub/garbage-collector should verify
-them before removal if historical manifest recovery must be retained.
+included in this check. Rollup files that no retained manifest generation
+references are removed automatically after publication and at startup.
 
 ## Snapshot backup
 

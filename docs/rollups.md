@@ -45,9 +45,12 @@ per file rather than a moving tail chunk.
 
 Manifest files are append-only generations. Startup scans newest to oldest and
 uses the highest fully valid generation, so a torn newest file does not require
-an independently mutable `CURRENT` pointer. Old rollup files and old manifests
-are retained until a future manifest garbage collector can prove they are
-unreferenced.
+an independently mutable `CURRENT` pointer. Each successful publication then
+prunes generations beyond the newest three and unlinks rollup files that no
+retained generation references. Opening a store runs the same sweep, which also
+reclaims segments orphaned by an interrupted maintenance run. The sweep is
+skipped whenever a retained generation cannot be read back, so the recovery
+fallback never loses a referenced file.
 
 ## Late values and corrections
 
