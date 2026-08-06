@@ -16,6 +16,16 @@ steps in [docs/releases.md](docs/releases.md).
 - A draft, hand-written metadata wire codec and local Unix shadow sidecar
   carry catalog, run, plan, point, and outcome data without joining FTW's
   control path.
+- The sidecar checks each Unix peer's effective UID and drains the writer on
+  SIGTERM or SIGINT before it removes the socket and exits.
+- Checked systemd and launchd examples keep the store and socket private and
+  give the sidecar time to finish a clean stop.
+- An offline reconcile command compares exact source commit frames with stored
+  receipts, catalog state, and point bits and emits a bounded JSON summary.
+- Reconciliation binds every receipt to its exact canonical payload, caps raw
+  points scanned before time filtering, and bounds regular-file inputs.
+- A clean client EOF at a frame boundary no longer raises the sidecar's client
+  error count; partial frames still do.
 
 ### Fixed
 

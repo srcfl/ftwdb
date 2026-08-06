@@ -18,6 +18,7 @@ mod rollup;
 mod rollup_segment;
 mod segment;
 pub mod shadow_protocol;
+pub mod shadow_reconcile;
 pub mod shadow_runtime;
 pub mod shadow_server;
 mod snapshot;
@@ -41,8 +42,8 @@ pub use rollup::{CalendarGaugeRollup, FixedGaugeRollup, GaugeBucket};
 pub use rollup_segment::{RollupSegment, RollupSegmentStats};
 pub use segment::{Segment, SegmentStats};
 pub use storage::{
-    Commit, Config, Database, Durability, IngressWatermarks, PlanOutcome, Point, RecoveredTail,
-    SalvageStopReason, Stats,
+    Commit, Config, Database, Durability, IngressReceipt, IngressWatermarks, PlanOutcome, Point,
+    RecoveredTail, SalvageStopReason, Stats,
 };
 pub use store::{
     BackupReport, IntegrityReport, MaintenanceReport, RestoreReport, RetentionGate, RollupQuery,

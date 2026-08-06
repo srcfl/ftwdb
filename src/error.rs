@@ -51,16 +51,12 @@ pub enum Error {
     IngressCommitIdConflict {
         commit_id: u128,
     },
-    /// A producer skipped or went back from its next required sequence. The
-    /// first transaction from a source may start at any sequence.
-    IngressSequenceGap {
+    /// A producer supplied a new cursor that did not advance. Gaps are valid:
+    /// the sequence is an opaque source cursor, not a dense counter.
+    IngressSequenceNotIncreasing {
         source_id: u128,
-        expected: u64,
+        previous: u64,
         actual: u64,
-    },
-    /// A source already stored sequence `u64::MAX` and cannot advance.
-    IngressSequenceExhausted {
-        source_id: u128,
     },
 }
 
@@ -116,18 +112,13 @@ impl fmt::Display for Error {
                 f,
                 "ingress commit identifier {commit_id:032x} conflicts with its stored transaction"
             ),
-            Self::IngressSequenceGap {
+            Self::IngressSequenceNotIncreasing {
                 source_id,
-                expected,
+                previous,
                 actual,
             } => write!(
                 f,
-                "ingress source {source_id:032x} requires sequence {expected}, got {actual}"
-            ),
-            Self::IngressSequenceExhausted { source_id } => write!(
-                f,
-                "ingress source {source_id:032x} cannot advance past sequence {}",
-                u64::MAX
+                "ingress source {source_id:032x} requires a cursor above {previous}, got {actual}"
             ),
         }
     }

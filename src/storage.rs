@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 
 const DATABASE_MAGIC: &[u8; 8] = b"FTWDB001";
@@ -141,6 +141,21 @@ pub struct IngressWatermarks {
     pub accepted_through: Option<u64>,
     /// Highest sequence covered by a successful sync.
     pub durable_through: Option<u64>,
+}
+
+/// Read-only proof that one ordered ingress frame exists in the current log.
+///
+/// `durable` reflects the current handle's proven durable watermark. A
+/// read-only opener cannot prove that a prior writer synced a recovered frame,
+/// so it reports `false` until a writable opener has synced that prefix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IngressReceipt {
+    pub identity: IngressIdentity,
+    pub frame_offset: u64,
+    pub records: usize,
+    pub points: usize,
+    pub bytes_written: u64,
+    pub durable: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -654,7 +669,8 @@ impl Database {
     /// checksummed frame. An exact replay returns the original frame receipt
     /// with `deduplicated: true` and writes nothing. Reusing either key with
     /// different bytes returns a nonfatal ingress conflict. After a source's
-    /// first commit, only its next sequence is accepted.
+    /// first commit, only a strictly greater source cursor is accepted. The
+    /// cursor may contain gaps; source reconciliation detects missing data.
     pub fn commit_ingress(
         &mut self,
         identity: IngressIdentity,
@@ -705,19 +721,13 @@ impl Database {
             .ingress_last_sequences
             .get(&identity.source_id)
             .copied()
+            && identity.sequence <= last
         {
-            let Some(expected) = last.checked_add(1) else {
-                return Err(Error::IngressSequenceExhausted {
-                    source_id: identity.source_id,
-                });
-            };
-            if identity.sequence != expected {
-                return Err(Error::IngressSequenceGap {
-                    source_id: identity.source_id,
-                    expected,
-                    actual: identity.sequence,
-                });
-            }
+            return Err(Error::IngressSequenceNotIncreasing {
+                source_id: identity.source_id,
+                previous: last,
+                actual: identity.sequence,
+            });
         }
 
         let point_count = transaction.point_count();
@@ -813,86 +823,130 @@ impl Database {
         receipt: StoredIngressReceipt,
         candidate: &[u8],
     ) -> Result<bool> {
-        if candidate.len() != receipt.canonical_payload_len as usize
-            || hash(candidate) != receipt.canonical_payload_crc32
-        {
-            return Ok(false);
-        }
-        let result = (|| -> Result<bool> {
-            let expected_canonical_offset = receipt
-                .commit
-                .frame_offset
-                .checked_add((FRAME_HEADER_BYTES + INGRESS_IDENTITY_BYTES) as u64)
-                .ok_or_else(|| {
-                    Error::Serialization("ingress replay offset overflows".to_owned())
-                })?;
-            if receipt.canonical_payload_offset != expected_canonical_offset {
-                return corruption(
-                    receipt.commit.frame_offset,
-                    "stored ingress receipt offset is invalid",
-                );
-            }
-            let mut identity_bytes = [0_u8; INGRESS_IDENTITY_BYTES];
-            identity_bytes[..16].copy_from_slice(&receipt.identity.source_id.to_le_bytes());
-            identity_bytes[16..24].copy_from_slice(&receipt.identity.sequence.to_le_bytes());
-            identity_bytes[24..40].copy_from_slice(&receipt.identity.commit_id.to_le_bytes());
-            let mut expected_payload_checksum = crc32fast::Hasher::new();
-            expected_payload_checksum.update(&identity_bytes);
-            expected_payload_checksum.update(candidate);
-            let payload_len = u32::try_from(INGRESS_IDENTITY_BYTES + candidate.len())
-                .map_err(|_| Error::Serialization("ingress replay length overflows".to_owned()))?;
-            let record_count = u32::try_from(receipt.commit.records).map_err(|_| {
-                Error::Serialization("ingress replay record count overflows".to_owned())
-            })?;
-            let expected_header = encode_frame_header(
-                FRAME_KIND_INGRESS_TRANSACTION,
-                record_count,
-                payload_len,
-                expected_payload_checksum.finalize(),
-            );
-
-            self.file
-                .seek(SeekFrom::Start(receipt.commit.frame_offset))?;
-            let mut stored_header = [0_u8; FRAME_HEADER_BYTES];
-            self.file.read_exact(&mut stored_header)?;
-            if stored_header != expected_header {
-                return corruption(
-                    receipt.commit.frame_offset,
-                    "stored ingress frame header changed after open",
-                );
-            }
-
-            let mut stored_identity = [0_u8; INGRESS_IDENTITY_BYTES];
-            self.file.read_exact(&mut stored_identity)?;
-            if stored_identity != identity_bytes {
-                return corruption(
-                    receipt.commit.frame_offset,
-                    "stored ingress identity changed after open",
-                );
-            }
-
-            let mut stored = [0_u8; 8 * 1024];
-            let mut stored_checksum = crc32fast::Hasher::new();
-            let mut equal = true;
-            for chunk in candidate.chunks(stored.len()) {
-                self.file.read_exact(&mut stored[..chunk.len()])?;
-                stored_checksum.update(&stored[..chunk.len()]);
-                equal &= stored[..chunk.len()] == *chunk;
-            }
-            if stored_checksum.finalize() != receipt.canonical_payload_crc32 {
-                return corruption(
-                    receipt.commit.frame_offset,
-                    "stored ingress transaction checksum changed after open",
-                );
-            }
-            Ok(equal)
-        })();
+        let result = self.ingress_payload_matches_at(receipt, candidate);
         if matches!(result, Err(Error::Io(_) | Error::Corruption { .. })) {
             // The in-memory catalog and index may no longer match the log.
             // Stop all later writes until a fresh scan proves a sound prefix.
             self.poisoned = true;
         }
         result
+    }
+
+    fn ingress_payload_matches_at(
+        &self,
+        receipt: StoredIngressReceipt,
+        candidate: &[u8],
+    ) -> Result<bool> {
+        if candidate.len() != receipt.canonical_payload_len as usize
+            || hash(candidate) != receipt.canonical_payload_crc32
+        {
+            return Ok(false);
+        }
+        let expected_canonical_offset = receipt
+            .commit
+            .frame_offset
+            .checked_add((FRAME_HEADER_BYTES + INGRESS_IDENTITY_BYTES) as u64)
+            .ok_or_else(|| Error::Serialization("ingress replay offset overflows".to_owned()))?;
+        if receipt.canonical_payload_offset != expected_canonical_offset {
+            return corruption(
+                receipt.commit.frame_offset,
+                "stored ingress receipt offset is invalid",
+            );
+        }
+        let mut identity_bytes = [0_u8; INGRESS_IDENTITY_BYTES];
+        identity_bytes[..16].copy_from_slice(&receipt.identity.source_id.to_le_bytes());
+        identity_bytes[16..24].copy_from_slice(&receipt.identity.sequence.to_le_bytes());
+        identity_bytes[24..40].copy_from_slice(&receipt.identity.commit_id.to_le_bytes());
+        let mut expected_payload_checksum = crc32fast::Hasher::new();
+        expected_payload_checksum.update(&identity_bytes);
+        expected_payload_checksum.update(candidate);
+        let payload_len = u32::try_from(INGRESS_IDENTITY_BYTES + candidate.len())
+            .map_err(|_| Error::Serialization("ingress replay length overflows".to_owned()))?;
+        let record_count = u32::try_from(receipt.commit.records).map_err(|_| {
+            Error::Serialization("ingress replay record count overflows".to_owned())
+        })?;
+        let expected_header = encode_frame_header(
+            FRAME_KIND_INGRESS_TRANSACTION,
+            record_count,
+            payload_len,
+            expected_payload_checksum.finalize(),
+        );
+
+        let mut stored_header = [0_u8; FRAME_HEADER_BYTES];
+        self.file
+            .read_exact_at(&mut stored_header, receipt.commit.frame_offset)?;
+        if stored_header != expected_header {
+            return corruption(
+                receipt.commit.frame_offset,
+                "stored ingress frame header changed after open",
+            );
+        }
+
+        let identity_offset = receipt
+            .commit
+            .frame_offset
+            .checked_add(FRAME_HEADER_BYTES as u64)
+            .ok_or_else(|| Error::Serialization("ingress replay offset overflows".to_owned()))?;
+        let mut stored_identity = [0_u8; INGRESS_IDENTITY_BYTES];
+        self.file
+            .read_exact_at(&mut stored_identity, identity_offset)?;
+        if stored_identity != identity_bytes {
+            return corruption(
+                receipt.commit.frame_offset,
+                "stored ingress identity changed after open",
+            );
+        }
+
+        let mut stored = [0_u8; 8 * 1024];
+        let mut stored_checksum = crc32fast::Hasher::new();
+        let mut equal = true;
+        let mut candidate_offset = 0_usize;
+        while candidate_offset < candidate.len() {
+            let chunk_len = stored.len().min(candidate.len() - candidate_offset);
+            let file_offset = receipt
+                .canonical_payload_offset
+                .checked_add(u64::try_from(candidate_offset).map_err(|_| {
+                    Error::Serialization("ingress replay offset overflows".to_owned())
+                })?)
+                .ok_or_else(|| {
+                    Error::Serialization("ingress replay offset overflows".to_owned())
+                })?;
+            self.file
+                .read_exact_at(&mut stored[..chunk_len], file_offset)?;
+            stored_checksum.update(&stored[..chunk_len]);
+            equal &=
+                stored[..chunk_len] == candidate[candidate_offset..candidate_offset + chunk_len];
+            candidate_offset += chunk_len;
+        }
+        if stored_checksum.finalize() != receipt.canonical_payload_crc32 {
+            return corruption(
+                receipt.commit.frame_offset,
+                "stored ingress transaction checksum changed after open",
+            );
+        }
+        Ok(equal)
+    }
+
+    /// Checks one expected ingress transaction against its exact stored
+    /// canonical bytes without changing the file cursor or writing the store.
+    pub(crate) fn verify_ingress_payload(
+        &self,
+        identity: IngressIdentity,
+        transaction: &Transaction,
+    ) -> Result<Option<bool>> {
+        let Some(receipt) = self
+            .ingress_receipts
+            .get(&IngressKey::from(identity))
+            .copied()
+        else {
+            return Ok(None);
+        };
+        if receipt.identity != identity {
+            return Ok(Some(false));
+        }
+        let canonical = encode_canonical_transaction(transaction)?;
+        self.ingress_payload_matches_at(receipt, &canonical)
+            .map(Some)
     }
 
     /// Whether a [`Transaction::with_commit_id`] identifier has been applied
@@ -909,6 +963,30 @@ impl Database {
             accepted_through: self.ingress_last_sequences.get(&source_id).copied(),
             durable_through: self.ingress_durable_sequences.get(&source_id).copied(),
         }
+    }
+
+    /// Returns the stored identity and frame receipt for one source sequence.
+    ///
+    /// This does not reread the frame payload. Open-time recovery already
+    /// checked it; integrity checks and exact retry perform the stronger byte
+    /// validation when required.
+    #[must_use]
+    pub fn ingress_receipt(&self, source_id: u128, sequence: u64) -> Option<IngressReceipt> {
+        let stored = self.ingress_receipts.get(&IngressKey {
+            source_id,
+            sequence,
+        })?;
+        Some(IngressReceipt {
+            identity: stored.identity,
+            frame_offset: stored.commit.frame_offset,
+            records: stored.commit.records,
+            points: stored.commit.points,
+            bytes_written: stored.commit.bytes_written,
+            durable: self
+                .ingress_durable_sequences
+                .get(&source_id)
+                .is_some_and(|durable| *durable >= sequence),
+        })
     }
 
     /// Returns every known ingress source in stable source-ID order.
@@ -1013,6 +1091,10 @@ impl Database {
             .collect();
         result.sort_by_key(|point| (point.valid_time, point.knowledge_time, point.change_time));
         result
+    }
+
+    pub(crate) fn series_points(&self, series_id: u64) -> &[Point] {
+        self.index.get(&series_id).map_or(&[], Vec::as_slice)
     }
 
     /// Returns the winning revision for each valid timestamp.
@@ -1433,11 +1515,11 @@ fn scan_log(
                     );
                 }
                 if let Some(last) = ingress_last_sequences.get(&identity.source_id).copied()
-                    && last.checked_add(1) != Some(identity.sequence)
+                    && identity.sequence <= last
                 {
                     stop_or_corruption!(
                         SalvageStopReason::InvalidIngressSequence,
-                        "ingress source sequence is not monotonic"
+                        "ingress source cursor is not strictly increasing"
                     );
                 }
                 ingress_identity = Some(identity);
@@ -3200,7 +3282,7 @@ mod tests {
     }
 
     #[test]
-    fn ingress_sequence_gap_is_enforced_after_reopen() {
+    fn ingress_cursor_allows_gaps_and_rejects_regression_after_reopen() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("ingress-sequence.ftwdb");
         {
@@ -3212,20 +3294,29 @@ mod tests {
         }
 
         let mut database = Database::open(&path).unwrap();
-        assert!(matches!(
-            database.commit_ingress(IngressIdentity::new(7, 52, 502), Transaction::new()),
-            Err(Error::IngressSequenceGap {
-                source_id: 7,
-                expected: 51,
-                actual: 52
-            })
-        ));
         assert!(
             !database
-                .commit_ingress(IngressIdentity::new(7, 51, 501), Transaction::new())
+                .commit_ingress(IngressIdentity::new(7, 52, 502), Transaction::new())
                 .unwrap()
                 .deduplicated
         );
+        database.close().unwrap();
+
+        let mut database = Database::open(&path).unwrap();
+        assert!(
+            database
+                .commit_ingress(IngressIdentity::new(7, 52, 502), Transaction::new())
+                .unwrap()
+                .deduplicated
+        );
+        assert!(matches!(
+            database.commit_ingress(IngressIdentity::new(7, 51, 501), Transaction::new()),
+            Err(Error::IngressSequenceNotIncreasing {
+                source_id: 7,
+                previous: 52,
+                actual: 51
+            })
+        ));
         assert_eq!(database.stats().unwrap().commits, 2);
     }
 

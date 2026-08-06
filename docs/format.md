@@ -88,7 +88,7 @@ The identity is followed by the canonical kind `1` transaction payload. The
 frame checksum covers both parts.
 
 FTWDB accepts any first sequence for a new non-zero source ID. It then accepts
-only the next sequence. An exact retry of a stored source and sequence reads
+only a strictly greater cursor; gaps are valid. An exact retry of a stored source and sequence reads
 the original transaction bytes from the log and compares every byte. It
 returns the original frame offset, record count, point count, and byte count
 without writing. A matching CRC is only a fast check and never replaces the
@@ -97,7 +97,8 @@ without poisoning the writer.
 
 Recovery rebuilds the source watermarks and receipt indexes from complete
 kind `3` frames. A torn last frame exposes neither its identity nor its data.
-Duplicate keys or a sequence gap inside a complete log are corruption. Kinds
+Duplicate keys or a source cursor that does not increase inside a complete log
+are corruption. Kinds
 `0` through `2` remain byte-compatible.
 
 The immutable segment format will be separately versioned and use per-column

@@ -13,10 +13,12 @@ use crate::shadow_runtime::{
     AckWaitError, FlushSubmitError, ShadowFlushFailure, ShadowRuntimeState, ShadowSubmitter,
     ShadowWrite, ShadowWriteFailure, SubmitError,
 };
-use crate::{Error, IngressIdentity, Transaction};
+use crate::{Error, IngressIdentity};
 use std::fmt;
 use std::fs::{self, DirBuilder, FileType};
 use std::io::{self, Read};
+use std::mem::MaybeUninit;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -31,6 +33,8 @@ static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Debug)]
 pub struct ShadowServerConfig {
     pub socket_path: PathBuf,
+    /// Effective user ID allowed to use the socket.
+    pub allowed_peer_uid: u32,
     pub io_timeout: Duration,
     pub acknowledgement_timeout: Duration,
     pub accept_poll_interval: Duration,
@@ -41,6 +45,7 @@ impl ShadowServerConfig {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
+            allowed_peer_uid: rustix::process::geteuid().as_raw(),
             io_timeout: Duration::from_secs(2),
             acknowledgement_timeout: Duration::from_secs(5),
             accept_poll_interval: Duration::from_millis(20),
@@ -71,6 +76,7 @@ impl ShadowStopToken {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ShadowServerReport {
     pub accepted_clients: u64,
+    pub peer_auth_failures: u64,
     pub client_errors: u64,
 }
 
@@ -81,6 +87,7 @@ pub enum ShadowServerError {
     ExistingPathIsNotSocket(PathBuf),
     SocketInUse(PathBuf),
     CouldNotProveSocketStale { path: PathBuf, error: io::Error },
+    PeerCredentials(io::Error),
     Io(io::Error),
 }
 
@@ -108,6 +115,9 @@ impl fmt::Display for ShadowServerError {
                 "could not prove that {} is stale: {error}",
                 path.display()
             ),
+            Self::PeerCredentials(error) => {
+                write!(formatter, "could not read Unix peer credentials: {error}")
+            }
             Self::Io(error) => write!(formatter, "shadow server I/O error: {error}"),
         }
     }
@@ -116,7 +126,9 @@ impl fmt::Display for ShadowServerError {
 impl std::error::Error for ShadowServerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::CouldNotProveSocketStale { error, .. } | Self::Io(error) => Some(error),
+            Self::CouldNotProveSocketStale { error, .. }
+            | Self::PeerCredentials(error)
+            | Self::Io(error) => Some(error),
             _ => None,
         }
     }
@@ -142,6 +154,15 @@ pub fn serve(
         match bound.listener.accept() {
             Ok((mut stream, _)) => {
                 report.accepted_clients = report.accepted_clients.saturating_add(1);
+                // The listener is nonblocking so stop polling stays bounded.
+                // Accepted streams must block under their own frame deadline.
+                stream.set_nonblocking(false)?;
+                let peer_uid =
+                    peer_effective_uid(&stream).map_err(ShadowServerError::PeerCredentials)?;
+                if peer_uid != config.allowed_peer_uid {
+                    report.peer_auth_failures = report.peer_auth_failures.saturating_add(1);
+                    continue;
+                }
                 if serve_connection(&mut stream, &submitter, config, stop).is_err() {
                     report.client_errors = report.client_errors.saturating_add(1);
                 }
@@ -154,6 +175,83 @@ pub fn serve(
         }
     }
     Ok(report)
+}
+
+/// Returns the effective UID captured by the kernel for this connected peer.
+/// The check does not trust socket-file mode alone: a process that received an
+/// open descriptor still has to run as the configured service user.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_effective_uid(stream: &UnixStream) -> io::Result<u32> {
+    let mut credentials = MaybeUninit::<libc::ucred>::zeroed();
+    let mut length = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>())
+        .expect("ucred size fits socklen_t");
+    // SAFETY: `credentials` points to writable storage of `length` bytes, and
+    // the stream owns a valid socket descriptor for the whole call.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if usize::try_from(length).ok() != Some(std::mem::size_of::<libc::ucred>()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "kernel returned a truncated peer credential",
+        ));
+    }
+    // SAFETY: getsockopt succeeded and reported the full `ucred` size.
+    Ok(unsafe { credentials.assume_init() }.uid)
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn peer_effective_uid(stream: &UnixStream) -> io::Result<u32> {
+    let mut uid = MaybeUninit::<libc::uid_t>::uninit();
+    let mut gid = MaybeUninit::<libc::gid_t>::uninit();
+    // SAFETY: the stream owns a valid socket descriptor, and both output
+    // pointers refer to initialized storage when getpeereid returns success.
+    let result =
+        unsafe { libc::getpeereid(stream.as_raw_fd(), uid.as_mut_ptr(), gid.as_mut_ptr()) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: getpeereid initialized both outputs on success.
+    Ok(unsafe { uid.assume_init() })
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd"
+)))]
+fn peer_effective_uid(_stream: &UnixStream) -> io::Result<u32> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "peer credentials are not implemented on this Unix target",
+    ))
 }
 
 fn validate_config(config: &ShadowServerConfig) -> Result<(), ShadowServerError> {
@@ -175,9 +273,6 @@ fn serve_connection(
     config: &ShadowServerConfig,
     stop: &ShadowStopToken,
 ) -> Result<(), ()> {
-    stream
-        .set_write_timeout(Some(config.io_timeout))
-        .map_err(|_| ())?;
     let mut source_id = None;
 
     loop {
@@ -186,6 +281,11 @@ fn serve_connection(
         }
         let message = match read_frame_before(stream, config.io_timeout) {
             Ok(message) => message,
+            Err(shadow_protocol::ProtocolError::Truncated { actual: 0, .. }) => {
+                // EOF before the next frame starts is a normal client close.
+                // A partial header or body still takes the error path below.
+                return Ok(());
+            }
             Err(error) => {
                 if stop.is_stopped() {
                     return Ok(());
@@ -240,7 +340,9 @@ fn serve_connection(
             WireMessage::Response(_) => stable_error(ErrorCode::InvalidRequest, false),
         };
 
-        if shadow_protocol::write_to(stream, &response).is_err() {
+        if stream.set_write_timeout(Some(config.io_timeout)).is_err()
+            || shadow_protocol::write_to(stream, &response).is_err()
+        {
             return Err(());
         }
     }
@@ -271,8 +373,24 @@ impl Read for DeadlineReader<'_> {
             .checked_duration_since(Instant::now())
             .filter(|remaining| !remaining.is_zero())
             .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "frame deadline expired"))?;
-        self.stream.set_read_timeout(Some(remaining))?;
-        self.stream.read(buffer)
+        let read = match self.stream.set_read_timeout(Some(remaining)) {
+            Ok(()) => self.stream.read(buffer),
+            // macOS can reject SO_RCVTIMEO with EINVAL after the peer has
+            // already closed. A nonblocking read can classify that close
+            // without risking an unbounded wait if the timeout itself was bad.
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                self.stream.set_nonblocking(true)?;
+                let read = self.stream.read(buffer);
+                self.stream.set_nonblocking(false)?;
+                read
+            }
+            Err(error) => return Err(error),
+        };
+        match read {
+            Ok(read) => Ok(read),
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => Ok(0),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -284,7 +402,7 @@ fn handle_commit(
     let source_id = batch.source_id;
     let sequence = batch.sequence;
     let commit_id = batch.commit_id;
-    let mut transaction = transaction_from_batch(batch);
+    let mut transaction = shadow_protocol::transaction_from_batch(batch);
     transaction.with_ingress_identity(IngressIdentity::new(source_id, sequence, commit_id));
     let write = ShadowWrite::from_identified(transaction)
         .expect("ingress identity always supplies a commit ID");
@@ -313,29 +431,6 @@ fn handle_commit(
         points: u32::try_from(commit.points).unwrap_or(u32::MAX),
         bytes_written: commit.bytes_written,
     }))
-}
-
-fn transaction_from_batch(batch: CommitBatchRequest) -> Transaction {
-    let mut transaction = Transaction::new();
-    for entity in batch.entities {
-        transaction.upsert_entity(entity);
-    }
-    for relation in batch.relations {
-        transaction.upsert_relation(relation);
-    }
-    for series in batch.series {
-        transaction.define_series(series);
-    }
-    for run in batch.runs {
-        transaction.upsert_run(run);
-    }
-    for plan in batch.plans {
-        transaction.upsert_plan(plan);
-    }
-    if !batch.points.is_empty() {
-        transaction.append_points(batch.points);
-    }
-    transaction
 }
 
 fn handle_flush(
@@ -424,8 +519,7 @@ fn map_store_error(error: &Error) -> WireMessage {
         Error::IngressSourceSequenceConflict { .. } | Error::IngressCommitIdConflict { .. } => {
             stable_error(ErrorCode::IdempotencyConflict, false)
         }
-        Error::IngressSequenceGap { .. }
-        | Error::IngressSequenceExhausted { .. }
+        Error::IngressSequenceNotIncreasing { .. }
         | Error::BatchTooLarge { .. }
         | Error::InvalidArgument(_)
         | Error::InvalidModel(_)
@@ -631,6 +725,14 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_effective_uid_of_a_connected_peer() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let expected = rustix::process::geteuid().as_raw();
+        assert_eq!(peer_effective_uid(&client).unwrap(), expected);
+        assert_eq!(peer_effective_uid(&server).unwrap(), expected);
+    }
+
+    #[test]
     fn hello_is_required_before_health() {
         let (_directory, runtime) = runtime();
         let submitter = runtime.submitter();
@@ -653,7 +755,7 @@ mod tests {
             }))
         ));
         drop(client);
-        assert!(join.join().unwrap().is_err());
+        assert!(join.join().unwrap().is_ok());
         runtime.shutdown().unwrap();
     }
 
@@ -692,8 +794,45 @@ mod tests {
             WireMessage::Response(Response::Health(HealthResponse { nonce: 11, .. }))
         ));
         drop(client);
-        assert!(join.join().unwrap().is_err());
+        assert!(join.join().unwrap().is_ok());
         runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn frame_boundary_eof_is_clean_but_body_eof_is_an_error() {
+        use std::io::Write;
+
+        let config = ShadowServerConfig::new("/tmp/unused-ftwdb-shadow.sock");
+
+        let (client, mut server) = UnixStream::pair().unwrap();
+        drop(client);
+        let boundary = read_frame_before(&mut server, config.io_timeout);
+        assert!(
+            matches!(
+                boundary,
+                Err(shadow_protocol::ProtocolError::Truncated { actual: 0, .. })
+            ),
+            "unexpected boundary result: {boundary:?}"
+        );
+
+        let frame = shadow_protocol::encode(&WireMessage::Request(Request::Hello(HelloRequest {
+            source_id: 17,
+            node_id: "partial-client".to_owned(),
+            client_version: "test".to_owned(),
+            capabilities: 0,
+        })))
+        .unwrap();
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.write_all(&frame[..12]).unwrap();
+        drop(client);
+        let partial = read_frame_before(&mut server, config.io_timeout);
+        assert!(
+            matches!(
+                partial,
+                Err(shadow_protocol::ProtocolError::Truncated { actual: 12, .. })
+            ),
+            "unexpected partial-body result: {partial:?}"
+        );
     }
 
     #[test]
@@ -845,7 +984,7 @@ mod tests {
         ));
 
         drop(client);
-        assert!(join.join().unwrap().is_err());
+        assert!(join.join().unwrap().is_ok());
         runtime.shutdown().unwrap();
     }
 
@@ -870,12 +1009,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let parent = directory.path().join("shared-run");
         fs::create_dir(&parent).unwrap();
-        if let Err(error) = fs::set_permissions(&parent, fs::Permissions::from_mode(0o770)) {
-            if error.kind() == io::ErrorKind::PermissionDenied {
-                return;
-            }
-            panic!("could not prepare shared parent: {error}");
-        }
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o770)).unwrap();
         let path = parent.join("shadow.sock");
         let error = match BoundSocket::bind(&path) {
             Ok(_) => panic!("bind unexpectedly used a shared parent"),
@@ -892,11 +1026,7 @@ mod tests {
     fn bind_refuses_a_live_socket() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("shadow.sock");
-        let listener = match UnixListener::bind(&path) {
-            Ok(listener) => listener,
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
-            Err(error) => panic!("could not prepare live socket: {error}"),
-        };
+        let listener = UnixListener::bind(&path).unwrap();
         let error = match BoundSocket::bind(&path) {
             Ok(_) => panic!("bind unexpectedly replaced the live socket"),
             Err(error) => error,
@@ -912,11 +1042,7 @@ mod tests {
     fn bind_replaces_a_proven_stale_socket() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("shadow.sock");
-        let listener = match UnixListener::bind(&path) {
-            Ok(listener) => listener,
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
-            Err(error) => panic!("could not prepare stale socket: {error}"),
-        };
+        let listener = UnixListener::bind(&path).unwrap();
         drop(listener);
         let bound = BoundSocket::bind(&path).unwrap();
         assert!(path.exists());
@@ -929,15 +1055,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let parent = directory.path().join("run");
         let path = parent.join("shadow.sock");
-        let bound = match BoundSocket::bind(&path) {
-            Ok(bound) => bound,
-            Err(ShadowServerError::Io(error))
-                if error.kind() == io::ErrorKind::PermissionDenied =>
-            {
-                return;
-            }
-            Err(error) => panic!("could not bind private socket: {error}"),
-        };
+        let bound = BoundSocket::bind(&path).unwrap();
         assert_eq!(
             fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
             0o700
@@ -966,7 +1084,7 @@ mod tests {
         .unwrap();
         let socket_path = directory.path().join("run/shadow.sock");
         let mut config = ShadowServerConfig::new(&socket_path);
-        config.io_timeout = Duration::from_millis(100);
+        config.io_timeout = Duration::from_secs(2);
         config.acknowledgement_timeout = Duration::from_millis(250);
         config.accept_poll_interval = Duration::from_millis(2);
         let stop = ShadowStopToken::new();
@@ -983,13 +1101,6 @@ mod tests {
             if join.as_ref().unwrap().is_finished() {
                 let result = join.take().unwrap().join().unwrap();
                 runtime.shutdown().unwrap();
-                if matches!(
-                    result,
-                    Err(ShadowServerError::Io(ref error))
-                        if error.kind() == io::ErrorKind::PermissionDenied
-                ) {
-                    return;
-                }
                 panic!("shadow server stopped before bind: {result:?}");
             }
             thread::sleep(Duration::from_millis(2));
@@ -1000,11 +1111,39 @@ mod tests {
             runtime.shutdown().unwrap();
             panic!("shadow socket did not appear; server result: {result:?}");
         }
-        let mut malformed = UnixStream::connect(&socket_path).unwrap();
+        let connect_deadline = Instant::now() + Duration::from_secs(1);
+        let mut malformed = loop {
+            match UnixStream::connect(&socket_path) {
+                Ok(client) => break client,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+                    ) && Instant::now() < connect_deadline =>
+                {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("listener did not accept its first client: {error}"),
+            }
+        };
         malformed.write_all(b"bad").unwrap();
         drop(malformed);
 
-        let mut client = UnixStream::connect(&socket_path).unwrap();
+        let reconnect_deadline = Instant::now() + Duration::from_secs(1);
+        let mut client = loop {
+            match UnixStream::connect(&socket_path) {
+                Ok(client) => break client,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+                    ) && Instant::now() < reconnect_deadline =>
+                {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("listener did not recover from malformed client: {error}"),
+            }
+        };
         shadow_protocol::write_to(
             &mut client,
             &WireMessage::Request(Request::Hello(HelloRequest {
@@ -1023,7 +1162,85 @@ mod tests {
         drop(client);
         let report = join.take().unwrap().join().unwrap().unwrap();
         assert_eq!(report.accepted_clients, 2);
+        assert_eq!(report.client_errors, 1);
         assert!(!socket_path.exists());
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn listener_rejects_a_peer_with_the_wrong_effective_uid() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("store")).unwrap();
+        let runtime = ShadowRuntime::start_store(
+            store,
+            ShadowRuntimeConfig {
+                queue_capacity: 4,
+                max_queued_points: 64,
+            },
+        )
+        .unwrap();
+        let socket_path = directory.path().join("run/shadow.sock");
+        let mut config = ShadowServerConfig::new(&socket_path);
+        let current_uid = rustix::process::geteuid().as_raw();
+        config.allowed_peer_uid = if current_uid == u32::MAX {
+            0
+        } else {
+            current_uid + 1
+        };
+        config.io_timeout = Duration::from_millis(100);
+        config.accept_poll_interval = Duration::from_millis(2);
+        let stop = ShadowStopToken::new();
+        let server_stop = stop.clone();
+        let submitter = runtime.submitter();
+        let join = thread::spawn(move || serve(&config, submitter, &server_stop));
+
+        for _ in 0..100 {
+            if socket_path.exists() || join.is_finished() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        if !socket_path.exists() {
+            stop.stop();
+            let result = join.join().unwrap();
+            runtime.shutdown().unwrap();
+            panic!("shadow socket did not appear; server result: {result:?}");
+        }
+
+        let connect_deadline = Instant::now() + Duration::from_secs(1);
+        let mut client = loop {
+            match UnixStream::connect(&socket_path) {
+                Ok(client) => break client,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+                    ) && Instant::now() < connect_deadline =>
+                {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("listener did not accept unauthorized client: {error}"),
+            }
+        };
+        client
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        match client.read(&mut byte) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+                ) => {}
+            result => panic!("unauthorized connection remained open: {result:?}"),
+        }
+
+        stop.stop();
+        let report = join.join().unwrap().unwrap();
+        assert_eq!(report.accepted_clients, 1);
+        assert_eq!(report.peer_auth_failures, 1);
+        assert_eq!(report.client_errors, 0);
         runtime.shutdown().unwrap();
     }
 }

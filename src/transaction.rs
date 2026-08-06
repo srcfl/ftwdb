@@ -2,10 +2,10 @@ use crate::{Entity, Plan, Point, Relation, Run, SeriesDefinition};
 
 /// Durable identity for one ordered ingress transaction.
 ///
-/// `source_id` names one producer and `sequence` orders that producer's
-/// commits. After the first stored sequence, FTWDB accepts only the next
-/// sequence. `commit_id` supplies a second, globally unique retry key. FTWDB
-/// stores all three fields in the same checksummed frame as the transaction.
+/// `source_id` names one producer and `sequence` is that producer's opaque,
+/// strictly increasing cursor. Gaps are valid. `commit_id` supplies a second,
+/// globally unique retry key. FTWDB stores all three fields in the same
+/// checksummed frame as the transaction.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct IngressIdentity {
     pub source_id: u128,

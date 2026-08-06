@@ -38,7 +38,7 @@
 use crate::{
     CalendarUnit, Entity, EntityId, Plan, PlanStatus, Point, Properties, PropertyValue, Relation,
     RelationId, RollupPolicy, RollupResolution, RollupTier, Run, RunId, RunKind, RunStatus,
-    SeriesDefinition, SeriesSemantics,
+    SeriesDefinition, SeriesSemantics, Transaction,
 };
 use crc32fast::Hasher;
 use std::collections::BTreeMap;
@@ -119,6 +119,32 @@ pub struct CommitBatchRequest {
     pub plans: Vec<Plan>,
     /// Each point contains all 72 FTWDB point bytes and UTC microsecond times.
     pub points: Vec<Point>,
+}
+
+/// Builds the one canonical storage transaction used by both the sidecar and
+/// read-only reconciliation. Keeping this mapping in one place prevents the
+/// verifier from blessing bytes that the server would store differently.
+pub(crate) fn transaction_from_batch(batch: CommitBatchRequest) -> Transaction {
+    let mut transaction = Transaction::new();
+    for entity in batch.entities {
+        transaction.upsert_entity(entity);
+    }
+    for relation in batch.relations {
+        transaction.upsert_relation(relation);
+    }
+    for series in batch.series {
+        transaction.define_series(series);
+    }
+    for run in batch.runs {
+        transaction.upsert_run(run);
+    }
+    for plan in batch.plans {
+        transaction.upsert_plan(plan);
+    }
+    if !batch.points.is_empty() {
+        transaction.append_points(batch.points);
+    }
+    transaction
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlushRequest {

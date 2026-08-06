@@ -112,8 +112,9 @@ result-verified adapters stay open and are required for the M4 exit.
 - portable, versioned local wire contract for catalog, runs, plans, and points;
 - durable source, sequence, and commit identity with exact replay receipts;
 - bounded single-writer runtime with clear overload and poison states;
-- local Unix sidecar with private path modes plus time, frame, client, and memory bounds;
-- peer-credential checks, clean signal shutdown, and managed service files;
+- local Unix sidecar with private path modes, peer-UID checks, clean signal shutdown,
+  and time, frame, client, and memory bounds;
+- managed service files and live operational metrics;
 - FTW async dual-write adapter, cross-language golden fixtures, and reconcile report;
 - box metrics, week soak, live SD-write measurements, physical power cuts, and rollback.
 

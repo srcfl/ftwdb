@@ -7,6 +7,12 @@ use std::fs::{self, DirBuilder};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
+
+static TERMINATION_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     if let Err(error) = run() {
@@ -27,6 +33,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Err(usage().into());
     }
 
+    let stop = ShadowStopToken::new();
+    let _signals = TerminationSignals::install(stop.clone())?;
     let store_path = PathBuf::from(store_path);
     prepare_private_store_root(&store_path)?;
     let store = Store::open_with(
@@ -45,12 +53,107 @@ fn run() -> Result<(), Box<dyn Error>> {
     )?;
     let submitter = runtime.submitter();
     let server_config = ShadowServerConfig::new(PathBuf::from(socket_path));
-    let stop = ShadowStopToken::new();
     let result = serve(&server_config, submitter, &stop);
     let shutdown = runtime.shutdown();
-    result?;
+    let report = result?;
     shutdown?;
+    eprintln!(
+        "ftwdb-shadow: stopped accepted_clients={} peer_auth_failures={} client_errors={}",
+        report.accepted_clients, report.peer_auth_failures, report.client_errors
+    );
     Ok(())
+}
+
+extern "C" fn request_termination(_signal: libc::c_int) {
+    // AtomicBool is lock-free on the supported Linux and macOS targets. The
+    // handler does no allocation, locking, I/O, or cleanup work.
+    TERMINATION_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+struct TerminationSignals {
+    previous_sigint: libc::sigaction,
+    previous_sigterm: libc::sigaction,
+    cancel_watcher: Arc<AtomicBool>,
+    watcher: Option<thread::JoinHandle<()>>,
+}
+
+impl TerminationSignals {
+    fn install(stop: ShadowStopToken) -> io::Result<Self> {
+        TERMINATION_REQUESTED.store(false, Ordering::Relaxed);
+        let previous_sigterm = install_signal(libc::SIGTERM)?;
+        let previous_sigint = match install_signal(libc::SIGINT) {
+            Ok(previous) => previous,
+            Err(error) => {
+                restore_signal(libc::SIGTERM, &previous_sigterm);
+                return Err(error);
+            }
+        };
+
+        let cancel_watcher = Arc::new(AtomicBool::new(false));
+        let watcher_cancel = Arc::clone(&cancel_watcher);
+        let watcher = match thread::Builder::new()
+            .name("ftwdb-shadow-signals".to_owned())
+            .spawn(move || {
+                while !watcher_cancel.load(Ordering::Acquire) {
+                    if TERMINATION_REQUESTED.load(Ordering::Relaxed) {
+                        stop.stop();
+                        return;
+                    }
+                    thread::park_timeout(Duration::from_millis(10));
+                }
+            }) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                restore_signal(libc::SIGINT, &previous_sigint);
+                restore_signal(libc::SIGTERM, &previous_sigterm);
+                return Err(error);
+            }
+        };
+
+        Ok(Self {
+            previous_sigint,
+            previous_sigterm,
+            cancel_watcher,
+            watcher: Some(watcher),
+        })
+    }
+}
+
+impl Drop for TerminationSignals {
+    fn drop(&mut self) {
+        // Restore first so a signal that arrives during teardown keeps the
+        // launcher's prior behavior instead of getting lost.
+        restore_signal(libc::SIGINT, &self.previous_sigint);
+        restore_signal(libc::SIGTERM, &self.previous_sigterm);
+        self.cancel_watcher.store(true, Ordering::Release);
+        if let Some(watcher) = self.watcher.take() {
+            watcher.thread().unpark();
+            let _ = watcher.join();
+        }
+    }
+}
+
+fn install_signal(signal: libc::c_int) -> io::Result<libc::sigaction> {
+    // SAFETY: zero is a valid starting state for sigaction on the supported
+    // targets. sigemptyset initializes the mask before sigaction reads it.
+    let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    action.sa_sigaction = request_termination as *const () as libc::sighandler_t;
+    action.sa_flags = 0;
+    // SAFETY: action owns valid mask storage.
+    if unsafe { libc::sigemptyset(&mut action.sa_mask) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both pointers refer to valid sigaction values for this call.
+    let mut previous = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    if unsafe { libc::sigaction(signal, &action, &mut previous) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(previous)
+}
+
+fn restore_signal(signal: libc::c_int, previous: &libc::sigaction) {
+    // SAFETY: previous came from a successful sigaction call in this process.
+    let _ = unsafe { libc::sigaction(signal, previous, std::ptr::null_mut()) };
 }
 
 fn usage() -> &'static str {

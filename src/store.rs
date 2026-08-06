@@ -323,6 +323,29 @@ impl Store {
         self.database.ingress_watermarks(source_id)
     }
 
+    /// Returns the read-only frame receipt for one ordered source sequence.
+    #[must_use]
+    pub fn ingress_receipt(&self, source_id: u128, sequence: u64) -> Option<crate::IngressReceipt> {
+        self.database.ingress_receipt(source_id, sequence)
+    }
+
+    /// Compares source-side shadow batches with this store without writing.
+    ///
+    /// A read-only store can prove content but cannot prove that a prior
+    /// writer synced a recovered receipt. Pair this report with the live
+    /// sidecar's durable watermark when deciding whether the source copy may
+    /// be released.
+    pub fn reconcile_shadow_batches(
+        &self,
+        expected: &[crate::shadow_protocol::CommitBatchRequest],
+        limits: crate::shadow_reconcile::ShadowReconcileLimits,
+    ) -> std::result::Result<
+        crate::shadow_reconcile::ShadowReconciliationReport,
+        crate::shadow_reconcile::ShadowReconcileError,
+    > {
+        crate::shadow_reconcile::reconcile_shadow_batches(&self.database, expected, limits)
+    }
+
     /// Returns every known ingress source in stable source-ID order.
     #[must_use]
     pub fn all_ingress_watermarks(&self) -> std::collections::BTreeMap<u128, IngressWatermarks> {

@@ -68,7 +68,8 @@ without taking down a healthy writer.
 The current wire health reply reports writer status, queued operations, and the
 connected source's accepted and durable watermarks. The in-process runtime also
 tracks queue limits, accepted, acknowledged, and failed counts, all known
-source watermarks, and the latest fatal writer error.
+source watermarks, and the latest fatal writer error. On clean shutdown, the
+service log reports accepted clients, peer-auth failures, and client errors.
 
 Before beta, an operations endpoint or service log must also expose overload
 and protocol-error counts, database bytes, points, commits, recovered tail
@@ -76,14 +77,16 @@ bytes, sync policy, and whether the last acknowledgement was durable.
 
 ## Flash-write policy
 
-The safe first beta uses `Durability::Always` and sends useful batches instead
-of one point per transaction. This gives a clear acknowledgement contract but
-can issue too many syncs if the source sends small batches.
+The sidecar keeps `Durability::Always` fixed during the first beta work and
+sends useful batches instead of one point per transaction. This gives a clear
+acknowledgement contract but can issue too many syncs if the source sends small
+batches. Do not change that default until target-box write counts and physical
+power cuts prove a safer policy.
 
-`Durability::EveryBytes` can cut sync traffic after the client proves that it
-retains every non-durable batch and can replay it with the same IDs. A flush
-advances the durable watermark for all earlier accepted batches. Manual
-durability is not a beta default.
+`Durability::EveryBytes` exists in the storage layer, but the sidecar must not
+use it for beta. A later change needs its own target-box write-count results,
+physical power-cut evidence, and proof that the client retains and replays each
+non-durable batch with the same IDs.
 
 Measure these values on the target box for each policy:
 
@@ -103,12 +106,64 @@ and restore tests prove that all required data remains available.
 The service creates or checks a store root owned by its effective user with
 mode `0700`. It refuses a symlink, another owner, or any group or world access.
 It also creates a private socket directory and a Unix socket with mode `0600`.
-A later hardening step must check the peer UID or GID on each accepted
-connection. Never expose this protocol through a TCP proxy in the beta.
+For every accepted connection, Linux and macOS ask the kernel for the peer's
+effective UID. The service closes the connection before reading a frame unless
+that UID matches the configured service UID. Never expose this protocol through
+a TCP proxy in the beta.
+
+The command installs small SIGTERM and SIGINT handlers that only set an atomic
+flag. A helper thread turns that flag into a server stop request. The server
+then drains the writer, syncs the store, removes its socket, and returns a
+normal exit code. The current two-second frame deadline also bounds shutdown
+when a connected client stops sending bytes.
 
 The client must send `HELLO` first. The server rejects an unknown major version,
 an unknown message kind, set reserved bits, a bad checksum, a frame above the
 fixed size limit, a malformed record, and a request before `HELLO`.
+A clean EOF before the next frame is a normal disconnect. An EOF inside a
+header or body is a client error.
+
+## Frozen protocol fixtures
+
+`testdata/shadow-protocol-v1` contains one hex-encoded frame for every v1
+request and response kind, plus separate commit and flush acknowledgements.
+The Rust integration test checks both directions against those bytes. The Go
+adapter must use the same files; copied values or a second fixture generator do
+not count as a shared contract test.
+
+The v1 source sequence is an opaque, strictly increasing source cursor. It may
+contain gaps. An exact retry must reuse the same source ID, sequence, commit ID,
+and transaction bytes.
+
+## Reconciliation report
+
+`shadow_reconcile::reconcile_shadow_batches` compares a bounded source window
+without writing to the store. It checks:
+
+- each source and sequence against its stored ingress receipt;
+- the exact canonical transaction bytes stored in that receipt's frame;
+- commit ID, record count, point count, and current durability proof;
+- the last supplied state of each entity, relation, series, run, and plan;
+- exact point multiplicity and every point bit inside each supplied series'
+  smallest covered timestamp span.
+
+The report keeps full counts but caps mismatch details. Separate limits cap
+input batches, metadata, expected points, observed points, and all raw series
+entries visited before timestamp filtering. Catalog checks are one-way because
+catalog objects do not yet keep an ingress source ID. The caller must pass
+batches in the intended cross-source catalog order. A read-only open can prove
+content but cannot claim that a prior writer synced a receipt.
+
+`ftwdb-shadow-reconcile <store-directory> <commit-request.hex> ...` runs this
+check offline against exact v1 commit frames and writes one stable JSON summary.
+Stop the sidecar first: the read-only opener takes the store's shared lock and
+will not bypass its active writer. Mismatch details go to stderr. Exit code `3`
+means the command completed and found a content mismatch; a read or input error
+uses exit code `2`. The JSON states that a read-only run has no durability
+proof, so pair it with the sidecar's live durable watermark.
+Each input must be a regular hex file no larger than one encoded protocol
+frame. The command also caps frame count, decoded bytes, metadata records, and
+points before it opens the store. Its current decoded-input cap is 256 MiB.
 
 ## Required tests before an FTW beta
 
@@ -118,6 +173,7 @@ fixed size limit, a malformed record, and a request before `HELLO`.
 - round trips for every catalog record and every point field;
 - unknown version, kind, flag, trailing byte, bad checksum, short read, and
   maximum-size cases;
+- clean frame-boundary EOF versus a partial-frame EOF;
 - Go and Rust encode/decode checks against the same fixtures;
 - sign, unit, UTC, interval, revision, run, plan, and outcome examples.
 
@@ -126,7 +182,7 @@ fixed size limit, a malformed record, and a request before `HELLO`.
 - exact retry before and after reopen returns the original receipt;
 - same sequence with another commit ID fails;
 - same commit ID with other data fails;
-- a sequence gap fails without poisoning the writer;
+- a new cursor that is equal to or below the prior cursor fails without poisoning the writer;
 - an acknowledgement lost after a durable write does not duplicate data;
 - a flush covers every earlier accepted batch and no later batch.
 
@@ -150,7 +206,7 @@ fixed size limit, a malformed record, and a request before `HELLO`.
 - corrupt the shadow store while FTW keeps its current source of truth;
 - disable the source flag and sidecar service separately;
 - compare source rows, shadow rows, plans, decisions, and outcomes with a
-  stable reconciliation report.
+  stable reconciliation report whose receipt checks use exact stored bytes.
 
 ## Rollout gates
 
