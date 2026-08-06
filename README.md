@@ -29,6 +29,8 @@ This repository currently contains the first executable storage slice:
 - immutable compressed raw and rollup segments with checksummed manifests;
 - persistent fixed and IANA-calendar rollups, including DST-correct energy;
 - automatic late-data invalidation, rebuild, cached queries, and retention gates;
+- exact per-source ingress replay receipts that survive reopen;
+- a draft, bounded Go-portable shadow protocol and local Unix sidecar;
 - tests, property tests, Criterion benchmarks, and a competitor benchmark plan.
 
 It is **not production-ready**. The active log still rebuilds an in-memory read
@@ -74,6 +76,15 @@ cargo run --release -- restore ./backups/energy-2026-07-21.ftwdb ./restored-ener
 cargo run --release -- salvage ./damaged-energy.ftwdb ./salvaged-energy.ftwdb
 ```
 
+Run the local shadow sidecar with sync-on-every-batch durability:
+
+```sh
+cargo run --release --bin ftwdb-shadow -- ./shadow.ftwdb ./run/ftwdb-shadow.sock
+```
+
+The sidecar protocol is still a draft. Do not make FTW control or production
+reads depend on it. See the shadow guide and its beta gates below.
+
 ## Design documents
 
 - [Architecture and invariants](docs/architecture.md)
@@ -82,6 +93,7 @@ cargo run --release -- salvage ./damaged-energy.ftwdb ./salvaged-energy.ftwdb
 - [Immutable segment format](docs/segment-format.md)
 - [Persistent rollups and retention](docs/rollups.md)
 - [Integrity checks, backup, restore, and salvage](docs/operations.md)
+- [FTW shadow sidecar and beta gates](docs/shadow-sidecar.md)
 - [OSS database research](docs/research.md)
 - [Benchmark protocol](docs/benchmarking.md)
 - [Deterministic energy workload](docs/workload.md)

@@ -17,6 +17,9 @@ mod real_fixture;
 mod rollup;
 mod rollup_segment;
 mod segment;
+pub mod shadow_protocol;
+pub mod shadow_runtime;
+pub mod shadow_server;
 mod snapshot;
 mod storage;
 mod store;
@@ -38,14 +41,14 @@ pub use rollup::{CalendarGaugeRollup, FixedGaugeRollup, GaugeBucket};
 pub use rollup_segment::{RollupSegment, RollupSegmentStats};
 pub use segment::{Segment, SegmentStats};
 pub use storage::{
-    Commit, Config, Database, Durability, PlanOutcome, Point, RecoveredTail, SalvageStopReason,
-    Stats,
+    Commit, Config, Database, Durability, IngressWatermarks, PlanOutcome, Point, RecoveredTail,
+    SalvageStopReason, Stats,
 };
 pub use store::{
     BackupReport, IntegrityReport, MaintenanceReport, RestoreReport, RetentionGate, RollupQuery,
     RollupSource, SalvageReport, SalvageStatus, Store,
 };
-pub use transaction::Transaction;
+pub use transaction::{IngressIdentity, Transaction};
 pub use tsbs::{TsbsIotLoadReport, load_tsbs_iot};
 pub use workload::{
     EnergyWorkload, MAX_WORKLOAD_BUNDLE_BYTES, MAX_WORKLOAD_DAYS, MAX_WORKLOAD_POINTS,

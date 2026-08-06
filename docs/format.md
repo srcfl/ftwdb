@@ -18,7 +18,7 @@ uncompressed; it is a durability test vehicle, not the final segment format.
 |---:|---:|---|
 | 0 | 4 | ASCII `WBAT` |
 | 4 | 2 | frame version (`1`) |
-| 6 | 2 | frame kind: `0` legacy points, `1` mixed transaction, `2` identified mixed transaction |
+| 6 | 2 | frame kind: `0` legacy points, `1` mixed transaction, `2` identified mixed transaction, `3` ordered ingress transaction |
 | 8 | 4 | item count: points or transaction records |
 | 12 | 4 | payload bytes |
 | 16 | 4 | CRC32 of payload |
@@ -73,6 +73,32 @@ Recovery collects every identifier seen during the log scan, and a commit
 whose identifier is already present writes nothing and reports deduplication.
 A duplicate identifier encountered in the log itself is reported as
 corruption, since the writer never appends one.
+
+## Ordered ingress transaction payload
+
+A frame of kind `3` starts with this fixed 40-byte identity:
+
+| Offset | Bytes | Field |
+|---:|---:|---|
+| 0 | 16 | `source_id` as little-endian `u128` |
+| 16 | 8 | `sequence` as little-endian `u64` |
+| 24 | 16 | `commit_id` as little-endian `u128` |
+
+The identity is followed by the canonical kind `1` transaction payload. The
+frame checksum covers both parts.
+
+FTWDB accepts any first sequence for a new non-zero source ID. It then accepts
+only the next sequence. An exact retry of a stored source and sequence reads
+the original transaction bytes from the log and compares every byte. It
+returns the original frame offset, record count, point count, and byte count
+without writing. A matching CRC is only a fast check and never replaces the
+byte comparison. Reusing a source sequence or commit ID for other data fails
+without poisoning the writer.
+
+Recovery rebuilds the source watermarks and receipt indexes from complete
+kind `3` frames. A torn last frame exposes neither its identity nor its data.
+Duplicate keys or a sequence gap inside a complete log are corruption. Kinds
+`0` through `2` remain byte-compatible.
 
 The immutable segment format will be separately versioned and use per-column
 encoding, block checksums, sparse indexes, and footer redundancy.

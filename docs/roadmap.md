@@ -106,3 +106,23 @@ process-lock, sync-failure, `/dev/full`, and NBD tests, this closes the
 robustness gaps tracked in issue #17. Tests on the target board and SD cards,
 power cuts during commits, soak runs, remote backup policy, and the remaining
 result-verified adapters stay open and are required for the M4 exit.
+
+## M5: FTW shadow integration — foundation in progress
+
+- portable, versioned local wire contract for catalog, runs, plans, and points;
+- durable source, sequence, and commit identity with exact replay receipts;
+- bounded single-writer runtime with clear overload and poison states;
+- local Unix sidecar with private path modes plus time, frame, client, and memory bounds;
+- peer-credential checks, clean signal shutdown, and managed service files;
+- FTW async dual-write adapter, cross-language golden fixtures, and reconcile report;
+- box metrics, week soak, live SD-write measurements, physical power cuts, and rollback.
+
+Exit: selected FTW beta boxes can enable and disable shadow capture without any
+control-path effect; every accepted batch has a clear durability state; Go and
+Rust agree on every contract fixture; restart, retry, disk-full, corruption,
+and power-cut tests preserve one exact durable prefix; operators can compare,
+export, restore, rotate, and remove the shadow store.
+
+The storage ingress frame, protocol draft, bounded writer, and sidecar work are
+the first slice. FTWDB remains a shadow sink until every M4 hardware gate and
+the M5 exit above pass.

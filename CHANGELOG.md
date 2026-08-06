@@ -6,6 +6,17 @@ steps in [docs/releases.md](docs/releases.md).
 
 ## [Unreleased]
 
+### Added
+
+- Ordered ingress frames now store source, sequence, commit ID, and transaction
+  as one checked unit. Exact retries compare the original bytes and return the
+  original receipt across reopen.
+- A bounded single-writer runtime separates request errors from storage faults
+  and tracks accepted and durable progress per source.
+- A draft, hand-written metadata wire codec and local Unix shadow sidecar
+  carry catalog, run, plan, point, and outcome data without joining FTW's
+  control path.
+
 ### Fixed
 
 - Release publication now reads notes from the annotated tag through a file,

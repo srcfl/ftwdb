@@ -106,3 +106,22 @@ The first production shape is one writer with snapshot readers. This matches
 edge ingestion, makes commit order unambiguous, and avoids a coordination-heavy
 write path. Concurrent producers feed one bounded writer queue. Independent
 readers never mutate segment files.
+
+## FTW shadow boundary
+
+The first FTW link runs FTWDB as a local Unix sidecar while FTW keeps its
+current data path and all control duties. The sidecar has its own process,
+failure state, update path, and kill switch. A missing, slow, full, corrupt, or
+stopped sidecar must not delay device reads, planning, dispatch, or safety
+checks.
+
+One versioned wire batch maps to one atomic ordered-ingress frame. The batch
+keeps catalog changes, runs, plans, points, and its source/sequence/commit
+identity in the same recovery unit. A bounded nonblocking queue feeds the only
+writer. Client errors reject one request; storage errors poison the writer and
+require a checked reopen.
+
+FTWDB does not serve authoritative FTW reads during shadow collection. Read
+promotion starts with a diagnostic comparison after replay, retry, overload,
+soak, target-board power-cut, and rollback checks pass. See
+[FTW shadow sidecar](shadow-sidecar.md).

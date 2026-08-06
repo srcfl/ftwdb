@@ -5,10 +5,11 @@ use crate::snapshot::{
     snapshot_digest, snapshot_file_prefix_digest,
 };
 use crate::storage::{SalvageSource, sync_directory, sync_parent_directory};
-use crate::transaction::Record;
+use crate::transaction::{IngressIdentity, Record};
 use crate::{
-    CalendarGaugeRollup, Commit, Config, Database, Error, FixedGaugeRollup, GaugeBucket, Point,
-    Result, RollupResolution, RollupSegment, SeriesSemantics, Transaction,
+    CalendarGaugeRollup, Commit, Config, Database, Error, FixedGaugeRollup, GaugeBucket,
+    IngressWatermarks, Point, Result, RollupResolution, RollupSegment, SeriesSemantics,
+    Transaction,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -251,6 +252,11 @@ impl Store {
         self.manifest.generation
     }
 
+    #[must_use]
+    pub const fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
     pub fn active_rollups(&self) -> impl Iterator<Item = &RollupDescriptor> {
         self.manifest.rollups.iter().filter(|rollup| rollup.active)
     }
@@ -297,6 +303,30 @@ impl Store {
             self.advance_after_points(&committed_points)?;
         }
         Ok(commit)
+    }
+
+    /// Commits one ordered producer transaction through the raw log and the
+    /// same rollup invalidation path as [`Store::commit`]. Exact retries keep
+    /// the original raw frame receipt and skip manifest work.
+    pub fn commit_ingress(
+        &mut self,
+        identity: IngressIdentity,
+        mut transaction: Transaction,
+    ) -> Result<Commit> {
+        transaction.with_ingress_identity(identity);
+        self.commit(transaction)
+    }
+
+    /// Returns accepted and durable progress for one ordered ingress source.
+    #[must_use]
+    pub fn ingress_watermarks(&self, source_id: u128) -> IngressWatermarks {
+        self.database.ingress_watermarks(source_id)
+    }
+
+    /// Returns every known ingress source in stable source-ID order.
+    #[must_use]
+    pub fn all_ingress_watermarks(&self) -> std::collections::BTreeMap<u128, IngressWatermarks> {
+        self.database.all_ingress_watermarks()
     }
 
     /// Compatibility append for a previously initialized catalog. New code

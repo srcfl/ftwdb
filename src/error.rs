@@ -40,6 +40,28 @@ pub enum Error {
     SourceChanged {
         path: PathBuf,
     },
+    /// A producer reused one source sequence with a different transaction or
+    /// commit identifier. The writer remains usable.
+    IngressSourceSequenceConflict {
+        source_id: u128,
+        sequence: u64,
+    },
+    /// A producer reused one ingress commit identifier for another source,
+    /// sequence, or transaction. The writer remains usable.
+    IngressCommitIdConflict {
+        commit_id: u128,
+    },
+    /// A producer skipped or went back from its next required sequence. The
+    /// first transaction from a source may start at any sequence.
+    IngressSequenceGap {
+        source_id: u128,
+        expected: u64,
+        actual: u64,
+    },
+    /// A source already stored sequence `u64::MAX` and cannot advance.
+    IngressSequenceExhausted {
+        source_id: u128,
+    },
 }
 
 impl fmt::Display for Error {
@@ -82,6 +104,30 @@ impl fmt::Display for Error {
                 f,
                 "source file {} changed while it was being checked",
                 path.display()
+            ),
+            Self::IngressSourceSequenceConflict {
+                source_id,
+                sequence,
+            } => write!(
+                f,
+                "ingress source {source_id:032x} sequence {sequence} conflicts with its stored transaction"
+            ),
+            Self::IngressCommitIdConflict { commit_id } => write!(
+                f,
+                "ingress commit identifier {commit_id:032x} conflicts with its stored transaction"
+            ),
+            Self::IngressSequenceGap {
+                source_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "ingress source {source_id:032x} requires sequence {expected}, got {actual}"
+            ),
+            Self::IngressSequenceExhausted { source_id } => write!(
+                f,
+                "ingress source {source_id:032x} cannot advance past sequence {}",
+                u64::MAX
             ),
         }
     }
