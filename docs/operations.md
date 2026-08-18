@@ -80,7 +80,8 @@ The selected snapshot contains:
 
 - `active.wlog`, always copied;
 - the selected manifest generation, when one exists;
-- each active immutable rollup named by that manifest.
+- each active immutable rollup named by that manifest;
+- each sealed raw segment named by that manifest.
 
 Every selected path must be a regular file according to `symlink_metadata` and
 the opened file identity. Read-only file opens use no-follow and nonblocking

@@ -97,7 +97,7 @@ proptest! {
             .map(|(index, value)| point(3, index, *value))
             .collect();
         Segment::create(&path, &expected, block_points).unwrap();
-        let mut segment = Segment::open(&path).unwrap();
+        let segment = Segment::open(&path).unwrap();
         prop_assert_eq!(
             segment.query(3, i64::MIN, i64::MAX).unwrap(),
             expected,

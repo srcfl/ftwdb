@@ -1,4 +1,4 @@
-use crate::manifest::{self, Manifest, RollupDescriptor};
+use crate::manifest::{self, Manifest, RawSegmentDescriptor, RollupDescriptor};
 use crate::rollup::calendar_bucket_bounds;
 use crate::snapshot::{
     PublicationStep, StagedDirectory, inject_checksum_mismatch, publication_checkpoint,
@@ -8,7 +8,7 @@ use crate::storage::{SalvageSource, sync_directory, sync_parent_directory};
 use crate::transaction::{IngressIdentity, Record};
 use crate::{
     CalendarGaugeRollup, Commit, Config, Database, Error, FixedGaugeRollup, GaugeBucket,
-    IngressWatermarks, Point, Result, RollupResolution, RollupSegment, SeriesDefinition,
+    IngressWatermarks, Point, Result, RollupResolution, RollupSegment, Segment, SeriesDefinition,
     SeriesSemantics, Transaction,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -22,11 +22,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const ACTIVE_LOG: &str = "active.wlog";
 const MANIFEST_DIRECTORY: &str = "manifests";
 const ROLLUP_DIRECTORY: &str = "rollups";
+const SEGMENT_DIRECTORY: &str = "segments";
+const SEAL_BLOCK_POINTS: usize = 16_384;
 const UTC_DAY_MICROS: i64 = 86_400_000_000;
 /// Process-local verified rollup files. Queries may temporarily hold more than
 /// this when a single range covers a larger working set; idle cache is trimmed
 /// back so open no longer preloads every generation into RAM.
 const MAX_CACHED_ROLLUP_SEGMENTS: usize = 1_024;
+
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_AFTER_SEAL_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_seal_reclaim() {
+    FAIL_AFTER_SEAL_PUBLISH.with(|flag| flag.set(true));
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RollupSource {
@@ -57,6 +69,16 @@ pub struct MaintenanceReport {
     pub rollup_buckets_written: u64,
     pub rollup_bytes_written: u64,
     pub retention_gates: Vec<RetentionGate>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SealReport {
+    pub manifest_generation: u64,
+    pub segment_file: String,
+    pub sealed_points: u64,
+    pub live_points: u64,
+    pub segment_bytes: u64,
+    pub log_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -152,6 +174,7 @@ pub struct Store {
     root: PathBuf,
     rollup_directory: PathBuf,
     manifest_directory: PathBuf,
+    segment_directory: PathBuf,
     database: Database,
     manifest: Manifest,
     rollup_cache: RwLock<HashMap<String, RollupSegment>>,
@@ -182,8 +205,10 @@ impl Store {
         }
         let manifest_directory = root.join(MANIFEST_DIRECTORY);
         let rollup_directory = root.join(ROLLUP_DIRECTORY);
+        let segment_directory = root.join(SEGMENT_DIRECTORY);
         std::fs::create_dir_all(&manifest_directory)?;
         std::fs::create_dir_all(&rollup_directory)?;
+        std::fs::create_dir_all(&segment_directory)?;
         // Make the manifests/ and rollups/ entries durable in the root, then
         // make the root's own entry durable in its parent — the same order
         // segment publication uses: contents first, then the directory entry
@@ -204,12 +229,15 @@ impl Store {
         // `Error::Locked` before it can republish manifests or rewrite
         // rollups. Backups copy (never hard-link) the active log, so opening
         // a published backup does not contend with the source's lock.
-        let database = Database::open_with(root.join(ACTIVE_LOG), config)?;
         let manifest = Manifest::load(&manifest_directory)?;
+        let published_seals = published_seal_generations(&manifest);
+        let database =
+            Database::open_with_published_seals(root.join(ACTIVE_LOG), config, &published_seals)?;
         let mut store = Self {
             root,
             rollup_directory,
             manifest_directory,
+            segment_directory,
             database,
             manifest,
             rollup_cache: RwLock::new(HashMap::new()),
@@ -219,10 +247,14 @@ impl Store {
             materialized_series_revisions: HashMap::new(),
             last_maintain_now_micros: None,
         };
+        store.attach_published_segments()?;
         store.verify_and_reconcile_manifest()?;
         // Reclaims superseded manifests/segments and any segment orphaned by
         // a crash between `RollupSegment::create` and manifest publication.
         store.remove_unreferenced_files();
+        if store.database.pending_reclaim() {
+            store.database.reclaim_live_log()?;
+        }
         Ok(store)
     }
 
@@ -242,15 +274,22 @@ impl Store {
         let root = path.as_ref().to_path_buf();
         let manifest_directory = root.join(MANIFEST_DIRECTORY);
         let rollup_directory = root.join(ROLLUP_DIRECTORY);
+        let segment_directory = root.join(SEGMENT_DIRECTORY);
         require_real_directory(&root)?;
         require_real_directory(&manifest_directory)?;
         require_real_directory(&rollup_directory)?;
-        let database = Database::open_read_only(root.join(ACTIVE_LOG))?;
         let manifest = Manifest::load(&manifest_directory)?;
+        if !manifest.segments.is_empty() {
+            require_real_directory(&segment_directory)?;
+        }
+        let published_seals = published_seal_generations(&manifest);
+        let database =
+            Database::open_read_only_with_published_seals(root.join(ACTIVE_LOG), &published_seals)?;
         let mut store = Self {
             root,
             rollup_directory,
             manifest_directory,
+            segment_directory,
             database,
             manifest,
             rollup_cache: RwLock::new(HashMap::new()),
@@ -260,6 +299,7 @@ impl Store {
             materialized_series_revisions: HashMap::new(),
             last_maintain_now_micros: None,
         };
+        store.attach_published_segments()?;
         store.verify_manifest_read_only()?;
         Ok(store)
     }
@@ -446,21 +486,53 @@ impl Store {
                 }
                 continue;
             }
-            let points = self
-                .database
-                .query_latest(definition.id, i64::MIN, i64::MAX);
             let max_gap = definition.maximum_gap_micros.unwrap_or(0);
+            let Some((earliest, latest)) = self.database.series_valid_bounds(definition.id) else {
+                continue;
+            };
             for tier in &definition.rollup_policy.tiers {
-                let mut buckets = materialize(&points, &tier.resolution, max_gap)?;
-                buckets.retain(|bucket| bucket.end <= now_micros);
                 let retention_cutoff = tier
                     .retain_for_micros
                     .map(|retention| now_micros.saturating_sub(retention));
-                let shards = rollup_shards(&buckets, &tier.resolution, now_micros)?;
-                for shard in shards
+                let needed = needed_completed_shards(
+                    definition.id,
+                    &tier.resolution,
+                    earliest,
+                    latest,
+                    now_micros,
+                    &next.rollups,
+                    stats.points,
+                )?;
+                let needed: Vec<_> = needed
                     .into_iter()
                     .filter(|shard| retention_cutoff.is_none_or(|cutoff| shard.end >= cutoff))
-                {
+                    .collect();
+                if needed.is_empty() {
+                    continue;
+                }
+                let query_start = needed
+                    .iter()
+                    .map(|shard| shard.start)
+                    .min()
+                    .unwrap_or(earliest)
+                    .saturating_sub(max_gap);
+                let query_end = needed
+                    .iter()
+                    .map(|shard| shard.end)
+                    .max()
+                    .unwrap_or(latest.saturating_add(1))
+                    .saturating_add(max_gap.max(1));
+                let points = self
+                    .database
+                    .query_latest(definition.id, query_start, query_end);
+                let mut buckets = materialize(&points, &tier.resolution, max_gap)?;
+                buckets.retain(|bucket| bucket.end <= now_micros);
+                let shards = rollup_shards(&buckets, &tier.resolution, now_micros)?;
+                for shard in shards.into_iter().filter(|shard| {
+                    needed
+                        .iter()
+                        .any(|want| want.start == shard.start && want.end == shard.end)
+                }) {
                     let already_current = next.rollups.iter().any(|rollup| {
                         rollup.active
                             && rollup.series_id == definition.id
@@ -520,6 +592,67 @@ impl Store {
             rollup_buckets_written: buckets_written,
             rollup_bytes_written: bytes_written,
             retention_gates,
+        })
+    }
+
+    /// Seals the live raw index into an immutable segment, publishes it, and
+    /// rewrites `active.wlog` to catalog + identity receipts.
+    ///
+    /// After this returns, open/recovery replays only the unsealed tail.
+    /// Sealed points stay queryable from the segment file.
+    pub fn seal_and_reclaim(&mut self) -> Result<SealReport> {
+        self.ensure_writable()?;
+        self.database.flush()?;
+        let live = self.database.live_points_snapshot();
+        if live.is_empty() {
+            return Ok(SealReport {
+                manifest_generation: self.manifest.generation,
+                log_bytes: self.database.stats()?.file_bytes,
+                ..SealReport::default()
+            });
+        }
+        let stats = self.database.stats()?;
+        let next_generation = self.manifest.generation.saturating_add(1);
+        let file = raw_segment_file_name(next_generation);
+        let min_valid_time = live.iter().map(|point| point.valid_time).min().unwrap();
+        let max_valid_time = live.iter().map(|point| point.valid_time).max().unwrap();
+        let segment_stats =
+            Segment::create(self.segment_directory.join(&file), &live, SEAL_BLOCK_POINTS)?;
+        self.database.write_seal_checkpoint(
+            next_generation,
+            u64::try_from(live.len()).unwrap_or(u64::MAX),
+        )?;
+
+        let mut next = self.manifest.clone();
+        next.generation = next_generation;
+        next.segments.push(RawSegmentDescriptor {
+            file: file.clone(),
+            generation: next_generation,
+            points: segment_stats.points,
+            source_commit: stats.commits,
+            source_points: stats.points,
+            min_valid_time,
+            max_valid_time,
+        });
+        self.publish_or_poison(next)?;
+        self.attach_published_segments()?;
+
+        #[cfg(test)]
+        if FAIL_AFTER_SEAL_PUBLISH.with(std::cell::Cell::take) {
+            return Err(Error::Io(std::io::Error::other(
+                "injected seal reclaim failure",
+            )));
+        }
+
+        self.database.clear_live_index();
+        self.database.reclaim_live_log()?;
+        Ok(SealReport {
+            manifest_generation: self.manifest.generation,
+            segment_file: file,
+            sealed_points: segment_stats.points,
+            live_points: self.database.live_index_len() as u64,
+            segment_bytes: segment_stats.stored_bytes,
+            log_bytes: self.database.stats()?.file_bytes,
         })
     }
 
@@ -611,8 +744,7 @@ impl Store {
                 continue;
             };
             let cutoff = now_micros.saturating_sub(retention);
-            let raw = self.database.series_points(definition.id);
-            let Some(oldest) = raw.first().map(|point| point.valid_time) else {
+            let Some((oldest, _)) = self.database.series_valid_bounds(definition.id) else {
                 gates.push(RetentionGate {
                     series_id: definition.id,
                     raw_before: cutoff,
@@ -700,6 +832,18 @@ impl Store {
             stale_rollup_files: self.stale_rollup_files,
             ..IntegrityReport::default()
         };
+        for descriptor in &self.manifest.segments {
+            let segment = Segment::open(self.segment_directory.join(&descriptor.file))?;
+            if segment.stats().points != descriptor.points {
+                return Err(Error::Corruption {
+                    offset: 0,
+                    reason: format!(
+                        "raw segment {} does not match its manifest point count",
+                        descriptor.file
+                    ),
+                });
+            }
+        }
         for descriptor in self.active_rollups() {
             let segment = RollupSegment::open(self.rollup_directory.join(&descriptor.file))?;
             let stats = segment.stats();
@@ -860,6 +1004,7 @@ impl Store {
         damaged_store: impl AsRef<Path>,
         destination: impl AsRef<Path>,
     ) -> Result<SalvageReport> {
+        refuse_sealed_salvage(damaged_store.as_ref())?;
         let mut source = SalvageSource::open(damaged_store.as_ref(), ACTIVE_LOG)?;
         let destination = destination.as_ref();
         let relative_paths = vec![ACTIVE_LOG.to_owned()];
@@ -996,9 +1141,8 @@ impl Store {
         now_micros: i64,
         rollups: &[RollupDescriptor],
     ) -> Result<bool> {
-        let raw = self.database.series_points(definition.id);
-        let known_unchanged =
-            self.materialized_series_revisions.get(&definition.id) == Some(&raw.len());
+        let known_unchanged = self.materialized_series_revisions.get(&definition.id)
+            == Some(&self.database.series_revision_count(definition.id));
         let no_new_completed_shard = match (known_unchanged, self.last_maintain_now_micros) {
             (true, Some(prev_now)) => {
                 !series_gained_completed_shard(definition, prev_now, now_micros)?
@@ -1009,7 +1153,10 @@ impl Store {
             return Ok(true);
         }
         Ok(!series_has_missing_completed_shard(
-            definition, raw, now_micros, rollups,
+            definition,
+            self.database.series_valid_bounds(definition.id),
+            now_micros,
+            rollups,
         )?)
     }
 
@@ -1019,7 +1166,7 @@ impl Store {
             if definition.semantics == SeriesSemantics::Gauge {
                 self.materialized_series_revisions.insert(
                     definition.id,
-                    self.database.series_points(definition.id).len(),
+                    self.database.series_revision_count(definition.id),
                 );
             }
         }
@@ -1089,6 +1236,12 @@ impl Store {
             self.active_rollups()
                 .map(|descriptor| format!("{ROLLUP_DIRECTORY}/{}", descriptor.file)),
         );
+        files.extend(
+            self.manifest
+                .segments
+                .iter()
+                .map(|descriptor| format!("{SEGMENT_DIRECTORY}/{}", descriptor.file)),
+        );
         if self.manifest.generation > 0 {
             files.push(format!(
                 "{MANIFEST_DIRECTORY}/MANIFEST.{:020}",
@@ -1098,6 +1251,29 @@ impl Store {
         files.sort();
         files.dedup();
         files
+    }
+
+    fn attach_published_segments(&mut self) -> Result<()> {
+        let mut opened = Vec::with_capacity(self.manifest.segments.len());
+        for descriptor in &self.manifest.segments {
+            let path = self.segment_directory.join(&descriptor.file);
+            let segment = Segment::open(&path).map_err(|error| Error::Corruption {
+                offset: 0,
+                reason: format!("raw segment {} is unreadable: {error}", descriptor.file),
+            })?;
+            if segment.stats().points != descriptor.points {
+                return Err(Error::Corruption {
+                    offset: 0,
+                    reason: format!(
+                        "raw segment {} point count does not match the manifest",
+                        descriptor.file
+                    ),
+                });
+            }
+            opened.push(segment);
+        }
+        self.database.attach_sealed_segments(opened);
+        Ok(())
     }
 
     fn require_clean_restore_source(&self, report: &IntegrityReport) -> Result<()> {
@@ -1128,8 +1304,10 @@ impl Store {
     fn write_snapshot(&self, temporary: &Path) -> Result<BackupReport> {
         let manifests = temporary.join(MANIFEST_DIRECTORY);
         let rollups = temporary.join(ROLLUP_DIRECTORY);
+        let segments = temporary.join(SEGMENT_DIRECTORY);
         std::fs::create_dir(&manifests)?;
         std::fs::create_dir(&rollups)?;
+        std::fs::create_dir(&segments)?;
         let mut report = BackupReport {
             manifest_generation: self.manifest.generation,
             ..BackupReport::default()
@@ -1147,6 +1325,13 @@ impl Store {
             )?;
             report.record_link_or_copy(outcome);
         }
+        for descriptor in &self.manifest.segments {
+            let outcome = hard_link_or_copy(
+                &self.segment_directory.join(&descriptor.file),
+                &segments.join(&descriptor.file),
+            )?;
+            report.record_link_or_copy(outcome);
+        }
         if self.manifest.generation > 0 {
             let file = format!("MANIFEST.{:020}", self.manifest.generation);
             let outcome =
@@ -1156,6 +1341,7 @@ impl Store {
         publication_checkpoint(PublicationStep::Sync)?;
         sync_directory(&manifests)?;
         sync_directory(&rollups)?;
+        sync_directory(&segments)?;
         sync_directory(temporary)?;
         report.bytes = directory_bytes(temporary)?;
         Ok(report)
@@ -1284,8 +1470,14 @@ impl Store {
         let Ok(mut referenced) = manifest::referenced_rollup_files(&retained) else {
             return;
         };
+        let Ok(mut referenced_segments) = manifest::referenced_segment_files(&retained) else {
+            return;
+        };
         for rollup in &self.manifest.rollups {
             referenced.insert(rollup.file.clone());
+        }
+        for segment in &self.manifest.segments {
+            referenced_segments.insert(segment.file.clone());
         }
         let Ok(entries) = std::fs::read_dir(&self.rollup_directory) else {
             return;
@@ -1303,6 +1495,21 @@ impl Store {
         }
         if removed {
             let _ = sync_directory(&self.rollup_directory);
+        }
+        let Ok(entries) = std::fs::read_dir(&self.segment_directory) else {
+            return;
+        };
+        let mut removed_segments = false;
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if name.ends_with(".wseg") && !referenced_segments.contains(&name) {
+                removed_segments |= std::fs::remove_file(entry.path()).is_ok();
+            }
+        }
+        if removed_segments {
+            let _ = sync_directory(&self.segment_directory);
         }
     }
 
@@ -1519,49 +1726,88 @@ fn series_gained_completed_shard(
 
 fn series_has_missing_completed_shard(
     definition: &SeriesDefinition,
-    raw: &[Point],
+    bounds: Option<(i64, i64)>,
     now_micros: i64,
     rollups: &[RollupDescriptor],
 ) -> Result<bool> {
-    if raw.is_empty() {
+    let Some((earliest, latest)) = bounds else {
         return Ok(false);
-    }
+    };
     for tier in &definition.rollup_policy.tiers {
-        let covered: HashSet<(i64, i64)> = rollups
-            .iter()
-            .filter(|rollup| {
-                rollup.active
-                    && rollup.series_id == definition.id
-                    && rollup.resolution == tier.resolution
-            })
-            .map(|rollup| (rollup.start, rollup.end))
-            .collect();
-        match &tier.resolution {
-            RollupResolution::FixedMicros(micros) => {
-                let width = fixed_shard_width(*micros)?;
-                for point in raw {
-                    let start = point.valid_time.div_euclid(width) * width;
-                    let end = start.saturating_add(width);
-                    if end <= now_micros && !covered.contains(&(start, end)) {
-                        return Ok(true);
-                    }
-                }
-            }
-            RollupResolution::Calendar {
-                unit,
-                iana_timezone,
-            } => {
-                for point in raw {
-                    let (start, end) =
-                        calendar_bucket_bounds(point.valid_time, *unit, iana_timezone)?;
-                    if end <= now_micros && !covered.contains(&(start, end)) {
-                        return Ok(true);
-                    }
-                }
-            }
+        let needed = needed_completed_shards(
+            definition.id,
+            &tier.resolution,
+            earliest,
+            latest,
+            now_micros,
+            rollups,
+            u64::MAX,
+        )?;
+        if !needed.is_empty() {
+            return Ok(true);
         }
     }
     Ok(false)
+}
+
+struct ShardBounds {
+    start: i64,
+    end: i64,
+}
+
+fn needed_completed_shards(
+    series_id: u64,
+    resolution: &RollupResolution,
+    earliest: i64,
+    latest: i64,
+    now_micros: i64,
+    rollups: &[RollupDescriptor],
+    current_points: u64,
+) -> Result<Vec<ShardBounds>> {
+    let covered: HashSet<(i64, i64)> = rollups
+        .iter()
+        .filter(|rollup| {
+            rollup.active
+                && rollup.series_id == series_id
+                && &rollup.resolution == resolution
+                && (current_points == u64::MAX || rollup.source_points == current_points)
+        })
+        .map(|rollup| (rollup.start, rollup.end))
+        .collect();
+    let mut needed = Vec::new();
+    match resolution {
+        RollupResolution::FixedMicros(micros) => {
+            let width = fixed_shard_width(*micros)?;
+            let mut start = earliest.div_euclid(width) * width;
+            while start <= latest {
+                let end = start.saturating_add(width);
+                if end <= now_micros && !covered.contains(&(start, end)) {
+                    needed.push(ShardBounds { start, end });
+                }
+                if end <= start {
+                    break;
+                }
+                start = end;
+            }
+        }
+        RollupResolution::Calendar {
+            unit,
+            iana_timezone,
+        } => {
+            let mut cursor = earliest;
+            while cursor <= latest {
+                let (start, end) = calendar_bucket_bounds(cursor, *unit, iana_timezone)?;
+                if end <= now_micros && !covered.contains(&(start, end)) {
+                    needed.push(ShardBounds { start, end });
+                }
+                if end <= cursor {
+                    break;
+                }
+                cursor = end;
+            }
+        }
+    }
+    Ok(needed)
 }
 
 fn latest_completed_shard_end(
@@ -1725,6 +1971,40 @@ fn query_envelope(start: i64, end: i64, resolution: &RollupResolution) -> Result
             Ok((first, last))
         }
     }
+}
+
+fn published_seal_generations(manifest: &Manifest) -> HashSet<u64> {
+    manifest
+        .segments
+        .iter()
+        .map(|segment| segment.generation)
+        .collect()
+}
+
+fn raw_segment_file_name(generation: u64) -> String {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("g{generation}-{nonce}.wseg")
+}
+
+fn refuse_sealed_salvage(root: &Path) -> Result<()> {
+    let segments = root.join(SEGMENT_DIRECTORY);
+    let Ok(entries) = std::fs::read_dir(&segments) else {
+        return Ok(());
+    };
+    if entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.ends_with(".wseg"))
+    }) {
+        return Err(Error::InvalidModel(
+            "salvage does not reconstruct sealed raw segments; restore from a backup".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn rollup_file_name(
@@ -1898,8 +2178,8 @@ fn snapshot_mismatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        BackupReport, LinkOrCopy, RollupSource, SalvageStatus, Store, hard_link_or_copy,
-        hard_link_or_copy_with,
+        BackupReport, LinkOrCopy, RollupSource, SalvageStatus, Store, fail_next_seal_reclaim,
+        hard_link_or_copy, hard_link_or_copy_with,
     };
     use crate::snapshot::{PublicationStep, StagedDirectory, fail_next_publication_step};
     use crate::storage::mutate_salvage_source_after_identity_checks;
@@ -3959,5 +4239,234 @@ mod tests {
                 "{step:?} failure left a stage"
             );
         }
+    }
+
+    #[test]
+    fn seal_reclaim_reopen_reads_a_point_only_from_the_sealed_segment() {
+        let directory = tempdir().unwrap();
+        let sealed = Point::actual(1, 5 * SECOND, 5.0);
+        let log_bytes_before;
+        {
+            let mut store = Store::open(directory.path()).unwrap();
+            initialize(&mut store, Vec::new(), None);
+            let mut transaction = Transaction::new();
+            transaction.append_points(vec![sealed]);
+            store.commit(transaction).unwrap();
+            log_bytes_before = store.database().stats().unwrap().file_bytes;
+            let report = store.seal_and_reclaim().unwrap();
+            assert_eq!(report.sealed_points, 1);
+            assert_eq!(report.live_points, 0);
+            assert!(report.log_bytes < log_bytes_before);
+            assert_eq!(store.database().live_index_len(), 0);
+            assert_eq!(store.database().sealed_point_count(), 1);
+            assert_eq!(
+                store.database().query_latest(1, i64::MIN, i64::MAX),
+                vec![sealed]
+            );
+            store.close().unwrap();
+        }
+
+        let store = Store::open(directory.path()).unwrap();
+        assert_eq!(store.database().live_index_len(), 0);
+        assert_eq!(store.database().sealed_point_count(), 1);
+        assert_eq!(
+            store.database().query_latest(1, i64::MIN, i64::MAX),
+            vec![sealed]
+        );
+        assert_eq!(
+            store.database().query_history(1, i64::MIN, i64::MAX),
+            vec![sealed]
+        );
+        assert!(store.database().stats().unwrap().file_bytes < log_bytes_before);
+    }
+
+    #[test]
+    fn crash_after_seal_publish_before_reclaim_keeps_winners() {
+        let directory = tempdir().unwrap();
+        let first = Point::actual(1, 5 * SECOND, 5.0);
+        let correction = Point {
+            series_id: 1,
+            valid_time: 5 * SECOND,
+            valid_time_end: 5 * SECOND,
+            knowledge_time: 6 * SECOND,
+            change_time: 6 * SECOND,
+            run_id: 0,
+            value: 9.0,
+            quality: 0,
+            flags: 0,
+        };
+        {
+            let mut store = Store::open(directory.path()).unwrap();
+            initialize(&mut store, Vec::new(), None);
+            let mut transaction = Transaction::new();
+            transaction.append_points(vec![first, correction]);
+            store.commit(transaction).unwrap();
+            fail_next_seal_reclaim();
+            assert!(store.seal_and_reclaim().is_err());
+            store.close().unwrap();
+        }
+
+        let store = Store::open(directory.path()).unwrap();
+        assert_eq!(store.database().live_index_len(), 0);
+        assert_eq!(
+            store.database().query_latest(1, i64::MIN, i64::MAX),
+            vec![correction]
+        );
+        assert_eq!(
+            store.database().query_history(1, i64::MIN, i64::MAX),
+            vec![first, correction]
+        );
+        assert_eq!(store.database().stats().unwrap().points, 2);
+    }
+
+    #[test]
+    fn range_query_spans_sealed_history_and_the_live_tail() {
+        let directory = tempdir().unwrap();
+        let historical = Point::actual(1, 5 * SECOND, 5.0);
+        let tail = Point::actual(1, 15 * SECOND, 15.0);
+        let mut store = Store::open(directory.path()).unwrap();
+        initialize(&mut store, Vec::new(), None);
+        let mut transaction = Transaction::new();
+        transaction.append_points(vec![historical]);
+        store.commit(transaction).unwrap();
+        store.seal_and_reclaim().unwrap();
+        assert_eq!(store.database().live_index_len(), 0);
+
+        let mut transaction = Transaction::new();
+        transaction.append_points(vec![tail]);
+        store.commit(transaction).unwrap();
+        assert_eq!(store.database().live_index_len(), 1);
+        assert_eq!(
+            store.database().query_latest(1, 0, 10 * SECOND),
+            vec![historical]
+        );
+        assert_eq!(
+            store.database().query_latest(1, 10 * SECOND, 20 * SECOND),
+            vec![tail]
+        );
+        assert_eq!(
+            store.database().query_latest(1, 0, 20 * SECOND),
+            vec![historical, tail]
+        );
+    }
+
+    #[test]
+    fn maintain_after_seal_materializes_from_segments_not_the_live_index() {
+        let directory = tempdir().unwrap();
+        let resolution = RollupResolution::FixedMicros(5 * SECOND);
+        let mut store = Store::open(directory.path()).unwrap();
+        initialize(
+            &mut store,
+            vec![RollupTier {
+                resolution: resolution.clone(),
+                retain_for_micros: None,
+            }],
+            None,
+        );
+        let mut transaction = Transaction::new();
+        transaction.append_points(points());
+        store.commit(transaction).unwrap();
+        store.seal_and_reclaim().unwrap();
+        assert_eq!(store.database().live_index_len(), 0);
+        assert_eq!(store.database().sealed_point_count(), 21);
+
+        let report = store.maintain(DAY).unwrap();
+        assert_eq!(report.rollup_files_written, 1);
+        assert_eq!(store.database().live_index_len(), 0);
+        let persisted = store.query_gauge(1, 0, 20 * SECOND, &resolution).unwrap();
+        assert_eq!(persisted.source, RollupSource::Materialized);
+        let raw = store
+            .database()
+            .rollup_gauge(1, 0, 20 * SECOND + 1, 5 * SECOND, 2 * SECOND)
+            .unwrap()
+            .range(0, 20 * SECOND);
+        assert_eq!(persisted.buckets, raw);
+    }
+
+    #[test]
+    fn dirty_maintain_after_seal_queries_only_the_live_window() {
+        let directory = tempdir().unwrap();
+        let resolution = RollupResolution::FixedMicros(5 * SECOND);
+        let mut store = Store::open(directory.path()).unwrap();
+        initialize(
+            &mut store,
+            vec![RollupTier {
+                resolution: resolution.clone(),
+                retain_for_micros: None,
+            }],
+            None,
+        );
+        let mut transaction = Transaction::new();
+        transaction.append_points(points());
+        store.commit(transaction).unwrap();
+        store.maintain(DAY).unwrap();
+        let historical: Vec<_> = store
+            .active_rollups()
+            .map(|rollup| rollup.file.clone())
+            .collect();
+        store.seal_and_reclaim().unwrap();
+        assert_eq!(store.database().live_index_len(), 0);
+
+        let mut transaction = Transaction::new();
+        transaction.append_points(vec![Point::actual(1, DAY + 5 * SECOND, 21.0)]);
+        store.commit(transaction).unwrap();
+        assert_eq!(store.database().live_index_len(), 1);
+        let report = store.maintain(2 * DAY).unwrap();
+        assert_eq!(report.rollup_files_written, 1);
+        assert!(
+            historical
+                .iter()
+                .all(|file| store.active_rollups().any(|rollup| &rollup.file == file))
+        );
+        assert_eq!(store.database().live_index_len(), 1);
+        assert_eq!(
+            store
+                .query_gauge(1, 0, 2 * DAY, &resolution)
+                .unwrap()
+                .source,
+            RollupSource::Materialized
+        );
+    }
+
+    #[test]
+    fn identified_commit_still_deduplicates_after_seal_and_reclaim() {
+        let directory = tempdir().unwrap();
+        let sample = Point::actual(1, 6 * SECOND, 6.0);
+        let mut store = Store::open(directory.path()).unwrap();
+        initialize(&mut store, Vec::new(), None);
+        let mut transaction = Transaction::new();
+        transaction.append_points(vec![sample]).with_commit_id(7);
+        assert!(!store.commit(transaction).unwrap().deduplicated);
+        store.seal_and_reclaim().unwrap();
+        assert_eq!(store.database().live_index_len(), 0);
+
+        let mut retry = Transaction::new();
+        retry.append_points(vec![sample]).with_commit_id(7);
+        assert!(store.commit(retry).unwrap().deduplicated);
+        assert_eq!(store.database().live_index_len(), 0);
+        assert_eq!(store.database().query_history(1, 0, DAY), vec![sample]);
+    }
+
+    #[test]
+    fn salvage_refuses_a_store_with_sealed_raw_segments() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        let target = directory.path().join("salvaged");
+        {
+            let mut store = Store::open(&source).unwrap();
+            initialize(&mut store, Vec::new(), None);
+            let mut transaction = Transaction::new();
+            transaction.append_points(vec![Point::actual(1, SECOND, 1.0)]);
+            store.commit(transaction).unwrap();
+            store.seal_and_reclaim().unwrap();
+            store.close().unwrap();
+        }
+        let error = Store::salvage_from(&source, &target).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not reconstruct sealed raw segments")
+        );
+        assert!(!target.exists());
     }
 }

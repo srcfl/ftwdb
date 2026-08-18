@@ -39,7 +39,9 @@ needs retention or a newly closed shard, maintain publishes nothing.
 
 When a series does need work:
 
-1. compute every completed configured bucket from its latest revisions;
+1. compute completed configured buckets from the latest revisions in the
+   unfinished time window — sealed segments plus the live tail — rather than
+   scanning every historical point in RAM;
 2. write and checksum an immutable `.rseg` file;
 3. sync the file and publish its no-replace hard link;
 4. sync the rollup directory;
@@ -83,6 +85,7 @@ range plus the series maximum-gap context, rather than rescanning all history.
 
 Raw retention is currently a safety report, not a deletion operation. A series
 is eligible only when every configured tier is current and covers all raw data
-through the cutoff. The active log mixes catalog records and points, so actual
-reclamation remains disabled until M4 compaction can rewrite retained records
-without losing metadata or provenance.
+through the cutoff. `Store::seal_and_reclaim` is the separate compaction that
+moves live raw points into an immutable segment and rewrites `active.wlog` to
+catalog plus identity receipts; it does not delete retained history. Physical
+raw deletion stays gated until retention can drop sealed segment coverage.

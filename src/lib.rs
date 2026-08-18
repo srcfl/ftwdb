@@ -31,7 +31,7 @@ mod workload;
 pub use aggregate::{CounterAggregate, GaugeAggregate, Sample};
 pub use catalog::{Catalog, CatalogStats};
 pub use error::{Error, Result};
-pub use manifest::RollupDescriptor;
+pub use manifest::{RawSegmentDescriptor, RollupDescriptor};
 pub use model::{
     CalendarUnit, Entity, EntityId, Plan, PlanStatus, Properties, PropertyValue, Relation,
     RelationId, RollupPolicy, RollupResolution, RollupTier, Run, RunId, RunKind, RunStatus,
@@ -47,7 +47,7 @@ pub use storage::{
 };
 pub use store::{
     BackupReport, IntegrityReport, MaintenanceReport, RestoreReport, RetentionGate, RollupQuery,
-    RollupSource, SalvageReport, SalvageStatus, Store,
+    RollupSource, SalvageReport, SalvageStatus, SealReport, Store,
 };
 pub use transaction::{IngressIdentity, Transaction};
 pub use tsbs::{TsbsIotLoadReport, load_tsbs_iot};

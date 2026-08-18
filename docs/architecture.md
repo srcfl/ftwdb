@@ -45,11 +45,15 @@ database/
     MANIFEST.00000000000000000001
   rollups/
     g1-s42-f300000000-*.rseg
+  segments/
+    g2-*.wseg
 ```
 
-This is the current M3 directory shape. Raw immutable segments exist as a
-standalone format but are not yet installed into the manifest or used to
-reclaim the mixed active log.
+This is the current directory shape. Immutable raw segments are published
+through the same manifest generations as rollups. After `seal_and_reclaim`,
+`active.wlog` holds catalog records, identity receipts, and the unsealed tail.
+Open replays only that tail; older raw points are read from sealed segment
+files.
 
 ## Write path
 
@@ -76,9 +80,10 @@ Readers use a stable manifest snapshot. The planner:
 4. merges immutable blocks and recent committed frames;
 5. applies revision winner rules `(knowledge_time, change_time, append_order)`.
 
-The active log currently rebuilds an in-memory per-series index on open.
-Materialized rollups use verified immutable files and a process-local cache;
-M4 moves raw reads to sparse segment indexes and bounds both caches.
+Open rebuilds an in-memory per-series index from the unsealed tail only.
+Sealed raw points stay on the sparse segment index and are merged at query
+time. Materialized rollups use verified immutable files and a process-local
+cache. A full sparse on-disk tail index remains later M4 hardening.
 
 ## Crash and corruption model
 

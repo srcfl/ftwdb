@@ -9,7 +9,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAGIC: &[u8; 8] = b"WMAN0001";
-const VERSION: u16 = 1;
+const VERSION_V1: u16 = 1;
+const VERSION: u16 = 2;
 const HEADER_BYTES: usize = 24;
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 const PREFIX: &str = "MANIFEST.";
@@ -33,10 +34,35 @@ pub struct RollupDescriptor {
     pub active: bool,
 }
 
+/// One immutable raw-point segment published through a manifest generation.
+///
+/// `generation` matches the seal checkpoint written to `active.wlog` before
+/// this descriptor becomes visible, so a reopen can drop already-sealed
+/// frames from the live index even when reclaim has not yet rewritten the
+/// log.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RawSegmentDescriptor {
+    pub file: String,
+    pub generation: u64,
+    pub points: u64,
+    pub source_commit: u64,
+    pub source_points: u64,
+    pub min_valid_time: i64,
+    pub max_valid_time: i64,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct Manifest {
     pub generation: u64,
     pub rollups: Vec<RollupDescriptor>,
+    #[serde(default)]
+    pub segments: Vec<RawSegmentDescriptor>,
+}
+
+#[derive(Deserialize)]
+struct ManifestV1 {
+    generation: u64,
+    rollups: Vec<RollupDescriptor>,
 }
 
 impl Manifest {
@@ -179,6 +205,20 @@ pub(crate) fn referenced_rollup_files(
     Ok(referenced)
 }
 
+/// Every raw-segment filename referenced by the given retained generations.
+pub(crate) fn referenced_segment_files(
+    retained: &[(u64, PathBuf)],
+) -> Result<std::collections::HashSet<String>> {
+    let mut referenced = std::collections::HashSet::new();
+    for (generation, path) in retained {
+        let manifest = read_manifest(path, *generation)?;
+        for segment in manifest.segments {
+            referenced.insert(segment.file);
+        }
+    }
+    Ok(referenced)
+}
+
 fn read_manifest(path: &Path, expected_generation: u64) -> Result<Manifest> {
     let mut file = open_regular_file_read_only(path)?;
     let file_len = file.metadata()?.len();
@@ -191,7 +231,7 @@ fn read_manifest(path: &Path, expected_generation: u64) -> Result<Manifest> {
         return corruption("invalid manifest magic");
     }
     let version = u16::from_le_bytes(header[8..10].try_into().unwrap());
-    if version != VERSION {
+    if version != VERSION && version != VERSION_V1 {
         return corruption("unsupported manifest version");
     }
     if hash(&header[..20]) != u32::from_le_bytes(header[20..24].try_into().unwrap()) {
@@ -206,8 +246,7 @@ fn read_manifest(path: &Path, expected_generation: u64) -> Result<Manifest> {
     if hash(&payload) != u32::from_le_bytes(header[16..20].try_into().unwrap()) {
         return corruption("manifest payload checksum mismatch");
     }
-    let manifest: Manifest = postcard::from_bytes(&payload)
-        .map_err(|error| Error::Serialization(format!("manifest decode failed: {error}")))?;
+    let manifest = decode_manifest_payload(&payload, version)?;
     if manifest.generation != expected_generation {
         return corruption("manifest generation does not match its filename");
     }
@@ -215,21 +254,48 @@ fn read_manifest(path: &Path, expected_generation: u64) -> Result<Manifest> {
     Ok(manifest)
 }
 
+fn decode_manifest_payload(payload: &[u8], version: u16) -> Result<Manifest> {
+    if version == VERSION_V1 {
+        let parsed: ManifestV1 = postcard::from_bytes(payload)
+            .map_err(|error| Error::Serialization(format!("manifest decode failed: {error}")))?;
+        return Ok(Manifest {
+            generation: parsed.generation,
+            rollups: parsed.rollups,
+            segments: Vec::new(),
+        });
+    }
+    postcard::from_bytes(payload)
+        .map_err(|error| Error::Serialization(format!("manifest decode failed: {error}")))
+}
+
 fn validate_manifest(manifest: &Manifest) -> Result<()> {
     for rollup in &manifest.rollups {
-        let path = Path::new(&rollup.file);
-        if path.components().count() != 1
-            || !matches!(path.components().next(), Some(Component::Normal(_)))
-        {
-            return Err(Error::InvalidModel(
-                "manifest rollup filename must be a single safe path component".to_owned(),
-            ));
-        }
+        validate_safe_filename(&rollup.file, "manifest rollup filename")?;
         if rollup.series_id == 0 || rollup.end <= rollup.start {
             return Err(Error::InvalidModel(
                 "manifest rollup descriptor has invalid identity or bounds".to_owned(),
             ));
         }
+    }
+    for segment in &manifest.segments {
+        validate_safe_filename(&segment.file, "manifest raw segment filename")?;
+        if segment.points == 0 || segment.max_valid_time < segment.min_valid_time {
+            return Err(Error::InvalidModel(
+                "manifest raw segment descriptor has invalid coverage".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_safe_filename(file: &str, label: &str) -> Result<()> {
+    let path = Path::new(file);
+    if path.components().count() != 1
+        || !matches!(path.components().next(), Some(Component::Normal(_)))
+    {
+        return Err(Error::InvalidModel(format!(
+            "{label} must be a single safe path component"
+        )));
     }
     Ok(())
 }
@@ -276,6 +342,7 @@ mod tests {
                 source_points: 10,
                 active: true,
             }],
+            segments: Vec::new(),
         }
     }
 

@@ -495,7 +495,7 @@ fn reconcile_points(
 
     let mut observed_counts = BTreeMap::<ShadowPointKey, usize>::new();
     for (series_id, span) in spans {
-        let series_points = database.series_points(series_id);
+        let series_points = database.query_history(series_id, span.start, span.end);
         report.scanned_points = report
             .scanned_points
             .checked_add(series_points.len())
@@ -508,11 +508,7 @@ fn reconcile_points(
             limits.max_scanned_points,
             ReconcileLimit::ScannedPoints,
         )?;
-        for point in series_points
-            .iter()
-            .filter(|point| point.valid_time >= span.start && point.valid_time < span.end)
-            .copied()
-        {
+        for point in series_points {
             report.observed_points = report.observed_points.checked_add(1).ok_or(
                 ShadowReconcileError::LimitExceeded {
                     limit: ReconcileLimit::ObservedPoints,

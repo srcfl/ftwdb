@@ -50,4 +50,7 @@ data-driven by the energy corpus rather than globally fixed.
 Segment creation sorts a snapshot in memory. Reads are bounded per compressed
 block plus returned result, but large compactions still need an external/streamed
 merge path. Segments currently contain raw points only; catalog state remains
-in the commit log and the M3 manifest coordinates segment publication.
+in the commit log. The store manifest publishes each sealed segment, and
+`query_latest` / `query_history` / `query_run` merge those files with the
+unsealed tail. After reclaim, open does not reload sealed points into the live
+index.

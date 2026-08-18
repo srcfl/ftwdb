@@ -4,7 +4,7 @@ use crc32fast::hash;
 use lz4_flex::block::{compress_prepend_size, decompress};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -187,7 +187,7 @@ impl Segment {
     }
 
     /// Reads one series/time range, touching only overlapping indexed blocks.
-    pub fn query(&mut self, series_id: u64, start: i64, end: i64) -> Result<Vec<Point>> {
+    pub fn query(&self, series_id: u64, start: i64, end: i64) -> Result<Vec<Point>> {
         let entries: Vec<_> = self
             .index
             .iter()
@@ -198,7 +198,7 @@ impl Segment {
             .collect();
         let mut result = Vec::new();
         for entry in entries {
-            let points = read_block(&mut self.file, entry)?;
+            let points = read_block(&self.file, entry)?;
             result.extend(
                 points
                     .into_iter()
@@ -206,6 +206,48 @@ impl Segment {
             );
         }
         Ok(result)
+    }
+
+    /// Inclusive valid-time bounds for one series, from the sparse index.
+    #[must_use]
+    pub fn series_bounds(&self, series_id: u64) -> Option<(i64, i64)> {
+        let mut min_time = i64::MAX;
+        let mut max_time = i64::MIN;
+        for entry in &self.index {
+            if entry.series_id == series_id {
+                min_time = min_time.min(entry.min_time);
+                max_time = max_time.max(entry.max_time);
+            }
+        }
+        (min_time <= max_time).then_some((min_time, max_time))
+    }
+
+    #[must_use]
+    pub fn series_ids(&self) -> Vec<u64> {
+        let mut ids = Vec::new();
+        for entry in &self.index {
+            if ids.last() != Some(&entry.series_id) {
+                ids.push(entry.series_id);
+            }
+        }
+        ids
+    }
+
+    #[must_use]
+    pub fn series_point_count(&self, series_id: u64) -> u64 {
+        self.index
+            .iter()
+            .filter(|entry| entry.series_id == series_id)
+            .map(|entry| u64::from(entry.points))
+            .sum()
+    }
+
+    /// True when this segment's sparse index overlaps the requested range.
+    #[must_use]
+    pub fn overlaps(&self, series_id: u64, start: i64, end: i64) -> bool {
+        self.index.iter().any(|entry| {
+            entry.series_id == series_id && entry.max_time >= start && entry.min_time < end
+        })
     }
 }
 
@@ -496,10 +538,9 @@ fn split_columns(encoded: &[u8], offset: u64) -> Result<Vec<&[u8]>> {
     Ok(columns)
 }
 
-fn read_block(file: &mut File, entry: IndexEntry) -> Result<Vec<Point>> {
-    file.seek(SeekFrom::Start(entry.offset))?;
+fn read_block(file: &File, entry: IndexEntry) -> Result<Vec<Point>> {
     let mut header = [0_u8; BLOCK_HEADER_BYTES];
-    file.read_exact(&mut header)?;
+    file.read_exact_at(&mut header, entry.offset)?;
     if &header[..4] != BLOCK_MAGIC {
         return corruption(entry.offset, "invalid block magic");
     }
@@ -536,7 +577,7 @@ fn read_block(file: &mut File, entry: IndexEntry) -> Result<Vec<Point>> {
         return corruption(entry.offset, "block uncompressed length is out of bounds");
     }
     let mut payload = vec![0_u8; payload_len];
-    file.read_exact(&mut payload)?;
+    file.read_exact_at(&mut payload, entry.offset + BLOCK_HEADER_BYTES as u64)?;
     if hash(&payload) != expected_payload_crc {
         return corruption(entry.offset, "block payload checksum mismatch");
     }
@@ -872,7 +913,7 @@ mod tests {
         assert!(stats.blocks > 2);
         assert!(stats.stored_bytes < stats.logical_point_bytes / 2);
 
-        let mut segment = Segment::open(&path).unwrap();
+        let segment = Segment::open(&path).unwrap();
         assert_eq!(segment.stats(), stats);
         let selected = segment.query(2, 123_000_000, 140_000_000).unwrap();
         let expected: Vec<_> = input
@@ -900,7 +941,7 @@ mod tests {
         file.write_all(&[0xAA]).unwrap();
         file.sync_all().unwrap();
 
-        let mut segment = Segment::open(&path).unwrap();
+        let segment = Segment::open(&path).unwrap();
         assert!(matches!(
             segment.query(1, i64::MIN, i64::MAX),
             Err(Error::Corruption { .. })
@@ -949,7 +990,7 @@ mod tests {
         // under the index's compression-ratio bound, so the block is only
         // rejected when its columns are decoded.
         claim_first_block_points(&path, 1_000);
-        let mut segment = Segment::open(&path).unwrap();
+        let segment = Segment::open(&path).unwrap();
         assert!(matches!(
             segment.query(1, i64::MIN, i64::MAX),
             Err(Error::Corruption { .. })
@@ -987,7 +1028,7 @@ mod tests {
         // structural bound on the header length must reject the block before
         // any decompression buffer is sized.
         tamper_first_block_lz4(&path, Some(u32::MAX), u32::MAX);
-        let mut segment = Segment::open(&path).unwrap();
+        let segment = Segment::open(&path).unwrap();
         assert!(matches!(
             segment.query(1, i64::MIN, i64::MAX),
             Err(Error::Corruption { .. })
@@ -1013,7 +1054,7 @@ mod tests {
         tamper_first_block_lz4(&path, Some(claimed_length), claimed_length);
         claim_first_block_points(&path, claimed_points);
 
-        let mut segment = Segment::open(&path).unwrap();
+        let segment = Segment::open(&path).unwrap();
         assert!(matches!(
             segment.query(1, i64::MIN, i64::MAX),
             Err(Error::Corruption { reason, .. }) if reason.contains("exceeds LZ4 capacity")
@@ -1029,7 +1070,7 @@ mod tests {
         // Only the in-payload size prefix claims ~4 GiB; it must be rejected
         // against the validated header length instead of sizing an allocation.
         tamper_first_block_lz4(&path, None, u32::MAX);
-        let mut segment = Segment::open(&path).unwrap();
+        let segment = Segment::open(&path).unwrap();
         assert!(matches!(
             segment.query(1, i64::MIN, i64::MAX),
             Err(Error::Corruption { .. })

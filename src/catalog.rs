@@ -81,6 +81,85 @@ impl Catalog {
         }
     }
 
+    /// Catalog records in an apply-safe order so a compact log can rebuild
+    /// the current identity set without replaying historical frames.
+    pub(crate) fn snapshot_records(&self) -> Vec<Record> {
+        let mut records = Vec::with_capacity(
+            self.entities.len()
+                + self.relations.len()
+                + self.series.len()
+                + self.runs.len()
+                + self.plans.len(),
+        );
+        let mut remaining_entities: BTreeSet<_> = self.entities.keys().copied().collect();
+        while !remaining_entities.is_empty() {
+            let ready: Vec<_> = remaining_entities
+                .iter()
+                .copied()
+                .filter(|id| {
+                    self.entities[id]
+                        .parent
+                        .is_none_or(|parent| !remaining_entities.contains(&parent))
+                })
+                .collect();
+            if ready.is_empty() {
+                break;
+            }
+            for id in ready {
+                remaining_entities.remove(&id);
+                records.push(Record::Entity(self.entities[&id].clone()));
+            }
+        }
+        for relation in self.relations.values() {
+            records.push(Record::Relation(relation.clone()));
+        }
+        for series in self.series.values() {
+            records.push(Record::Series(series.clone()));
+        }
+        let mut remaining_runs: BTreeSet<_> = self.runs.keys().copied().collect();
+        while !remaining_runs.is_empty() {
+            let ready: Vec<_> = remaining_runs
+                .iter()
+                .copied()
+                .filter(|id| {
+                    let run = &self.runs[id];
+                    run.parent_run
+                        .is_none_or(|parent| !remaining_runs.contains(&parent))
+                        && run
+                            .input_snapshot
+                            .is_none_or(|input| !remaining_runs.contains(&input))
+                })
+                .collect();
+            if ready.is_empty() {
+                break;
+            }
+            for id in ready {
+                remaining_runs.remove(&id);
+                records.push(Record::Run(self.runs[&id].clone()));
+            }
+        }
+        let mut remaining_plans: BTreeSet<_> = self.plans.keys().copied().collect();
+        while !remaining_plans.is_empty() {
+            let ready: Vec<_> = remaining_plans
+                .iter()
+                .copied()
+                .filter(|id| {
+                    self.plans[id]
+                        .supersedes
+                        .is_none_or(|previous| !remaining_plans.contains(&previous))
+                })
+                .collect();
+            if ready.is_empty() {
+                break;
+            }
+            for id in ready {
+                remaining_plans.remove(&id);
+                records.push(Record::Plan(self.plans[&id].clone()));
+            }
+        }
+        records
+    }
+
     pub(crate) fn validate_and_apply(&self, records: &[Record]) -> Result<Self> {
         let mut candidate = self.clone();
         for record in records {
