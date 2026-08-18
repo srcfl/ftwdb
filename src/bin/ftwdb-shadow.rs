@@ -60,8 +60,18 @@ fn run() -> Result<(), Box<dyn Error>> {
     let report = result?;
     shutdown?;
     eprintln!(
-        "ftwdb-shadow: stopped accepted_clients={} peer_auth_failures={} client_errors={}",
-        report.accepted_clients, report.peer_auth_failures, report.client_errors
+        "ftwdb-shadow: stopped accepted_clients={} peer_auth_failures={} client_errors={} overload_count={} protocol_error_count={} database_bytes={} database_points={} database_commits={} recovered_tail_bytes={} sync_policy={} last_ack_durable={}",
+        report.accepted_clients,
+        report.peer_auth_failures,
+        report.client_errors,
+        report.overload_count,
+        report.protocol_error_count,
+        report.database_bytes,
+        report.database_points,
+        report.database_commits,
+        report.recovered_tail_bytes,
+        report.sync_policy,
+        report.last_ack_durable
     );
     Ok(())
 }

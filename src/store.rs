@@ -316,6 +316,10 @@ impl Store {
         &self.database
     }
 
+    pub fn stored_bytes(&self) -> Result<u64> {
+        directory_bytes(&self.root)
+    }
+
     #[must_use]
     pub const fn manifest_generation(&self) -> u64 {
         self.manifest.generation
@@ -4841,6 +4845,50 @@ mod tests {
         );
         assert_eq!(salvaged.database().sealed_point_count(), 1);
         assert_eq!(directory_snapshot(&source), source_before);
+    }
+
+    #[test]
+    fn salvage_then_maintain_query_gauge_matches_raw_winners() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        let salvaged_path = directory.path().join("salvaged");
+        let resolution = RollupResolution::FixedMicros(5 * SECOND);
+        {
+            let mut store = Store::open(&source).unwrap();
+            initialize(
+                &mut store,
+                vec![RollupTier {
+                    resolution: resolution.clone(),
+                    retain_for_micros: None,
+                }],
+                None,
+            );
+            let mut transaction = Transaction::new();
+            transaction.append_points(points());
+            store.commit(transaction).unwrap();
+            store.seal_and_reclaim().unwrap();
+            assert_eq!(store.database().live_index_len(), 0);
+            store.close().unwrap();
+        }
+
+        Store::salvage_from(&source, &salvaged_path).unwrap();
+        let mut salvaged = Store::open(&salvaged_path).unwrap();
+        assert!(
+            salvaged.active_rollups().next().is_none(),
+            "salvage must drop rollups so maintain has to rebuild them"
+        );
+        let report = salvaged.maintain(DAY).unwrap();
+        assert_eq!(report.rollup_files_written, 1);
+        let persisted = salvaged
+            .query_gauge(1, 0, 20 * SECOND, &resolution)
+            .unwrap();
+        assert_eq!(persisted.source, RollupSource::Materialized);
+        let raw = salvaged
+            .database()
+            .rollup_gauge(1, 0, 20 * SECOND + 1, 5 * SECOND, 2 * SECOND)
+            .unwrap()
+            .range(0, 20 * SECOND);
+        assert_eq!(persisted.buckets, raw);
     }
 
     #[test]

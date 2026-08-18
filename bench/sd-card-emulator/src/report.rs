@@ -14,6 +14,22 @@ pub struct VerifyInput<'a> {
     pub writer_exit: Option<i32>,
     pub writer_signal: Option<i32>,
     pub checksum_ok: Option<bool>,
+    pub ack_log: Option<&'a Path>,
+    pub max_in_flight_commits: u64,
+    pub max_in_flight_points: u64,
+}
+
+impl<'a> VerifyInput<'a> {
+    fn mid_commit(&self) -> bool {
+        self.ack_log.is_some()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AckWatermark {
+    pub commits: u64,
+    pub points: u64,
+    pub durable: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -31,6 +47,12 @@ pub struct FaultRunReport {
     pub recovered_commits: u64,
     pub recovered_points: u64,
     pub recovered_tail_bytes: u64,
+    pub in_flight_commits: u64,
+    pub in_flight_points: u64,
+    pub contains_every_ack: bool,
+    pub has_at_most_one_unacknowledged: bool,
+    pub silent_partial_frame: bool,
+    pub write_amplification: f64,
     pub check_store_ok: bool,
     pub checksum_ok: Option<bool>,
     pub injected_operations: u64,
@@ -45,6 +67,38 @@ pub struct FaultRunReport {
     pub emulator_version: String,
     pub emulator_commit: String,
     pub passed: bool,
+}
+
+pub fn last_durable_ack(path: &Path) -> Result<AckWatermark, VerifyError> {
+    let contents = fs::read_to_string(path)?;
+    let mut last = None;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if string(&value, "format").ok() != Some("ftwdb-ack-watermark-v1") {
+            continue;
+        }
+        let durable = value
+            .get("durable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !durable {
+            continue;
+        }
+        last = Some(AckWatermark {
+            commits: unsigned(&value, "commits")?,
+            points: unsigned(&value, "points")?,
+            durable,
+        });
+    }
+    last.ok_or_else(|| {
+        VerifyError::Invalid("ack log has no complete durable watermark line".to_owned())
+    })
 }
 
 pub fn verify(input: &VerifyInput<'_>) -> Result<FaultRunReport, VerifyError> {
@@ -64,6 +118,8 @@ pub fn verify(input: &VerifyInput<'_>) -> Result<FaultRunReport, VerifyError> {
     let recovered_points = unsigned(&check, "raw_points")?;
     let recovered_commits = unsigned(&check, "raw_commits")?;
     let recovered_tail_bytes = parse_recovered_tail(&fs::read_to_string(input.inspect)?)?;
+    let check_tail_bytes = unsigned(&check, "raw_recovered_tail_bytes").unwrap_or(0);
+    let recovered_tail_kind = string(&check, "raw_recovered_tail").unwrap_or("none");
     let injected_torn_operations = unsigned(stats, "injected_torn_operations")?;
     let injected_torn_bytes = unsigned(stats, "injected_torn_bytes")?;
     let power_torn_operations = unsigned(stats, "torn_operations")?;
@@ -75,9 +131,41 @@ pub fn verify(input: &VerifyInput<'_>) -> Result<FaultRunReport, VerifyError> {
     let dropped_operations = unsigned(stats, "dropped_operations")?;
     let dropped_bytes = unsigned(stats, "dropped_bytes")?;
     let checksum_passed = input.checksum_ok != Some(false);
-    let passed = recovered_points == input.expected_points
-        && recovered_commits == input.expected_commits
-        && checksum_passed;
+    let write_amplification = stats
+        .get("write_amplification")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+
+    let (acknowledged_commits, acknowledged_points) = if let Some(ack_log) = input.ack_log {
+        let ack = last_durable_ack(ack_log)?;
+        (ack.commits, ack.points)
+    } else {
+        (input.expected_commits, input.expected_points)
+    };
+
+    let contains_every_ack =
+        recovered_commits >= acknowledged_commits && recovered_points >= acknowledged_points;
+    let in_flight_commits = recovered_commits.saturating_sub(acknowledged_commits);
+    let in_flight_points = recovered_points.saturating_sub(acknowledged_points);
+    let has_at_most_one_unacknowledged = in_flight_commits <= input.max_in_flight_commits
+        && in_flight_points <= input.max_in_flight_points;
+    let silent_partial_frame = check_tail_bytes != recovered_tail_bytes
+        || !matches!(
+            recovered_tail_kind,
+            "none" | "incomplete-header" | "incomplete-payload"
+        )
+        || (recovered_tail_kind == "none" && recovered_tail_bytes != 0);
+
+    let passed = if input.mid_commit() {
+        contains_every_ack
+            && has_at_most_one_unacknowledged
+            && !silent_partial_frame
+            && checksum_passed
+    } else {
+        recovered_points == acknowledged_points
+            && recovered_commits == acknowledged_commits
+            && checksum_passed
+    };
 
     Ok(FaultRunReport {
         schema_version: "ftw-sd-fault-run-v1",
@@ -88,11 +176,17 @@ pub fn verify(input: &VerifyInput<'_>) -> Result<FaultRunReport, VerifyError> {
         fault_operation: optional_unsigned(stats, "last_fault_operation"),
         writer_exit: input.writer_exit,
         writer_signal: input.writer_signal,
-        acknowledged_commits: input.expected_commits,
-        acknowledged_points: input.expected_points,
+        acknowledged_commits,
+        acknowledged_points,
         recovered_commits,
         recovered_points,
         recovered_tail_bytes,
+        in_flight_commits,
+        in_flight_points,
+        contains_every_ack,
+        has_at_most_one_unacknowledged,
+        silent_partial_frame,
+        write_amplification,
         check_store_ok: true,
         checksum_ok: input.checksum_ok,
         injected_operations: injected_eio
@@ -263,6 +357,9 @@ mod tests {
             writer_exit: Some(1),
             writer_signal: None,
             checksum_ok: Some(true),
+            ack_log: None,
+            max_in_flight_commits: 0,
+            max_in_flight_points: 0,
         };
         let report = verify(&input).unwrap();
         assert!(report.passed);
@@ -276,6 +373,119 @@ mod tests {
         })
         .unwrap();
         assert!(!failed.passed);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn last_durable_ack_skips_a_truncated_final_line() {
+        let directory = std::env::temp_dir().join(format!("ftw-sd-ack-log-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("ack.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"format\":\"ftwdb-ack-watermark-v1\",\"commits\":1,\"points\":10,\"durable\":true}\n",
+                "{\"format\":\"ftwdb-ack-watermark-v1\",\"commits\":2,\"points\":20,\"durable\":true}\n",
+                "{\"format\":\"ftwdb-ack-watermark-v1\",\"commits\":3,\"poi"
+            ),
+        )
+        .unwrap();
+        let ack = last_durable_ack(&path).unwrap();
+        assert_eq!(ack.commits, 2);
+        assert_eq!(ack.points, 20);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn mid_commit_verify_accepts_one_in_flight_batch_and_rejects_lost_acks() {
+        let directory =
+            std::env::temp_dir().join(format!("ftw-sd-mid-commit-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let emulator = directory.join("emulator.json");
+        let check = directory.join("check.json");
+        let inspect = directory.join("inspect.txt");
+        let ack_log = directory.join("ack.jsonl");
+        fs::write(
+            &emulator,
+            serde_json::to_vec(&json!({
+                "schema_version": "ftw-sd-emulator-stats-v1",
+                "profile": "healthy",
+                "seed": 1,
+                "injected_torn_operations": 0,
+                "injected_torn_bytes": 0,
+                "torn_operations": 0,
+                "torn_bytes": 0,
+                "injected_eio_operations": 0,
+                "injected_corruptions": 0,
+                "false_flushes": 0,
+                "power_losses": 1,
+                "dropped_operations": 0,
+                "dropped_bytes": 0,
+                "reordered_operations": 0,
+                "max_erase_count": 0,
+                "bad_blocks": 0,
+                "write_amplification": 1.5,
+                "emulator_version": "0.1.0",
+                "emulator_commit": "abc"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &check,
+            b"{\"format\":\"ftwdb-integrity-v1\",\"raw_points\":30,\"raw_commits\":3,\"raw_recovered_tail_bytes\":7,\"raw_recovered_tail\":\"incomplete-header\"}\n",
+        )
+        .unwrap();
+        fs::write(&inspect, b"recovered_tail_bytes: 7\n").unwrap();
+        fs::write(
+            &ack_log,
+            "{\"format\":\"ftwdb-ack-watermark-v1\",\"commits\":2,\"points\":20,\"durable\":true}\n",
+        )
+        .unwrap();
+        let input = VerifyInput {
+            emulator: &emulator,
+            check: &check,
+            inspect: &inspect,
+            expected_points: 0,
+            expected_commits: 0,
+            writer_exit: Some(1),
+            writer_signal: None,
+            checksum_ok: Some(true),
+            ack_log: Some(&ack_log),
+            max_in_flight_commits: 1,
+            max_in_flight_points: 10,
+        };
+        let report = verify(&input).unwrap();
+        assert!(report.passed);
+        assert!(report.contains_every_ack);
+        assert!(report.has_at_most_one_unacknowledged);
+        assert!(!report.silent_partial_frame);
+        assert_eq!(report.in_flight_commits, 1);
+        assert_eq!(report.write_amplification, 1.5);
+
+        fs::write(
+            &ack_log,
+            "{\"format\":\"ftwdb-ack-watermark-v1\",\"commits\":4,\"points\":40,\"durable\":true}\n",
+        )
+        .unwrap();
+        let lost = verify(&input).unwrap();
+        assert!(!lost.passed);
+        assert!(!lost.contains_every_ack);
+
+        fs::write(
+            &ack_log,
+            "{\"format\":\"ftwdb-ack-watermark-v1\",\"commits\":1,\"points\":10,\"durable\":true}\n",
+        )
+        .unwrap();
+        fs::write(
+            &check,
+            b"{\"format\":\"ftwdb-integrity-v1\",\"raw_points\":40,\"raw_commits\":4,\"raw_recovered_tail_bytes\":0,\"raw_recovered_tail\":\"none\"}\n",
+        )
+        .unwrap();
+        fs::write(&inspect, b"recovered_tail_bytes: 0\n").unwrap();
+        let extra = verify(&input).unwrap();
+        assert!(!extra.passed);
+        assert!(!extra.has_at_most_one_unacknowledged);
         fs::remove_dir_all(directory).unwrap();
     }
 }

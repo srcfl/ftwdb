@@ -60,6 +60,28 @@ kind and its text and source also include the hard-link failure.
 This is a local consistent snapshot, not yet a remote backup policy. Encryption,
 incremental upload, retention, and salvage of a corrupted source remain open.
 
+## Scheduled snapshot runbook
+
+Keep the scheduler on the host, not on the SD card. Cron or a systemd timer is
+enough; do not add a second writer inside the sidecar.
+
+1. Stop `ftwdb-shadow`, or take the store's exclusive writer lock by stopping
+   every process that can append. A backup opens the source read-only under a
+   shared lock, so a live sidecar would block or race with the snapshot.
+2. Run `ftw backup <store-directory> <absent-destination>` on a path that is
+   **not** on the same card as the live store.
+3. Copy that destination off the card (rsync, `cp` to USB/NAS, or an existing
+   host backup job). Keep the on-host snapshot until the copy verifies.
+4. Restore-verify: `ftw restore <backup-directory> <absent-target>` to a new
+   directory, then confirm `source_snapshot_crc32` equals
+   `destination_snapshot_crc32` and run `ftw check-store` on the target.
+5. Restart the sidecar only after the backup JSON and CRC check succeed.
+
+Example timer (systemd): stop the sidecar, run backup to `/var/backups/ftwdb`,
+copy that tree off-card, restore-verify to a throwaway directory, then start
+the sidecar again. Example cron: the same steps in a root script invoked from
+`crontab` on the host. Neither scheduler replaces physical media tests.
+
 ## Strict restore
 
 `ftw restore <backup> <absent-target>` restores only a fully valid snapshot.
@@ -202,6 +224,11 @@ real ext4 filesystem on the 64 MiB NBD profile, writes durable fixture batches
 until `ENOSPC`, then checks the readable durable prefix. See the emulator
 README for its command, output files, and pass result. This does not replace
 the M4 physical SD-card power-cut release gate.
+
+[`linux-mid-commit.sh`](../bench/sd-card-emulator/linux-mid-commit.sh) cuts
+NBD power **during** a live `Durability::Always` ingest and checks recovered
+counts against the last fsynced ACK, not the full fixture. It needs Linux,
+root, and NBD. Host unit tests cover the watermark verifier without a device.
 
 ## Command-line checks
 

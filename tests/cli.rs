@@ -270,6 +270,7 @@ fn usage_errors_exit_two_on_stderr_without_creating_files() {
             "store",
             "--batch-points",
         ],
+        &["bench-real-fixture", "fixture.csv.gz", "store", "--ack-log"],
         &[
             "bench-real-fixture",
             "fixture.csv.gz",

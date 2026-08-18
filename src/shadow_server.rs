@@ -7,13 +7,13 @@
 
 use crate::shadow_protocol::{
     self, Ack, AckKind, CommitBatchRequest, ErrorCode, ErrorResponse, HealthResponse, HealthStatus,
-    HelloResponse, Request, Response, WireMessage,
+    HelloResponse, Request, Response, SyncPolicy, WireMessage,
 };
 use crate::shadow_runtime::{
     AckWaitError, FlushSubmitError, ShadowFlushFailure, ShadowRuntimeState, ShadowSubmitter,
     ShadowWrite, ShadowWriteFailure, SubmitError,
 };
-use crate::{Error, IngressIdentity};
+use crate::{Durability, Error, IngressIdentity};
 use std::fmt;
 use std::fs::{self, DirBuilder, FileType};
 use std::io::{self, Read};
@@ -78,6 +78,20 @@ pub struct ShadowServerReport {
     pub accepted_clients: u64,
     pub peer_auth_failures: u64,
     pub client_errors: u64,
+    pub overload_count: u64,
+    pub protocol_error_count: u64,
+    pub database_bytes: u64,
+    pub database_points: u64,
+    pub database_commits: u64,
+    pub recovered_tail_bytes: u64,
+    pub sync_policy: SyncPolicy,
+    pub last_ack_durable: bool,
+}
+
+#[derive(Debug, Default)]
+struct ServerCounters {
+    overload: AtomicU64,
+    protocol_error: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -149,6 +163,7 @@ pub fn serve(
     validate_config(config)?;
     let bound = BoundSocket::bind(&config.socket_path)?;
     bound.listener.set_nonblocking(true)?;
+    let counters = ServerCounters::default();
     let mut report = ShadowServerReport::default();
     while !stop.is_stopped() {
         match bound.listener.accept() {
@@ -163,7 +178,7 @@ pub fn serve(
                     report.peer_auth_failures = report.peer_auth_failures.saturating_add(1);
                     continue;
                 }
-                if serve_connection(&mut stream, &submitter, config, stop).is_err() {
+                if serve_connection(&mut stream, &submitter, config, stop, &counters).is_err() {
                     report.client_errors = report.client_errors.saturating_add(1);
                 }
             }
@@ -174,6 +189,15 @@ pub fn serve(
             Err(error) => return Err(ShadowServerError::Io(error)),
         }
     }
+    let health = submitter.health();
+    report.overload_count = counters.overload.load(Ordering::Relaxed);
+    report.protocol_error_count = counters.protocol_error.load(Ordering::Relaxed);
+    report.database_bytes = health.database_bytes;
+    report.database_points = health.database_points;
+    report.database_commits = health.database_commits;
+    report.recovered_tail_bytes = health.recovered_tail_bytes;
+    report.sync_policy = sync_policy_from_durability(health.durability);
+    report.last_ack_durable = health.last_ack_durable;
     Ok(report)
 }
 
@@ -272,6 +296,7 @@ fn serve_connection(
     submitter: &ShadowSubmitter,
     config: &ShadowServerConfig,
     stop: &ShadowStopToken,
+    counters: &ServerCounters,
 ) -> Result<(), ()> {
     let mut source_id = None;
 
@@ -290,6 +315,7 @@ fn serve_connection(
                 if stop.is_stopped() {
                     return Ok(());
                 }
+                counters.protocol_error.fetch_add(1, Ordering::Relaxed);
                 let code = match error {
                     shadow_protocol::ProtocolError::UnsupportedVersion(_) => ErrorCode::Unsupported,
                     _ => ErrorCode::InvalidRequest,
@@ -336,9 +362,20 @@ fn serve_connection(
                 request.nonce,
                 source_id.expect("HELLO set a source"),
                 submitter,
+                counters,
             ),
             WireMessage::Response(_) => stable_error(ErrorCode::InvalidRequest, false),
         };
+
+        if matches!(
+            &response,
+            WireMessage::Response(Response::Error(ErrorResponse {
+                code: ErrorCode::Overloaded,
+                ..
+            }))
+        ) {
+            counters.overload.fetch_add(1, Ordering::Relaxed);
+        }
 
         if stream.set_write_timeout(Some(config.io_timeout)).is_err()
             || shadow_protocol::write_to(stream, &response).is_err()
@@ -470,7 +507,12 @@ fn handle_flush(
     }))
 }
 
-fn handle_health(nonce: u64, source_id: u128, submitter: &ShadowSubmitter) -> WireMessage {
+fn handle_health(
+    nonce: u64,
+    source_id: u128,
+    submitter: &ShadowSubmitter,
+    counters: &ServerCounters,
+) -> WireMessage {
     let health = submitter.health();
     let watermarks = health
         .source_watermarks
@@ -489,7 +531,23 @@ fn handle_health(nonce: u64, source_id: u128, submitter: &ShadowSubmitter) -> Wi
         queue_entries: u32::try_from(health.queued).unwrap_or(u32::MAX),
         accepted_through_sequence: watermarks.accepted_through,
         durable_through_sequence: watermarks.durable_through,
+        overload_count: counters.overload.load(Ordering::Relaxed),
+        protocol_error_count: counters.protocol_error.load(Ordering::Relaxed),
+        database_bytes: health.database_bytes,
+        database_points: health.database_points,
+        database_commits: health.database_commits,
+        recovered_tail_bytes: health.recovered_tail_bytes,
+        sync_policy: sync_policy_from_durability(health.durability),
+        last_ack_durable: health.last_ack_durable,
     }))
+}
+
+fn sync_policy_from_durability(durability: Durability) -> SyncPolicy {
+    match durability {
+        Durability::Always => SyncPolicy::Always,
+        Durability::Manual => SyncPolicy::Manual,
+        Durability::EveryBytes(bytes) => SyncPolicy::EveryBytes(bytes),
+    }
 }
 
 fn map_submit_error(error: SubmitError) -> WireMessage {
@@ -805,7 +863,13 @@ mod tests {
         let config = ShadowServerConfig::new("/tmp/unused-ftwdb-shadow.sock");
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let join = thread::spawn(move || {
-            serve_connection(&mut server, &submitter, &config, &ShadowStopToken::new())
+            serve_connection(
+                &mut server,
+                &submitter,
+                &config,
+                &ShadowStopToken::new(),
+                &ServerCounters::default(),
+            )
         });
         shadow_protocol::write_to(
             &mut client,
@@ -832,7 +896,13 @@ mod tests {
         let config = ShadowServerConfig::new("/tmp/unused-ftwdb-shadow.sock");
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let join = thread::spawn(move || {
-            serve_connection(&mut server, &submitter, &config, &ShadowStopToken::new())
+            serve_connection(
+                &mut server,
+                &submitter,
+                &config,
+                &ShadowStopToken::new(),
+                &ServerCounters::default(),
+            )
         });
         shadow_protocol::write_to(
             &mut client,
@@ -855,10 +925,23 @@ mod tests {
             })),
         )
         .unwrap();
-        assert!(matches!(
-            shadow_protocol::read_from(&mut client).unwrap(),
-            WireMessage::Response(Response::Health(HealthResponse { nonce: 11, .. }))
-        ));
+        let WireMessage::Response(Response::Health(health)) =
+            shadow_protocol::read_from(&mut client).unwrap()
+        else {
+            panic!("expected a health response");
+        };
+        assert_eq!(health.nonce, 11);
+        assert_eq!(health.source_id, 17);
+        assert_eq!(health.status, HealthStatus::Healthy);
+        assert_eq!(health.queue_entries, 0);
+        assert_eq!(health.overload_count, 0);
+        assert_eq!(health.protocol_error_count, 0);
+        assert!(health.database_bytes > 0);
+        assert_eq!(health.database_points, 0);
+        assert_eq!(health.database_commits, 0);
+        assert_eq!(health.recovered_tail_bytes, 0);
+        assert_eq!(health.sync_policy, SyncPolicy::Always);
+        assert!(!health.last_ack_durable);
         drop(client);
         assert!(join.join().unwrap().is_ok());
         runtime.shutdown().unwrap();
@@ -945,8 +1028,15 @@ mod tests {
         let stop = ShadowStopToken::new();
         let server_stop = stop.clone();
         let (mut client, mut server) = UnixStream::pair().unwrap();
-        let join =
-            thread::spawn(move || serve_connection(&mut server, &submitter, &config, &server_stop));
+        let join = thread::spawn(move || {
+            serve_connection(
+                &mut server,
+                &submitter,
+                &config,
+                &server_stop,
+                &ServerCounters::default(),
+            )
+        });
         shadow_protocol::write_to(
             &mut client,
             &WireMessage::Request(Request::Hello(HelloRequest {
@@ -976,7 +1066,13 @@ mod tests {
         let config = ShadowServerConfig::new("/tmp/unused-ftwdb-shadow.sock");
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let join = thread::spawn(move || {
-            serve_connection(&mut server, &submitter, &config, &ShadowStopToken::new())
+            serve_connection(
+                &mut server,
+                &submitter,
+                &config,
+                &ShadowStopToken::new(),
+                &ServerCounters::default(),
+            )
         });
         shadow_protocol::write_to(
             &mut client,
@@ -1129,7 +1225,13 @@ mod tests {
         let config = ShadowServerConfig::new("/tmp/unused-ftwdb-shadow.sock");
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let join = thread::spawn(move || {
-            serve_connection(&mut server, &submitter, &config, &ShadowStopToken::new())
+            serve_connection(
+                &mut server,
+                &submitter,
+                &config,
+                &ShadowStopToken::new(),
+                &ServerCounters::default(),
+            )
         });
         shadow_protocol::write_to(
             &mut client,
@@ -1308,6 +1410,10 @@ mod tests {
         let report = join.take().unwrap().join().unwrap().unwrap();
         assert_eq!(report.accepted_clients, 2);
         assert_eq!(report.client_errors, 1);
+        assert_eq!(report.protocol_error_count, 1);
+        assert_eq!(report.overload_count, 0);
+        assert_eq!(report.sync_policy, SyncPolicy::Always);
+        assert!(!report.last_ack_durable);
         assert!(!socket_path.exists());
         runtime.shutdown().unwrap();
     }

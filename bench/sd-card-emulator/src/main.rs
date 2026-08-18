@@ -177,6 +177,9 @@ fn verify_run(arguments: &[String]) -> Result<(), String> {
     let mut writer_exit = None;
     let mut writer_signal = None;
     let mut checksum_ok = None;
+    let mut ack_log = None;
+    let mut max_in_flight_commits = 1;
+    let mut max_in_flight_points = None;
     let mut index = 0;
     while index < arguments.len() {
         let flag = &arguments[index];
@@ -195,23 +198,46 @@ fn verify_run(arguments: &[String]) -> Result<(), String> {
             "--writer-exit" => writer_exit = Some(parse_i32("writer exit", value)?),
             "--writer-signal" => writer_signal = Some(parse_i32("writer signal", value)?),
             "--checksum-ok" => checksum_ok = Some(parse_bool("checksum status", value)?),
+            "--ack-log" => ack_log = Some(PathBuf::from(value)),
+            "--max-in-flight-commits" => {
+                max_in_flight_commits = parse_u64("in-flight commits", value)?
+            }
+            "--max-in-flight-points" => {
+                max_in_flight_points = Some(parse_u64("in-flight points", value)?)
+            }
             _ => return Err(format!("unknown verify option {flag:?}")),
         }
     }
     let emulator = emulator.ok_or_else(|| "verify needs --emulator".to_owned())?;
     let check = check.ok_or_else(|| "verify needs --check".to_owned())?;
     let inspect = inspect.ok_or_else(|| "verify needs --inspect".to_owned())?;
+    if ack_log.is_none() {
+        if expected_points.is_none() {
+            return Err("verify needs --expected-points".to_owned());
+        }
+        if expected_commits.is_none() {
+            return Err("verify needs --expected-commits".to_owned());
+        }
+    } else if max_in_flight_points.is_none() {
+        return Err("verify --ack-log needs --max-in-flight-points".to_owned());
+    }
+    let max_in_flight_points = max_in_flight_points.unwrap_or(0);
     let report = verify(&VerifyInput {
         emulator: &emulator,
         check: &check,
         inspect: &inspect,
-        expected_points: expected_points
-            .ok_or_else(|| "verify needs --expected-points".to_owned())?,
-        expected_commits: expected_commits
-            .ok_or_else(|| "verify needs --expected-commits".to_owned())?,
+        expected_points: expected_points.unwrap_or(0),
+        expected_commits: expected_commits.unwrap_or(0),
         writer_exit,
         writer_signal,
         checksum_ok,
+        ack_log: ack_log.as_deref(),
+        max_in_flight_commits: if ack_log.is_some() {
+            max_in_flight_commits
+        } else {
+            0
+        },
+        max_in_flight_points,
     })
     .map_err(|error| error.to_string())?;
     println!(
@@ -252,6 +278,6 @@ fn print_help() {
          serve --config PROFILE.json --backing CARD.img [--listen HOST:PORT] \\\n+               [--control HOST:PORT] [--seed N] [--metrics FILE.jsonl] \\\n+               [--power-loss-after-ops N]\n\
          ctl [--control HOST:PORT] status|power-loss|reset|detach|read-only|read-write|flush|shutdown\n\
          validate PROFILE.json\n\
-         verify --emulator METRICS.jsonl --check CHECK.json --inspect INSPECT.txt \\\n+                --expected-points N --expected-commits N [--checksum-ok BOOL] \\\n+                [--writer-exit N] [--writer-signal N] [--output RESULT.jsonl]"
+         verify --emulator METRICS.jsonl --check CHECK.json --inspect INSPECT.txt \\\n+                [--expected-points N --expected-commits N | --ack-log ACK.jsonl] \\\n+                [--max-in-flight-commits N] [--max-in-flight-points N] [--checksum-ok BOOL] \\\n+                [--writer-exit N] [--writer-signal N] [--output RESULT.jsonl]"
     );
 }

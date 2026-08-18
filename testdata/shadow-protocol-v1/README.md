@@ -25,6 +25,11 @@ optional values, negative power, UTC microseconds, a run, a plan, and a
 hardware-style telemetry value. Existing unit tests freeze every enum tag and
 cover the other enum values.
 
+`health-response.hex` includes trailing ops fields (overload and protocol-error
+counts, database bytes/points/commits, recovered tail, sync policy, and
+last-ack durable). Decoders must still accept the shorter v1 prefix that omits
+those fields and treat missing counts as zero with sync policy `always`.
+
 The corpus uses big-endian wire values. Its shared IDs include:
 
 - source: `00112233445566778899aabbccddeeff`;

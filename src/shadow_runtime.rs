@@ -10,7 +10,9 @@
 //! replay checks, conflicts, and durable watermarks, including after restart.
 //! The runtime never acknowledges a replay from process-local state.
 
-use crate::{Commit, Database, Error, IngressIdentity, IngressWatermarks, Store, Transaction};
+use crate::{
+    Commit, Database, Durability, Error, IngressIdentity, IngressWatermarks, Store, Transaction,
+};
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -397,6 +399,22 @@ pub struct ShadowHealth {
     /// Latest fatal writer or close error. Rejected client input increments
     /// `failed` but does not mark a healthy writer as degraded.
     pub last_error: Option<String>,
+    pub database_bytes: u64,
+    pub database_points: u64,
+    pub database_commits: u64,
+    pub recovered_tail_bytes: u64,
+    pub durability: Durability,
+    pub last_ack_durable: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct StoreOpsSnapshot {
+    bytes: u64,
+    points: u64,
+    commits: u64,
+    recovered_tail_bytes: u64,
+    durability: Durability,
+    last_ack_durable: bool,
 }
 
 struct HealthState {
@@ -406,6 +424,7 @@ struct HealthState {
     failed: u64,
     source_watermarks: BTreeMap<u128, IngressWatermarks>,
     last_error: Option<String>,
+    store: StoreOpsSnapshot,
 }
 
 struct Shared {
@@ -674,6 +693,7 @@ impl ShadowRuntime {
         }
 
         let source_watermarks = backend.all_ingress_watermarks();
+        let store = backend.store_snapshot().unwrap_or_default();
         let (sender, receiver) = mpsc::sync_channel(config.queue_capacity);
         let shared = Arc::new(Shared {
             health: Mutex::new(HealthState {
@@ -683,6 +703,7 @@ impl ShadowRuntime {
                 failed: 0,
                 source_watermarks,
                 last_error: None,
+                store,
             }),
             send_gate: Mutex::new(()),
             queue_usage: Mutex::new(QueueUsage::default()),
@@ -895,6 +916,9 @@ trait WriterBackend: Send + 'static {
         let _ = (now_micros, config);
         Ok(())
     }
+    fn store_snapshot(&self) -> crate::Result<StoreOpsSnapshot> {
+        Ok(StoreOpsSnapshot::default())
+    }
 }
 
 impl WriterBackend for Store {
@@ -936,6 +960,18 @@ impl WriterBackend for Store {
         }
         Ok(())
     }
+
+    fn store_snapshot(&self) -> crate::Result<StoreOpsSnapshot> {
+        let stats = self.database().stats()?;
+        Ok(StoreOpsSnapshot {
+            bytes: self.stored_bytes()?,
+            points: stats.points,
+            commits: stats.commits,
+            recovered_tail_bytes: stats.recovered_tail_bytes,
+            durability: self.database().durability(),
+            last_ack_durable: false,
+        })
+    }
 }
 
 impl WriterBackend for Database {
@@ -962,6 +998,18 @@ impl WriterBackend for Database {
     fn close(mut self: Box<Self>) -> crate::Result<BTreeMap<u128, IngressWatermarks>> {
         Database::flush(&mut self)?;
         Ok(Database::all_ingress_watermarks(&self))
+    }
+
+    fn store_snapshot(&self) -> crate::Result<StoreOpsSnapshot> {
+        let stats = self.stats()?;
+        Ok(StoreOpsSnapshot {
+            bytes: stats.file_bytes,
+            points: stats.points,
+            commits: stats.commits,
+            recovered_tail_bytes: stats.recovered_tail_bytes,
+            durability: self.durability(),
+            last_ack_durable: false,
+        })
     }
 }
 
@@ -1044,6 +1092,15 @@ fn observe_source(
     watermarks
 }
 
+fn refresh_store_snapshot(backend: &dyn WriterBackend, shared: &Shared, last_ack_durable: bool) {
+    if let Ok(mut snapshot) = backend.store_snapshot() {
+        snapshot.last_ack_durable = last_ack_durable;
+        lock(&shared.health).store = snapshot;
+    } else {
+        lock(&shared.health).store.last_ack_durable = last_ack_durable;
+    }
+}
+
 fn maybe_run_background_maintenance(
     backend: &mut Box<dyn WriterBackend>,
     config: &ShadowRuntimeConfig,
@@ -1103,6 +1160,7 @@ fn process_write(
     match commit {
         Ok(Ok(commit)) => {
             let watermarks = observe_source(&**backend, shared, identity.source_id);
+            refresh_store_snapshot(&**backend, shared, commit.durable);
             let mut health = lock(&shared.health);
             health.acknowledged += 1;
             Ok(ShadowAck {
@@ -1183,6 +1241,7 @@ fn process_flush(
                 observe_source(&**backend, shared, observed_source_id);
             }
             let watermarks = backend.ingress_watermarks(source_id);
+            refresh_store_snapshot(&**backend, shared, true);
             Ok(ShadowFlushAck {
                 source_id,
                 through_sequence,
@@ -1311,6 +1370,12 @@ fn health_snapshot(shared: &Shared) -> ShadowHealth {
         failed: health.failed,
         source_watermarks: health.source_watermarks.clone(),
         last_error: health.last_error.clone(),
+        database_bytes: health.store.bytes,
+        database_points: health.store.points,
+        database_commits: health.store.commits,
+        recovered_tail_bytes: health.store.recovered_tail_bytes,
+        durability: health.store.durability,
+        last_ack_durable: health.store.last_ack_durable,
     }
 }
 
@@ -1714,6 +1779,8 @@ mod tests {
         ));
         submitter.try_submit(write(1, 78)).unwrap().wait().unwrap();
         assert_eq!(submitter.health().state, ShadowRuntimeState::Running);
+        assert!(submitter.health().last_ack_durable);
+        assert!(submitter.health().database_points >= 1);
         runtime.shutdown().unwrap();
     }
 

@@ -65,15 +65,19 @@ flushes in queue order. A storage I/O or sync error poisons that writer, rejects
 later writes, and requires a reopen. A bad client batch returns a request error
 without taking down a healthy writer.
 
-The current wire health reply reports writer status, queued operations, and the
-connected source's accepted and durable watermarks. The in-process runtime also
-tracks queue limits, accepted, acknowledged, and failed counts, all known
-source watermarks, and the latest fatal writer error. On clean shutdown, the
-service log reports accepted clients, peer-auth failures, and client errors.
+The current wire health reply reports writer status, queued operations, the
+connected source's accepted and durable watermarks, overload and protocol-error
+counts, database bytes, points, commits, recovered tail bytes, the live sync
+policy, and whether the last acknowledgement was durable. Older v1 health
+frames that omit the trailing ops fields still decode with zeroed counts and
+`always` sync policy. The in-process runtime also tracks queue limits,
+accepted, acknowledged, and failed counts, all known source watermarks, and the
+latest fatal writer error. On clean shutdown, the service log reports the same
+ops fields next to accepted clients, peer-auth failures, and client errors.
 
-Before beta, an operations endpoint or service log must also expose overload
-and protocol-error counts, database bytes, points, commits, recovered tail
-bytes, sync policy, and whether the last acknowledgement was durable.
+Snapshot backup is still `ftw backup`. Stop the sidecar first (it holds the
+exclusive writer lock), copy the published snapshot off the card, and
+restore-verify CRC as in [`operations.md`](operations.md).
 
 ## Flash-write policy
 
@@ -157,7 +161,7 @@ content but cannot claim that a prior writer synced a receipt.
 `ftwdb-shadow-reconcile <store-directory> <commit-request.hex> ...` runs this
 check offline against exact v1 commit frames and writes one stable JSON summary.
 Stop the sidecar first: the read-only opener takes the store's shared lock and
-will not bypass its active writer. Mismatch details go to stderr. Exit code `3`
+will not bypass its active writer.
 means the command completed and found a content mismatch; a read or input error
 uses exit code `2`. The JSON states that a read-only run has no durability
 proof, so pair it with the sidecar's live durable watermark.

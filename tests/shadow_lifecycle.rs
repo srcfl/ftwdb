@@ -63,8 +63,9 @@ fn assert_clean_signal_shutdown(signal: libc::c_int) {
         .unwrap();
     assert!(
         stderr.contains(
-            "ftwdb-shadow: stopped accepted_clients=0 peer_auth_failures=0 client_errors=0"
-        ),
+            "ftwdb-shadow: stopped accepted_clients=0 peer_auth_failures=0 client_errors=0 overload_count=0 protocol_error_count=0"
+        )
+            && stderr.contains("sync_policy=always last_ack_durable=false"),
         "clean shutdown report was missing: {stderr}"
     );
     assert!(!socket_path.exists(), "shadow socket was not cleaned up");

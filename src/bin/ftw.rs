@@ -2,12 +2,12 @@ use flate2::read::GzDecoder;
 use ftwdb::{
     BackupReport, Config, Database, Durability, EnergyWorkload, Error, MaintenanceReport,
     RestoreReport, RollupResolution, SalvageOptions, SalvageReport, SealReport, Store, Transaction,
-    WorkloadConfig, gauge_bucket_checksum, load_real_fixture, load_tsbs_iot,
+    WorkloadConfig, gauge_bucket_checksum, load_real_fixture_with_ack, load_tsbs_iot,
 };
 use std::env;
 use std::fs::File;
-use std::io::{BufReader, stdin};
-use std::path::Path;
+use std::io::{BufReader, Write, stdin};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -80,6 +80,7 @@ fn bench_real_fixture(arguments: &[String]) -> CliResult<()> {
     let mut durability = Durability::Always;
     let mut durability_name = "always".to_owned();
     let mut batch_points = 10_000_usize;
+    let mut ack_log = None::<PathBuf>;
     let mut index = 2;
     while index < arguments.len() {
         let option = &arguments[index];
@@ -88,6 +89,7 @@ fn bench_real_fixture(arguments: &[String]) -> CliResult<()> {
             .ok_or_else(|| usage_error(format!("missing value for {option}")))?;
         match option.as_str() {
             "--batch-points" => batch_points = parse(value, option)?,
+            "--ack-log" => ack_log = Some(PathBuf::from(value)),
             "--durability" if value == "always" => {
                 durability = Durability::Always;
                 durability_name = value.clone();
@@ -130,8 +132,19 @@ fn bench_real_fixture(arguments: &[String]) -> CliResult<()> {
     )?;
     let file = File::open(input)?;
     let reader = BufReader::new(GzDecoder::new(file));
+    let mut ack_file = ack_log.as_ref().map(File::create).transpose()?;
     let started = Instant::now();
-    let report = load_real_fixture(reader, &mut store, batch_points)?;
+    let report = load_real_fixture_with_ack(reader, &mut store, batch_points, |ack| {
+        if let Some(file) = ack_file.as_mut() {
+            writeln!(
+                file,
+                "{{\"format\":\"ftwdb-ack-watermark-v1\",\"commits\":{},\"points\":{},\"durable\":{}}}",
+                ack.commits, ack.points, ack.durable
+            )?;
+            file.sync_data()?;
+        }
+        Ok(())
+    })?;
     let ingest_seconds = started.elapsed().as_secs_f64();
     let stored_bytes = directory_bytes(database_directory)?;
     let points_per_second = report.points as f64 / ingest_seconds;
@@ -708,7 +721,7 @@ fn runtime_invalid(reason: impl Into<String>) -> CliError {
 
 fn usage(program: &str) {
     eprintln!(
-        "usage:\n  {program} inspect <database-file>\n  {program} check-store <store-directory>\n  {program} seal <store-directory>\n  {program} maintain <store-directory> [--now-micros N]\n  {program} backup <store-directory> <absent-destination>\n  {program} restore <backup-directory> <absent-target>\n  {program} salvage <damaged-store> <absent-target> [--drop-orphan-segments]\n  {program} generate <output-directory> [--seed N] [--sites N] [--days N] [--cadence-seconds N] [--start-micros N]\n  {program} bench-ftwdb <workload-directory> <empty-database-directory> [--durability always|manual] [--batch-points N]\n  {program} bench-real-fixture <points.csv.gz> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-points N]\n  {program} bench-tsbs-iot <influx-line-file|-> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-rows N]"
+        "usage:\n  {program} inspect <database-file>\n  {program} check-store <store-directory>\n  {program} seal <store-directory>\n  {program} maintain <store-directory> [--now-micros N]\n  {program} backup <store-directory> <absent-destination>\n  {program} restore <backup-directory> <absent-target>\n  {program} salvage <damaged-store> <absent-target> [--drop-orphan-segments]\n  {program} generate <output-directory> [--seed N] [--sites N] [--days N] [--cadence-seconds N] [--start-micros N]\n  {program} bench-ftwdb <workload-directory> <empty-database-directory> [--durability always|manual] [--batch-points N]\n  {program} bench-real-fixture <points.csv.gz> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-points N] [--ack-log FILE]\n  {program} bench-tsbs-iot <influx-line-file|-> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-rows N]"
     );
 }
 

@@ -182,6 +182,24 @@ pub enum HealthStatus {
     Degraded,
     Unavailable,
 }
+/// Sidecar sync policy reported on health. Matches [`crate::Durability`]
+/// tags so operators can see the live writer without a second endpoint.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SyncPolicy {
+    #[default]
+    Always,
+    Manual,
+    EveryBytes(u64),
+}
+impl fmt::Display for SyncPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Always => formatter.write_str("always"),
+            Self::Manual => formatter.write_str("manual"),
+            Self::EveryBytes(bytes) => write!(formatter, "every-bytes:{bytes}"),
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HealthResponse {
     pub nonce: u64,
@@ -190,6 +208,14 @@ pub struct HealthResponse {
     pub queue_entries: u32,
     pub accepted_through_sequence: Option<u64>,
     pub durable_through_sequence: Option<u64>,
+    pub overload_count: u64,
+    pub protocol_error_count: u64,
+    pub database_bytes: u64,
+    pub database_points: u64,
+    pub database_commits: u64,
+    pub recovered_tail_bytes: u64,
+    pub sync_policy: SyncPolicy,
+    pub last_ack_durable: bool,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ErrorResponse {
@@ -457,6 +483,14 @@ fn encode_payload(message: &WireMessage, o: &mut Vec<u8>) -> Result<u8, Protocol
             put_u32(o, v.queue_entries);
             put_watermark(o, v.accepted_through_sequence);
             put_watermark(o, v.durable_through_sequence);
+            put_u64(o, v.overload_count);
+            put_u64(o, v.protocol_error_count);
+            put_u64(o, v.database_bytes);
+            put_u64(o, v.database_points);
+            put_u64(o, v.database_commits);
+            put_u64(o, v.recovered_tail_bytes);
+            put_sync_policy(o, v.sync_policy)?;
+            o.push(v.last_ack_durable as u8);
             Ok(HEALTH_RESPONSE)
         }
         WireMessage::Response(Response::Error(v)) => {
@@ -530,14 +564,32 @@ fn decode_payload(kind: u8, bytes: &[u8]) -> Result<WireMessage, ProtocolError> 
             bytes_written: i.u64()?,
         })),
         HEALTH_RESPONSE => {
-            let v = HealthResponse {
+            let mut v = HealthResponse {
                 nonce: i.u64()?,
                 source_id: i.u128()?,
                 status: status_from(i.u8()?)?,
                 queue_entries: i.u32()?,
                 accepted_through_sequence: i.watermark("accepted watermark")?,
                 durable_through_sequence: i.watermark("durable watermark")?,
+                overload_count: 0,
+                protocol_error_count: 0,
+                database_bytes: 0,
+                database_points: 0,
+                database_commits: 0,
+                recovered_tail_bytes: 0,
+                sync_policy: SyncPolicy::Always,
+                last_ack_durable: false,
             };
+            if i.remaining() > 0 {
+                v.overload_count = i.u64()?;
+                v.protocol_error_count = i.u64()?;
+                v.database_bytes = i.u64()?;
+                v.database_points = i.u64()?;
+                v.database_commits = i.u64()?;
+                v.recovered_tail_bytes = i.u64()?;
+                v.sync_policy = sync_policy_from(&mut i)?;
+                v.last_ack_durable = boolean(&mut i, "last_ack_durable")?;
+            }
             if v.queue_entries > MAX_QUEUE_ENTRIES {
                 return Err(ProtocolError::InvalidField("queue_entries"));
             }
@@ -1076,6 +1128,50 @@ fn status_from(v: u8) -> Result<HealthStatus, ProtocolError> {
         _ => Err(enum_error("health status", v)),
     }
 }
+fn put_sync_policy(o: &mut Vec<u8>, v: SyncPolicy) -> Result<(), ProtocolError> {
+    match v {
+        SyncPolicy::Always => {
+            o.push(1);
+            put_u64(o, 0);
+        }
+        SyncPolicy::Manual => {
+            o.push(2);
+            put_u64(o, 0);
+        }
+        SyncPolicy::EveryBytes(0) => {
+            return Err(ProtocolError::InvalidField("sync every-bytes"));
+        }
+        SyncPolicy::EveryBytes(bytes) => {
+            o.push(3);
+            put_u64(o, bytes);
+        }
+    }
+    Ok(())
+}
+fn sync_policy_from(i: &mut Input<'_>) -> Result<SyncPolicy, ProtocolError> {
+    match i.u8()? {
+        1 => {
+            if i.u64()? != 0 {
+                return Err(ProtocolError::InvalidField("sync every-bytes"));
+            }
+            Ok(SyncPolicy::Always)
+        }
+        2 => {
+            if i.u64()? != 0 {
+                return Err(ProtocolError::InvalidField("sync every-bytes"));
+            }
+            Ok(SyncPolicy::Manual)
+        }
+        3 => {
+            let bytes = i.u64()?;
+            if bytes == 0 {
+                return Err(ProtocolError::InvalidField("sync every-bytes"));
+            }
+            Ok(SyncPolicy::EveryBytes(bytes))
+        }
+        value => Err(enum_error("sync policy", value)),
+    }
+}
 fn error_byte(v: ErrorCode) -> u8 {
     match v {
         ErrorCode::InvalidRequest => 1,
@@ -1134,6 +1230,9 @@ impl<'a> Input<'a> {
         let v = &self.b[self.p..e];
         self.p = e;
         Ok(v)
+    }
+    fn remaining(&self) -> usize {
+        self.b.len().saturating_sub(self.p)
     }
     fn finish(&self) -> Result<(), ProtocolError> {
         if self.p == self.b.len() {
@@ -1426,6 +1525,14 @@ mod tests {
                     queue_entries: 4,
                     accepted_through_sequence: Some(2),
                     durable_through_sequence: None,
+                    overload_count: 0,
+                    protocol_error_count: 0,
+                    database_bytes: 0,
+                    database_points: 0,
+                    database_commits: 0,
+                    recovered_tail_bytes: 0,
+                    sync_policy: SyncPolicy::Always,
+                    last_ack_durable: false,
                 })),
             ),
             (
@@ -1504,6 +1611,47 @@ mod tests {
             .map(error_byte),
             [1, 2, 3, 4, 5]
         );
+        let mut always = Vec::new();
+        put_sync_policy(&mut always, SyncPolicy::Always).unwrap();
+        let mut manual = Vec::new();
+        put_sync_policy(&mut manual, SyncPolicy::Manual).unwrap();
+        let mut every = Vec::new();
+        put_sync_policy(&mut every, SyncPolicy::EveryBytes(64)).unwrap();
+        assert_eq!(always[0], 1);
+        assert_eq!(manual[0], 2);
+        assert_eq!(every[0], 3);
+    }
+    #[test]
+    fn health_response_decodes_the_legacy_prefix_without_ops_fields() {
+        let frame = decode_hex(
+            "465457530001820000000027112233445566778800112233445566778899aabbccddeeff02000000030101020304050607080053c62c77",
+        );
+        match decode(&frame).unwrap() {
+            WireMessage::Response(Response::Health(health)) => {
+                assert_eq!(health.nonce, 0x1122_3344_5566_7788);
+                assert_eq!(health.queue_entries, 3);
+                assert_eq!(
+                    health.accepted_through_sequence,
+                    Some(0x0102_0304_0506_0708)
+                );
+                assert_eq!(health.durable_through_sequence, None);
+                assert_eq!(health.overload_count, 0);
+                assert_eq!(health.protocol_error_count, 0);
+                assert_eq!(health.sync_policy, SyncPolicy::Always);
+                assert!(!health.last_ack_durable);
+            }
+            other => panic!("expected health, got {other:?}"),
+        }
+    }
+    fn decode_hex(text: &str) -> Vec<u8> {
+        let text = text.trim();
+        text.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let digits = std::str::from_utf8(pair).unwrap();
+                u8::from_str_radix(digits, 16).unwrap()
+            })
+            .collect()
     }
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()

@@ -100,10 +100,11 @@ impl Point {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Durability {
     /// Sync every committed batch before returning. Safest and hardest on
     /// flash media.
+    #[default]
     Always,
     /// Sync when at least this many frame bytes have accumulated. Recent
     /// acknowledged batches may be lost on power failure.
@@ -1627,6 +1628,11 @@ impl Database {
             recovered_tail_bytes: self.recovered_tail_bytes,
             recovered_tail: self.recovered_tail,
         })
+    }
+
+    #[must_use]
+    pub const fn durability(&self) -> Durability {
+        self.config.durability
     }
 }
 

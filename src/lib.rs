@@ -37,7 +37,9 @@ pub use model::{
     RelationId, RollupPolicy, RollupResolution, RollupTier, Run, RunId, RunKind, RunStatus,
     SeriesDefinition, SeriesSemantics,
 };
-pub use real_fixture::{RealFixtureLoadReport, load_real_fixture};
+pub use real_fixture::{
+    FixtureAck, RealFixtureLoadReport, load_real_fixture, load_real_fixture_with_ack,
+};
 pub use rollup::{CalendarGaugeRollup, FixedGaugeRollup, GaugeBucket};
 pub use rollup_segment::{RollupSegment, RollupSegmentStats};
 pub use segment::{Segment, SegmentStats};

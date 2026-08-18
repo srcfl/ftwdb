@@ -1,6 +1,7 @@
 use ftwdb::shadow_protocol::{
     self, Ack, AckKind, CommitBatchRequest, ErrorCode, ErrorResponse, FlushRequest, HealthRequest,
-    HealthResponse, HealthStatus, HelloRequest, HelloResponse, Request, Response, WireMessage,
+    HealthResponse, HealthStatus, HelloRequest, HelloResponse, Request, Response, SyncPolicy,
+    WireMessage,
 };
 use ftwdb::{
     CalendarUnit, Entity, EntityId, Plan, PlanStatus, Point, PropertyValue, Relation, RelationId,
@@ -195,6 +196,14 @@ fn fixture_messages() -> Vec<(&'static str, WireMessage)> {
                 queue_entries: 3,
                 accepted_through_sequence: Some(0x0102_0304_0506_0708),
                 durable_through_sequence: None,
+                overload_count: 5,
+                protocol_error_count: 7,
+                database_bytes: 0x3132_3334_3536_3738,
+                database_points: 9,
+                database_commits: 4,
+                recovered_tail_bytes: 0,
+                sync_policy: SyncPolicy::Always,
+                last_ack_durable: false,
             })),
         ),
         (
