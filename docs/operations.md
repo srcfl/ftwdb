@@ -116,7 +116,9 @@ on the result.
 
 `ftw salvage <damaged-store> <absent-target>` copies the longest valid raw-log
 prefix into a new store, together with sealed raw segments the recovered
-manifest still names. The command exits with code 2 for missing or extra
+manifest still names. Pass `--drop-orphan-segments` to ignore `.wseg` files on
+disk that the recovered manifest does not reference instead of failing closed.
+The command exits with code 2 for missing or extra
 arguments. A valid database header followed by a damaged frame produces a
 verified `partial` result and exit code 0. Header, source-open, lock,
 source-race, sealed-segment, stage-check, or publication errors use exit code
@@ -150,10 +152,13 @@ The fixed `stop_reason` values are:
 - `invalid-frame-magic`, `unsupported-frame-version`, and
   `frame-header-checksum-mismatch`;
 - `invalid-legacy-frame-size`, `transaction-frame-too-large`,
-  `identified-transaction-too-short`, and `unknown-frame-kind`;
+  `identified-transaction-too-short`, `ingress-transaction-too-short`, and
+  `unknown-frame-kind`;
 - `payload-checksum-mismatch`, `duplicate-commit-id`,
+  `duplicate-ingress-sequence`, `invalid-ingress-sequence`,
   `invalid-transaction`, `transaction-point-count-too-large`, and
-  `invalid-catalog-transaction`.
+  `invalid-catalog-transaction`;
+- `seal-checkpoint-invalid` and `identity-index-invalid`.
 
 After a valid database header, each listed frame or transaction fault yields a
 `partial` result, including a fault in the first frame. A header-only source is

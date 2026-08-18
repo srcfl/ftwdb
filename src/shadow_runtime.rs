@@ -17,7 +17,7 @@ use std::fmt;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Settings for one shadow writer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,6 +27,12 @@ pub struct ShadowRuntimeConfig {
     /// Maximum total point count in writes waiting behind the active write.
     /// Metadata records and flush operations consume no point budget.
     pub max_queued_points: usize,
+    /// Optional periodic [`Store::maintain`] interval for store backends.
+    /// Database backends ignore background maintenance.
+    pub maintenance_interval: Option<Duration>,
+    /// When set on a store backend, seal and reclaim once the active log
+    /// exceeds this many bytes after a maintenance tick.
+    pub seal_log_bytes_threshold: Option<u64>,
 }
 
 impl Default for ShadowRuntimeConfig {
@@ -34,6 +40,8 @@ impl Default for ShadowRuntimeConfig {
         Self {
             queue_capacity: 64,
             max_queued_points: 1_048_576,
+            maintenance_interval: None,
+            seal_log_bytes_threshold: None,
         }
     }
 }
@@ -684,7 +692,7 @@ impl ShadowRuntime {
         let worker_shared = Arc::clone(&shared);
         let join = thread::Builder::new()
             .name("ftwdb-shadow-writer".to_owned())
-            .spawn(move || worker_loop(backend, receiver, worker_shared))
+            .spawn(move || worker_loop(backend, receiver, worker_shared, config))
             .map_err(ShadowStartError::Spawn)?;
         Ok(Self {
             submitter: ShadowSubmitter { sender, shared },
@@ -879,6 +887,14 @@ trait WriterBackend: Send + 'static {
     fn all_ingress_watermarks(&self) -> BTreeMap<u128, IngressWatermarks>;
     fn flush(&mut self) -> crate::Result<()>;
     fn close(self: Box<Self>) -> crate::Result<BTreeMap<u128, IngressWatermarks>>;
+    fn background_maintenance(
+        &mut self,
+        now_micros: i64,
+        config: &ShadowRuntimeConfig,
+    ) -> crate::Result<()> {
+        let _ = (now_micros, config);
+        Ok(())
+    }
 }
 
 impl WriterBackend for Store {
@@ -905,6 +921,20 @@ impl WriterBackend for Store {
     fn close(mut self: Box<Self>) -> crate::Result<BTreeMap<u128, IngressWatermarks>> {
         Store::flush(&mut self)?;
         Ok(Store::all_ingress_watermarks(&self))
+    }
+
+    fn background_maintenance(
+        &mut self,
+        now_micros: i64,
+        config: &ShadowRuntimeConfig,
+    ) -> crate::Result<()> {
+        Store::maintain(self, now_micros)?;
+        if let Some(threshold) = config.seal_log_bytes_threshold
+            && self.database().stats()?.file_bytes > threshold
+        {
+            Store::seal_and_reclaim(self)?;
+        }
+        Ok(())
     }
 }
 
@@ -939,14 +969,25 @@ fn worker_loop(
     mut backend: Box<dyn WriterBackend>,
     receiver: Receiver<Command>,
     shared: Arc<Shared>,
+    config: ShadowRuntimeConfig,
 ) {
     let mut poison: Option<WorkerPoison> = None;
+    let mut last_maintenance = None::<Instant>;
     while let Ok(command) = receiver.recv() {
         match command {
             Command::Write { write, reply } => {
                 let points = write.transaction.point_count();
                 release_queue_slot(&shared, points);
                 let result = process_write(&mut backend, write, &shared, &mut poison);
+                if result.is_ok() {
+                    maybe_run_background_maintenance(
+                        &mut backend,
+                        &config,
+                        &shared,
+                        &mut last_maintenance,
+                        &mut poison,
+                    );
+                }
                 let _ = reply.send(result);
             }
             Command::Flush {
@@ -1001,6 +1042,40 @@ fn observe_source(
         .source_watermarks
         .insert(source_id, watermarks);
     watermarks
+}
+
+fn maybe_run_background_maintenance(
+    backend: &mut Box<dyn WriterBackend>,
+    config: &ShadowRuntimeConfig,
+    shared: &Shared,
+    last_maintenance: &mut Option<Instant>,
+    poison: &mut Option<WorkerPoison>,
+) {
+    let Some(interval) = config.maintenance_interval else {
+        return;
+    };
+    let now = Instant::now();
+    if last_maintenance.is_some_and(|previous| now.duration_since(previous) < interval) {
+        return;
+    }
+    let now_micros = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros(),
+    )
+    .unwrap_or(i64::MAX);
+    match backend.background_maintenance(now_micros, config) {
+        Ok(()) => *last_maintenance = Some(now),
+        Err(error) if writer_error_requires_poison(&error) => {
+            let cause = error.to_string();
+            *poison = Some(WorkerPoison::Error(cause.clone()));
+            let mut health = lock(&shared.health);
+            health.state = ShadowRuntimeState::Poisoned;
+            health.last_error = Some(cause);
+        }
+        Err(_) => *last_maintenance = Some(now),
+    }
 }
 
 fn process_write(
@@ -1473,6 +1548,7 @@ mod tests {
             ShadowRuntimeConfig {
                 queue_capacity: 3,
                 max_queued_points: 2,
+                ..ShadowRuntimeConfig::default()
             },
             true,
             false,

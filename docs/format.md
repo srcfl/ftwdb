@@ -18,7 +18,7 @@ uncompressed; it is a durability test vehicle, not the final segment format.
 |---:|---:|---|
 | 0 | 4 | ASCII `WBAT` |
 | 4 | 2 | frame version (`1`) |
-| 6 | 2 | frame kind: `0` legacy points, `1` mixed transaction, `2` identified mixed transaction, `3` ordered ingress transaction |
+| 6 | 2 | frame kind: `0` legacy points, `1` mixed transaction, `2` identified mixed transaction, `3` ordered ingress transaction, `4` seal checkpoint, `5` identity index |
 | 8 | 4 | item count: points or transaction records |
 | 12 | 4 | payload bytes |
 | 16 | 4 | CRC32 of payload |
@@ -100,6 +100,30 @@ kind `3` frames. A torn last frame exposes neither its identity nor its data.
 Duplicate keys or a source cursor that does not increase inside a complete log
 are corruption. Kinds
 `0` through `2` remain byte-compatible.
+
+## Seal checkpoint payload
+
+A frame of kind `4` carries a fixed 16-byte payload:
+
+| Offset | Bytes | Field |
+|---:|---:|---|
+| 0 | 8 | sealed manifest generation as little-endian `u64` |
+| 8 | 8 | sealed point count as little-endian `u64` |
+
+The checkpoint is appended before the live log is reclaimed. Recovery treats an
+invalid payload length or generation mismatch as corruption.
+
+## Identity index payload
+
+A frame of kind `5` stores a compact Postcard-encoded index of ingress receipts
+written during log reclamation. Recovery validates the payload checksum and
+decodes the index before accepting the compact log. An invalid or truncated
+index fails closed as corruption.
+
+After reclaim, identity replay verification uses the identity-index frame and
+the retained receipt bytes in the compact log. A post-reclaim duplicate or
+cursor regression is reported as corruption from those durable bytes, not from
+recomputing a standalone frame CRC in isolation.
 
 The immutable segment format will be separately versioned and use per-column
 encoding, block checksums, sparse indexes, and footer redundancy.

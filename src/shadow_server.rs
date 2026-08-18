@@ -776,6 +776,7 @@ mod tests {
             ShadowRuntimeConfig {
                 queue_capacity: 4,
                 max_queued_points: 64,
+                ..ShadowRuntimeConfig::default()
             },
         )
         .unwrap();
@@ -1222,6 +1223,7 @@ mod tests {
             ShadowRuntimeConfig {
                 queue_capacity: 4,
                 max_queued_points: 64,
+                ..ShadowRuntimeConfig::default()
             },
         )
         .unwrap();
@@ -1319,6 +1321,7 @@ mod tests {
             ShadowRuntimeConfig {
                 queue_capacity: 4,
                 max_queued_points: 64,
+                ..ShadowRuntimeConfig::default()
             },
         )
         .unwrap();

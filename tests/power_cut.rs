@@ -205,7 +205,7 @@ fn always_recovers_every_acknowledged_batch_after_sigkill() {
             }
         };
         let stats = reopened.stats().unwrap();
-        let points = reopened.query_history(1, i64::MIN, i64::MAX);
+        let points = reopened.query_history(1, i64::MIN, i64::MAX).unwrap();
         let recovered_batches = points.len() / batch_points;
         let complete_batches = points.len().is_multiple_of(batch_points);
         let sequence_is_exact = points.iter().enumerate().all(|(sequence, point)| {

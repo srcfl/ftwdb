@@ -60,7 +60,7 @@ fn storage_benchmarks(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("query_100k");
     group.throughput(Throughput::Elements(100_000));
     group.bench_function("latest", |bencher| {
-        bencher.iter(|| database.query_latest(1, 0, i64::MAX));
+        bencher.iter(|| database.query_latest(1, 0, i64::MAX).unwrap());
     });
     group.bench_function("materialize_5m_gauge_rollup", |bencher| {
         bencher.iter(|| {
@@ -85,7 +85,7 @@ fn storage_benchmarks(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("query_tail_1k_of_100k");
     group.throughput(Throughput::Elements(1_000));
     group.bench_function("latest_last_1000", |bencher| {
-        bencher.iter(|| database.query_latest(1, 99_000_000_000, i64::MAX));
+        bencher.iter(|| database.query_latest(1, 99_000_000_000, i64::MAX).unwrap());
     });
     group.finish();
 

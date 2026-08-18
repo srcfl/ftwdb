@@ -495,7 +495,7 @@ fn reconcile_points(
 
     let mut observed_counts = BTreeMap::<ShadowPointKey, usize>::new();
     for (series_id, span) in spans {
-        let series_points = database.query_history(series_id, span.start, span.end);
+        let series_points = database.query_history(series_id, span.start, span.end)?;
         report.scanned_points = report
             .scanned_points
             .checked_add(series_points.len())

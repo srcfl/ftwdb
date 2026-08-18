@@ -186,6 +186,22 @@ impl Segment {
         self.stats
     }
 
+    /// Reads and checksums every indexed block. Used by integrity checks and
+    /// salvage so a corrupt payload cannot pass as healthy coverage.
+    pub fn verify_blocks(&self) -> Result<()> {
+        for entry in &self.index {
+            read_block(&self.file, *entry)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn first_block_payload_offset(&self) -> Option<u64> {
+        self.index
+            .first()
+            .map(|entry| entry.offset + BLOCK_HEADER_BYTES as u64 + 1)
+    }
+
     /// Reads one series/time range, touching only overlapping indexed blocks.
     pub fn query(&self, series_id: u64, start: i64, end: i64) -> Result<Vec<Point>> {
         let entries: Vec<_> = self

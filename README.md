@@ -34,8 +34,9 @@ This repository currently contains the first executable storage slice:
 - tests, property tests, Criterion benchmarks, and a competitor benchmark plan.
 
 It is **not production-ready**. The active log still rebuilds an in-memory read
-index, raw compaction/deletion is intentionally disabled, and real SD-card
-power-cut evidence has not yet been collected.
+index, and real SD-card power-cut evidence has not yet been collected. Writable
+stores can seal live raw into immutable segments, reclaim the active log, and
+run explicit background maintenance for rollups.
 
 ## Platform support
 

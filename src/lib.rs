@@ -47,7 +47,7 @@ pub use storage::{
 };
 pub use store::{
     BackupReport, IntegrityReport, MaintenanceReport, RestoreReport, RetentionGate, RollupQuery,
-    RollupSource, SalvageReport, SalvageStatus, SealReport, Store,
+    RollupSource, SalvageOptions, SalvageReport, SalvageStatus, SealReport, Store,
 };
 pub use transaction::{IngressIdentity, Transaction};
 pub use tsbs::{TsbsIotLoadReport, load_tsbs_iot};

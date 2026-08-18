@@ -1,8 +1,8 @@
 use flate2::read::GzDecoder;
 use ftwdb::{
-    BackupReport, Config, Database, Durability, EnergyWorkload, Error, RestoreReport,
-    RollupResolution, SalvageReport, Store, Transaction, WorkloadConfig, gauge_bucket_checksum,
-    load_real_fixture, load_tsbs_iot,
+    BackupReport, Config, Database, Durability, EnergyWorkload, Error, MaintenanceReport,
+    RestoreReport, RollupResolution, SalvageOptions, SalvageReport, SealReport, Store, Transaction,
+    WorkloadConfig, gauge_bucket_checksum, load_real_fixture, load_tsbs_iot,
 };
 use std::env;
 use std::fs::File;
@@ -40,6 +40,8 @@ fn main() -> ExitCode {
     let result = match arguments.get(1).map(String::as_str) {
         Some("inspect") => inspect(&arguments[2..]),
         Some("check-store") => check_store(&arguments[2..]),
+        Some("seal") => seal(&arguments[2..]),
+        Some("maintain") => maintain(&arguments[2..]),
         Some("backup") => backup(&arguments[2..]),
         Some("restore") => restore(&arguments[2..]),
         Some("salvage") => salvage(&arguments[2..]),
@@ -282,6 +284,86 @@ fn check_store(arguments: &[String]) -> CliResult<()> {
     Ok(())
 }
 
+fn seal(arguments: &[String]) -> CliResult<()> {
+    if arguments.len() != 1 {
+        return Err(usage_error("seal requires one store directory"));
+    }
+    let mut store = Store::open(&arguments[0])?;
+    let report = store.seal_and_reclaim()?;
+    println!("{}", seal_report_json(&report));
+    Ok(())
+}
+
+fn maintain(arguments: &[String]) -> CliResult<()> {
+    let mut store_path = None;
+    let mut now_micros = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--now-micros" => {
+                let value = arguments
+                    .get(index + 1)
+                    .ok_or_else(|| usage_error("maintain --now-micros requires a value"))?;
+                now_micros = Some(parse(value, "--now-micros")?);
+                index += 2;
+            }
+            option if option.starts_with("--") => {
+                return Err(usage_error(format!("maintain does not support {option}")));
+            }
+            path => {
+                if store_path.is_some() {
+                    return Err(usage_error("maintain accepts one store directory"));
+                }
+                store_path = Some(path.to_owned());
+                index += 1;
+            }
+        }
+    }
+    let Some(store_path) = store_path else {
+        return Err(usage_error("maintain requires one store directory"));
+    };
+    let mut store = Store::open(&store_path)?;
+    let now_micros = now_micros.unwrap_or_else(current_time_micros);
+    let report = store.maintain(now_micros)?;
+    println!("{}", maintain_report_json(&report));
+    Ok(())
+}
+
+fn current_time_micros() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
+fn seal_report_json(report: &SealReport) -> String {
+    format!(
+        "{{\"format\":\"ftwdb-seal-v1\",\"manifest_generation\":{},\"segment_file\":\"{}\",\"sealed_points\":{},\"live_points\":{},\"segment_bytes\":{},\"log_bytes\":{}}}",
+        report.manifest_generation,
+        report.segment_file,
+        report.sealed_points,
+        report.live_points,
+        report.segment_bytes,
+        report.log_bytes
+    )
+}
+
+fn maintain_report_json(report: &MaintenanceReport) -> String {
+    format!(
+        "{{\"format\":\"ftwdb-maintain-v1\",\"manifest_generation\":{},\"rollup_files_written\":{},\"rollup_buckets_written\":{},\"rollup_bytes_written\":{},\"retention_gates\":{}}}",
+        report.manifest_generation,
+        report.rollup_files_written,
+        report.rollup_buckets_written,
+        report.rollup_bytes_written,
+        report.retention_gates.len()
+    )
+}
+
 fn backup(arguments: &[String]) -> CliResult<()> {
     if arguments.len() != 2 {
         return Err(usage_error(
@@ -320,12 +402,36 @@ fn restore_report_json(report: &RestoreReport) -> String {
 }
 
 fn salvage(arguments: &[String]) -> CliResult<()> {
-    if arguments.len() != 2 {
+    let mut drop_orphan_segments = false;
+    let mut positional = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--drop-orphan-segments" => {
+                drop_orphan_segments = true;
+                index += 1;
+            }
+            option if option.starts_with("--") => {
+                return Err(usage_error(format!("salvage does not support {option}")));
+            }
+            value => {
+                positional.push(value.to_owned());
+                index += 1;
+            }
+        }
+    }
+    if positional.len() != 2 {
         return Err(usage_error(
             "salvage requires a damaged store and absent target directory",
         ));
     }
-    let report = Store::salvage_from(&arguments[0], &arguments[1])?;
+    let report = Store::salvage_from_with_options(
+        &positional[0],
+        &positional[1],
+        SalvageOptions {
+            drop_orphan_segments,
+        },
+    )?;
     println!("{}", salvage_report_json(&report));
     Ok(())
 }
@@ -602,7 +708,7 @@ fn runtime_invalid(reason: impl Into<String>) -> CliError {
 
 fn usage(program: &str) {
     eprintln!(
-        "usage:\n  {program} inspect <database-file>\n  {program} check-store <store-directory>\n  {program} backup <store-directory> <absent-destination>\n  {program} restore <backup-directory> <absent-target>\n  {program} salvage <damaged-store> <absent-target>\n  {program} generate <output-directory> [--seed N] [--sites N] [--days N] [--cadence-seconds N] [--start-micros N]\n  {program} bench-ftwdb <workload-directory> <empty-database-directory> [--durability always|manual] [--batch-points N]\n  {program} bench-real-fixture <points.csv.gz> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-points N]\n  {program} bench-tsbs-iot <influx-line-file|-> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-rows N]"
+        "usage:\n  {program} inspect <database-file>\n  {program} check-store <store-directory>\n  {program} seal <store-directory>\n  {program} maintain <store-directory> [--now-micros N]\n  {program} backup <store-directory> <absent-destination>\n  {program} restore <backup-directory> <absent-target>\n  {program} salvage <damaged-store> <absent-target> [--drop-orphan-segments]\n  {program} generate <output-directory> [--seed N] [--sites N] [--days N] [--cadence-seconds N] [--start-micros N]\n  {program} bench-ftwdb <workload-directory> <empty-database-directory> [--durability always|manual] [--batch-points N]\n  {program} bench-real-fixture <points.csv.gz> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-points N]\n  {program} bench-tsbs-iot <influx-line-file|-> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-rows N]"
     );
 }
 

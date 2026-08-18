@@ -119,6 +119,13 @@ pub struct RestoreReport {
     pub destination_snapshot_crc32: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SalvageOptions {
+    /// When true, orphan `.wseg` files not named by the recovered manifest
+    /// are ignored instead of failing salvage.
+    pub drop_orphan_segments: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SalvageStatus {
     Clean,
@@ -524,7 +531,7 @@ impl Store {
                     .saturating_add(max_gap.max(1));
                 let points = self
                     .database
-                    .query_latest(definition.id, query_start, query_end);
+                    .query_latest(definition.id, query_start, query_end)?;
                 let mut buckets = materialize(&points, &tier.resolution, max_gap)?;
                 buckets.retain(|bucket| bucket.end <= now_micros);
                 let shards = rollup_shards(&buckets, &tier.resolution, now_micros)?;
@@ -834,6 +841,7 @@ impl Store {
         };
         for descriptor in &self.manifest.segments {
             let segment = Segment::open(self.segment_directory.join(&descriptor.file))?;
+            segment.verify_blocks()?;
             if segment.stats().points != descriptor.points {
                 return Err(Error::Corruption {
                     offset: 0,
@@ -1005,8 +1013,17 @@ impl Store {
         damaged_store: impl AsRef<Path>,
         destination: impl AsRef<Path>,
     ) -> Result<SalvageReport> {
+        Self::salvage_from_with_options(damaged_store, destination, SalvageOptions::default())
+    }
+
+    /// Like [`Self::salvage_from`], with optional recovery policy controls.
+    pub fn salvage_from_with_options(
+        damaged_store: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+        options: SalvageOptions,
+    ) -> Result<SalvageReport> {
         let damaged_store = damaged_store.as_ref();
-        let sealed = plan_sealed_salvage(damaged_store)?;
+        let sealed = plan_sealed_salvage(damaged_store, options)?;
         let published_seals = published_seal_generations(&sealed.manifest);
         let mut source = SalvageSource::open(damaged_store, ACTIVE_LOG, &published_seals)?;
         let destination = destination.as_ref();
@@ -1240,7 +1257,7 @@ impl Store {
         let context_end = end.saturating_add(max_gap_micros.max(1));
         let points = self
             .database
-            .query_latest(series_id, context_start, context_end);
+            .query_latest(series_id, context_start, context_end)?;
         let mut buckets = materialize(&points, resolution, max_gap_micros)?;
         buckets.retain(|bucket| bucket.start >= start && bucket.end <= end);
         Ok(buckets)
@@ -2058,7 +2075,7 @@ fn list_wseg_names(root: &Path) -> Result<Vec<String>> {
 /// Recovers sealed `.wseg` coverage from the highest valid manifest. Missing
 /// or unreadable sealed files fail closed so salvage never publishes a store
 /// that silently dropped historical raw.
-fn plan_sealed_salvage(root: &Path) -> Result<SealedSalvagePlan> {
+fn plan_sealed_salvage(root: &Path, options: SalvageOptions) -> Result<SealedSalvagePlan> {
     let on_disk = list_wseg_names(root)?;
     let manifests = root.join(MANIFEST_DIRECTORY);
     let loaded = if manifests.is_dir() {
@@ -2091,6 +2108,9 @@ fn plan_sealed_salvage(root: &Path) -> Result<SealedSalvagePlan> {
         .collect();
     for name in &on_disk {
         if !referenced.contains(name.as_str()) {
+            if options.drop_orphan_segments {
+                continue;
+            }
             return Err(Error::Corruption {
                 offset: 0,
                 reason: format!(
@@ -2107,6 +2127,13 @@ fn plan_sealed_salvage(root: &Path) -> Result<SealedSalvagePlan> {
             offset: 0,
             reason: format!(
                 "sealed raw segment {} is unreadable: {error}",
+                descriptor.file
+            ),
+        })?;
+        segment.verify_blocks().map_err(|error| Error::Corruption {
+            offset: 0,
+            reason: format!(
+                "sealed raw segment {} failed block verification: {error}",
                 descriptor.file
             ),
         })?;
@@ -2326,14 +2353,14 @@ fn snapshot_mismatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        BackupReport, LinkOrCopy, RollupSource, SalvageStatus, Store, fail_next_seal_reclaim,
-        hard_link_or_copy, hard_link_or_copy_with,
+        BackupReport, LinkOrCopy, RollupSource, SalvageOptions, SalvageStatus, Store,
+        fail_next_seal_reclaim, hard_link_or_copy, hard_link_or_copy_with,
     };
     use crate::snapshot::{PublicationStep, StagedDirectory, fail_next_publication_step};
     use crate::storage::mutate_salvage_source_after_identity_checks;
     use crate::{
         CalendarUnit, Entity, EntityId, Point, RollupPolicy, RollupResolution, RollupTier,
-        SalvageStopReason, SeriesDefinition, SeriesSemantics, Transaction,
+        SalvageStopReason, Segment, SeriesDefinition, SeriesSemantics, Transaction,
     };
     use std::collections::BTreeMap;
     use std::error::Error as _;
@@ -3117,6 +3144,7 @@ mod tests {
             store
                 .database()
                 .query_history(1, 6 * SECOND, 6 * SECOND + 1)
+                .unwrap()
                 .len(),
             2 // the original sixth-second sample plus exactly one correction
         );
@@ -3155,7 +3183,7 @@ mod tests {
         assert!(!store.commit(other).unwrap().deduplicated);
         assert_eq!(store.database().stats().unwrap().points, 2);
         assert_eq!(
-            store.database().query_history(1, 0, DAY).len(),
+            store.database().query_history(1, 0, DAY).unwrap().len(),
             2 // each identified commit's point appears exactly once
         );
     }
@@ -4408,7 +4436,10 @@ mod tests {
             assert_eq!(store.database().live_index_len(), 0);
             assert_eq!(store.database().sealed_point_count(), 1);
             assert_eq!(
-                store.database().query_latest(1, i64::MIN, i64::MAX),
+                store
+                    .database()
+                    .query_latest(1, i64::MIN, i64::MAX)
+                    .unwrap(),
                 vec![sealed]
             );
             store.close().unwrap();
@@ -4418,11 +4449,17 @@ mod tests {
         assert_eq!(store.database().live_index_len(), 0);
         assert_eq!(store.database().sealed_point_count(), 1);
         assert_eq!(
-            store.database().query_latest(1, i64::MIN, i64::MAX),
+            store
+                .database()
+                .query_latest(1, i64::MIN, i64::MAX)
+                .unwrap(),
             vec![sealed]
         );
         assert_eq!(
-            store.database().query_history(1, i64::MIN, i64::MAX),
+            store
+                .database()
+                .query_history(1, i64::MIN, i64::MAX)
+                .unwrap(),
             vec![sealed]
         );
         assert!(store.database().stats().unwrap().file_bytes < log_bytes_before);
@@ -4457,11 +4494,17 @@ mod tests {
         let store = Store::open(directory.path()).unwrap();
         assert_eq!(store.database().live_index_len(), 0);
         assert_eq!(
-            store.database().query_latest(1, i64::MIN, i64::MAX),
+            store
+                .database()
+                .query_latest(1, i64::MIN, i64::MAX)
+                .unwrap(),
             vec![correction]
         );
         assert_eq!(
-            store.database().query_history(1, i64::MIN, i64::MAX),
+            store
+                .database()
+                .query_history(1, i64::MIN, i64::MAX)
+                .unwrap(),
             vec![first, correction]
         );
         assert_eq!(store.database().stats().unwrap().points, 2);
@@ -4485,15 +4528,18 @@ mod tests {
         store.commit(transaction).unwrap();
         assert_eq!(store.database().live_index_len(), 1);
         assert_eq!(
-            store.database().query_latest(1, 0, 10 * SECOND),
+            store.database().query_latest(1, 0, 10 * SECOND).unwrap(),
             vec![historical]
         );
         assert_eq!(
-            store.database().query_latest(1, 10 * SECOND, 20 * SECOND),
+            store
+                .database()
+                .query_latest(1, 10 * SECOND, 20 * SECOND)
+                .unwrap(),
             vec![tail]
         );
         assert_eq!(
-            store.database().query_latest(1, 0, 20 * SECOND),
+            store.database().query_latest(1, 0, 20 * SECOND).unwrap(),
             vec![historical, tail]
         );
     }
@@ -4592,7 +4638,10 @@ mod tests {
         retry.append_points(vec![sample]).with_commit_id(7);
         assert!(store.commit(retry).unwrap().deduplicated);
         assert_eq!(store.database().live_index_len(), 0);
-        assert_eq!(store.database().query_history(1, 0, DAY), vec![sample]);
+        assert_eq!(
+            store.database().query_history(1, 0, DAY).unwrap(),
+            vec![sample]
+        );
     }
 
     fn sealed_wseg_paths(root: &Path) -> Vec<std::path::PathBuf> {
@@ -4603,6 +4652,93 @@ mod tests {
             .collect();
         paths.sort();
         paths
+    }
+
+    fn corrupt_first_sealed_block_payload(root: &Path) {
+        let wseg = sealed_wseg_paths(root)[0].clone();
+        let segment = Segment::open(&wseg).unwrap();
+        let payload_offset = segment
+            .first_block_payload_offset()
+            .expect("sealed segment must expose a block payload offset");
+        drop(segment);
+        overwrite_byte(&wseg, payload_offset, 0xAA);
+    }
+
+    #[test]
+    fn query_latest_returns_corruption_for_corrupt_sealed_block_payload() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("store");
+        {
+            let mut store = Store::open(&root).unwrap();
+            initialize(&mut store, Vec::new(), None);
+            let mut transaction = Transaction::new();
+            transaction.append_points(vec![Point::actual(1, SECOND, 1.0)]);
+            store.commit(transaction).unwrap();
+            store.seal_and_reclaim().unwrap();
+            store.close().unwrap();
+        }
+        corrupt_first_sealed_block_payload(&root);
+        let store = Store::open_read_only(&root).unwrap();
+        assert!(matches!(
+            store.database().query_latest(1, 0, DAY),
+            Err(crate::Error::Corruption { .. })
+        ));
+    }
+
+    #[test]
+    fn check_integrity_fails_on_corrupt_sealed_block_payload() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("store");
+        {
+            let mut store = Store::open(&root).unwrap();
+            initialize(&mut store, Vec::new(), None);
+            let mut transaction = Transaction::new();
+            transaction.append_points(vec![Point::actual(1, SECOND, 1.0)]);
+            store.commit(transaction).unwrap();
+            store.seal_and_reclaim().unwrap();
+            store.close().unwrap();
+        }
+        corrupt_first_sealed_block_payload(&root);
+        let store = Store::open_read_only(&root).unwrap();
+        assert!(matches!(
+            store.check_integrity(),
+            Err(crate::Error::Corruption { .. })
+        ));
+    }
+
+    #[test]
+    fn salvage_with_drop_orphan_segments_ignores_unreferenced_wseg() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        let target = directory.path().join("salvaged");
+        {
+            let mut store = Store::open(&source).unwrap();
+            initialize(&mut store, Vec::new(), None);
+            let mut transaction = Transaction::new();
+            transaction.append_points(vec![Point::actual(1, SECOND, 1.0)]);
+            store.commit(transaction).unwrap();
+            store.seal_and_reclaim().unwrap();
+            store.close().unwrap();
+        }
+        let wseg = sealed_wseg_paths(&source)[0].clone();
+        std::fs::copy(&wseg, source.join("segments").join("orphan.wseg")).unwrap();
+        assert!(Store::salvage_from(&source, &target).is_err());
+
+        let target2 = directory.path().join("salvaged2");
+        let report = Store::salvage_from_with_options(
+            &source,
+            &target2,
+            SalvageOptions {
+                drop_orphan_segments: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.recovered_points, 1);
+        let salvaged = Store::open_read_only(&target2).unwrap();
+        assert_eq!(
+            salvaged.database().query_history(1, 0, DAY).unwrap(),
+            vec![Point::actual(1, SECOND, 1.0)]
+        );
     }
 
     #[test]
@@ -4640,18 +4776,18 @@ mod tests {
         assert_eq!(salvaged.database().sealed_point_count(), 1);
         assert_eq!(salvaged.database().live_index_len(), 1);
         assert_eq!(
-            salvaged.database().query_history(1, 0, DAY),
+            salvaged.database().query_history(1, 0, DAY).unwrap(),
             vec![sealed, live]
         );
         assert_eq!(
-            salvaged.database().query_history(1, 0, SECOND + 1),
+            salvaged.database().query_history(1, 0, SECOND + 1).unwrap(),
             vec![sealed]
         );
         drop(salvaged);
 
         let reopened = Store::open(&target).unwrap();
         assert_eq!(
-            reopened.database().query_history(1, 0, SECOND + 1),
+            reopened.database().query_history(1, 0, SECOND + 1).unwrap(),
             vec![sealed]
         );
         assert_eq!(directory_snapshot(&source), source_before);
@@ -4700,7 +4836,7 @@ mod tests {
 
         let salvaged = Store::open_read_only(&target).unwrap();
         assert_eq!(
-            salvaged.database().query_history(1, 0, DAY),
+            salvaged.database().query_history(1, 0, DAY).unwrap(),
             vec![sealed, live]
         );
         assert_eq!(salvaged.database().sealed_point_count(), 1);
@@ -4779,11 +4915,11 @@ mod tests {
         let store = Store::open_read_only(&restored).unwrap();
         assert_eq!(store.database().sealed_point_count(), 1);
         assert_eq!(
-            store.database().query_history(1, 0, DAY),
+            store.database().query_history(1, 0, DAY).unwrap(),
             vec![sealed, live]
         );
         assert_eq!(
-            store.database().query_history(1, 0, SECOND + 1),
+            store.database().query_history(1, 0, SECOND + 1).unwrap(),
             vec![sealed]
         );
         assert!(!sealed_wseg_paths(&restored).is_empty());

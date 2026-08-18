@@ -54,12 +54,12 @@ fn ingest_reopen_and_range_query_scale() {
     let tail_start = (points as i64 - 1_000) * 1_000_000;
     for _ in 0..40 {
         let started = Instant::now();
-        let full = database.query_latest(1, 0, i64::MAX);
+        let full = database.query_latest(1, 0, i64::MAX).unwrap();
         latest_full.push(started.elapsed());
         assert_eq!(full.len(), points);
 
         let started = Instant::now();
-        let tail = database.query_latest(1, tail_start, i64::MAX);
+        let tail = database.query_latest(1, tail_start, i64::MAX).unwrap();
         latest_tail.push(started.elapsed());
         assert_eq!(tail.len(), 1_000);
     }
@@ -76,7 +76,13 @@ fn ingest_reopen_and_range_query_scale() {
     .unwrap();
     let reopen = reopen_started.elapsed();
     assert_eq!(reopened.stats().unwrap().points, points as u64);
-    assert_eq!(reopened.query_latest(1, tail_start, i64::MAX).len(), 1_000);
+    assert_eq!(
+        reopened
+            .query_latest(1, tail_start, i64::MAX)
+            .unwrap()
+            .len(),
+        1_000
+    );
     drop(reopened);
 
     eprintln!(

@@ -249,11 +249,14 @@ mod tests {
         assert_eq!(report.first_offset_millis, 0);
         assert_eq!(report.last_offset_millis, 20);
 
-        let history = store.database().query_history(
-            1,
-            REAL_FIXTURE_START_MICROS,
-            REAL_FIXTURE_START_MICROS + 21_000,
-        );
+        let history = store
+            .database()
+            .query_history(
+                1,
+                REAL_FIXTURE_START_MICROS,
+                REAL_FIXTURE_START_MICROS + 21_000,
+            )
+            .unwrap();
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].value, 12.5);
         assert_eq!(history[1].value, 13.5);

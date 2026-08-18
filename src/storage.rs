@@ -1280,13 +1280,12 @@ impl Database {
     /// Returns every revision in deterministic temporal order.
     ///
     /// Sealed raw segments are merged with the live tail. A sealed-segment
-    /// read error is fail-closed: the call panics rather than returning a
-    /// silent partial history.
-    #[must_use]
-    pub fn query_history(&self, series_id: u64, start: i64, end: i64) -> Vec<Point> {
-        let mut result = self.collect_raw_points(series_id, start, end);
+    /// read error is fail-closed: the call returns [`Error::Corruption`]
+    /// rather than a silent partial history.
+    pub fn query_history(&self, series_id: u64, start: i64, end: i64) -> Result<Vec<Point>> {
+        let mut result = self.collect_raw_points(series_id, start, end)?;
         result.sort_by_key(|point| (point.valid_time, point.knowledge_time, point.change_time));
-        result
+        Ok(result)
     }
 
     /// Live-index revisions only. Sealed history is not included.
@@ -1339,50 +1338,53 @@ impl Database {
         (min_time <= max_time).then_some((min_time, max_time))
     }
 
-    fn collect_raw_points(&self, series_id: u64, start: i64, end: i64) -> Vec<Point> {
+    fn collect_raw_points(&self, series_id: u64, start: i64, end: i64) -> Result<Vec<Point>> {
         let mut points = series_time_slice(self.series_points(series_id), start, end).to_vec();
         for segment in &self.sealed {
             if !segment.overlaps(series_id, start, end) {
                 continue;
             }
-            let sealed = segment
-                .query(series_id, start, end)
-                .unwrap_or_else(|error| {
-                    panic!("sealed raw segment is unreadable after open: {error}")
-                });
-            points.extend(sealed);
+            points.extend(segment.query(series_id, start, end)?);
         }
         points.sort_by_key(|point| (point.valid_time, point.knowledge_time, point.change_time));
-        points
+        Ok(points)
     }
 
     /// Returns the winning revision for each valid timestamp.
-    #[must_use]
-    pub fn query_latest(&self, series_id: u64, start: i64, end: i64) -> Vec<Point> {
+    pub fn query_latest(&self, series_id: u64, start: i64, end: i64) -> Result<Vec<Point>> {
         self.query_with_cutoffs(series_id, start, end, None, None)
     }
 
     /// Replays what was visible at one historical instant.
-    #[must_use]
-    pub fn query_as_of(&self, series_id: u64, start: i64, end: i64, as_of: i64) -> Vec<Point> {
+    pub fn query_as_of(
+        &self,
+        series_id: u64,
+        start: i64,
+        end: i64,
+        as_of: i64,
+    ) -> Result<Vec<Point>> {
         self.query_with_cutoffs(series_id, start, end, Some(as_of), Some(as_of))
     }
 
     /// Returns the latest correction within one forecast/optimization run.
-    #[must_use]
-    pub fn query_run(&self, series_id: u64, run_id: u128, start: i64, end: i64) -> Vec<Point> {
-        winning_revisions(
-            &self.collect_raw_points(series_id, start, end),
+    pub fn query_run(
+        &self,
+        series_id: u64,
+        run_id: u128,
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<Point>> {
+        Ok(winning_revisions(
+            &self.collect_raw_points(series_id, start, end)?,
             start,
             end,
             |point| point.run_id == run_id,
             |candidate, current| candidate.change_time >= current.change_time,
-        )
+        ))
     }
 
     /// Exact-time plan-versus-actual alignment. Higher-level resampling uses
     /// persistent rollups before calling this primitive.
-    #[must_use]
     pub fn compare_plan_to_actual(
         &self,
         planned_series_id: u64,
@@ -1390,15 +1392,15 @@ impl Database {
         run_id: u128,
         start: i64,
         end: i64,
-    ) -> Vec<PlanOutcome> {
+    ) -> Result<Vec<PlanOutcome>> {
         let mut aligned = BTreeMap::<i64, (Option<Point>, Option<Point>)>::new();
-        for point in self.query_run(planned_series_id, run_id, start, end) {
+        for point in self.query_run(planned_series_id, run_id, start, end)? {
             aligned.entry(point.valid_time).or_default().0 = Some(point);
         }
-        for point in self.query_run(actual_series_id, 0, start, end) {
+        for point in self.query_run(actual_series_id, 0, start, end)? {
             aligned.entry(point.valid_time).or_default().1 = Some(point);
         }
-        aligned
+        Ok(aligned
             .into_iter()
             .map(|(valid_time, (planned, actual))| PlanOutcome {
                 valid_time,
@@ -1408,12 +1410,11 @@ impl Database {
                 planned,
                 actual,
             })
-            .collect()
+            .collect())
     }
 
     /// Separates forecast issue-time and correction-time cutoffs for strict
     /// point-in-time backtests.
-    #[must_use]
     pub fn query_with_cutoffs(
         &self,
         series_id: u64,
@@ -1421,9 +1422,9 @@ impl Database {
         end: i64,
         maximum_knowledge_time: Option<i64>,
         maximum_change_time: Option<i64>,
-    ) -> Vec<Point> {
-        winning_revisions(
-            &self.collect_raw_points(series_id, start, end),
+    ) -> Result<Vec<Point>> {
+        Ok(winning_revisions(
+            &self.collect_raw_points(series_id, start, end)?,
             start,
             end,
             |point| {
@@ -1434,7 +1435,7 @@ impl Database {
                 (candidate.knowledge_time, candidate.change_time)
                     >= (current.knowledge_time, current.change_time)
             },
-        )
+        ))
     }
 
     /// Materializes fixed UTC gauge buckets from the winning revisions in a
@@ -1453,7 +1454,7 @@ impl Database {
         max_gap_micros: i64,
     ) -> Result<FixedGaugeRollup> {
         FixedGaugeRollup::build(
-            &self.query_latest(series_id, start, end),
+            &self.query_latest(series_id, start, end)?,
             resolution_micros,
             max_gap_micros,
         )
@@ -3342,10 +3343,10 @@ mod tests {
 
         let database = Database::open(&path).unwrap();
         assert_eq!(database.stats().unwrap().points, 3);
-        let latest = database.query_latest(7, 0, 1_000);
+        let latest = database.query_latest(7, 0, 1_000).unwrap();
         assert_eq!(latest.len(), 2);
         assert_eq!(latest[0].value, 3.0);
-        assert_eq!(database.query_as_of(7, 0, 1_000, 15)[0].value, 1.0);
+        assert_eq!(database.query_as_of(7, 0, 1_000, 15).unwrap()[0].value, 1.0);
     }
 
     #[test]
@@ -3358,17 +3359,17 @@ mod tests {
                 .append(&[point(100, 10, 11, 1.0), point(200, 10, 11, 2.0)])
                 .unwrap();
             database.append(&[point(50, 20, 21, 3.0)]).unwrap();
-            assert_eq!(database.query_history(7, 0, 75).len(), 1);
+            assert_eq!(database.query_history(7, 0, 75).unwrap().len(), 1);
             database.close().unwrap();
         }
 
         let database = Database::open(&path).unwrap();
-        let early = database.query_history(7, 0, 75);
+        let early = database.query_history(7, 0, 75).unwrap();
         assert_eq!(early.len(), 1);
         assert_eq!(early[0].valid_time, 50);
         assert_eq!(early[0].value, 3.0);
-        assert_eq!(database.query_history(7, 0, 150).len(), 2);
-        assert_eq!(database.query_latest(7, 0, 1_000).len(), 3);
+        assert_eq!(database.query_history(7, 0, 150).unwrap().len(), 2);
+        assert_eq!(database.query_latest(7, 0, 1_000).unwrap().len(), 3);
     }
 
     #[test]
@@ -3464,7 +3465,7 @@ mod tests {
         // The legacy frame recovers unchanged on reopen.
         let database = Database::open(&path).unwrap();
         assert_eq!(database.stats().unwrap().points, 1);
-        assert_eq!(database.query_latest(7, 0, 1_000).len(), 1);
+        assert_eq!(database.query_latest(7, 0, 1_000).unwrap().len(), 1);
     }
 
     #[test]
@@ -3582,7 +3583,7 @@ mod tests {
             super::RecoveredTail::IncompletePayload
         );
         assert_eq!(stats.file_bytes, first_length);
-        assert_eq!(database.query_latest(7, 0, 10).len(), 1);
+        assert_eq!(database.query_latest(7, 0, 10).unwrap().len(), 1);
         database.close().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
     }
@@ -3619,7 +3620,7 @@ mod tests {
             Err(Error::ReadOnly)
         ));
         assert!(matches!(database.flush(), Err(Error::ReadOnly)));
-        assert_eq!(database.query_latest(7, 0, 10).len(), 1);
+        assert_eq!(database.query_latest(7, 0, 10).unwrap().len(), 1);
         database.close().unwrap();
     }
 
@@ -3676,7 +3677,7 @@ mod tests {
         file.set_len(full_length - 10).unwrap();
 
         let database = Database::open(&path).unwrap();
-        assert_eq!(database.query_latest(7, 0, 10).len(), 1);
+        assert_eq!(database.query_latest(7, 0, 10).unwrap().len(), 1);
         let stats = database.stats().unwrap();
         assert_eq!(stats.file_bytes, first_length);
         assert!(stats.recovered_tail_bytes > 0);
@@ -3709,7 +3710,7 @@ mod tests {
         assert_eq!(stats.file_bytes, first_length);
         assert_eq!(stats.recovered_tail_bytes, 7);
         assert_eq!(stats.recovered_tail, super::RecoveredTail::IncompleteHeader);
-        assert_eq!(database.query_latest(7, 0, 10).len(), 1);
+        assert_eq!(database.query_latest(7, 0, 10).unwrap().len(), 1);
         database.close().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
 
@@ -3718,7 +3719,7 @@ mod tests {
         assert_eq!(stats.file_bytes, first_length);
         assert_eq!(stats.recovered_tail_bytes, 7);
         assert_eq!(stats.recovered_tail, super::RecoveredTail::IncompleteHeader);
-        assert_eq!(database.query_latest(7, 0, 10).len(), 1);
+        assert_eq!(database.query_latest(7, 0, 10).unwrap().len(), 1);
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
@@ -3911,8 +3912,8 @@ mod tests {
         assert_eq!(database.catalog().series(7), Some(&power_series()));
         assert_eq!(database.catalog().run(RunId(9)), Some(&optimization_run()));
         assert_eq!(database.catalog().plan(11), Some(&plan()));
-        assert_eq!(database.query_run(7, 9, 0, 1_000), vec![planned]);
-        let comparison = database.compare_plan_to_actual(7, 7, 9, 0, 1_000);
+        assert_eq!(database.query_run(7, 9, 0, 1_000).unwrap(), vec![planned]);
+        let comparison = database.compare_plan_to_actual(7, 7, 9, 0, 1_000).unwrap();
         assert_eq!(comparison.len(), 1);
         assert_eq!(comparison[0].difference, Some(-200.0));
         assert_eq!(database.stats().unwrap().catalog_records, 4);
@@ -3952,7 +3953,7 @@ mod tests {
         assert_eq!(commit.records, 0);
         assert_eq!(commit.bytes_written, 0);
         assert_eq!(database.stats().unwrap().points, 1);
-        assert_eq!(database.query_history(7, 0, 1_000).len(), 1);
+        assert_eq!(database.query_history(7, 0, 1_000).unwrap().len(), 1);
 
         // A different identifier is an independent commit; retrying it within
         // the same session is deduplicated without a reopen.
@@ -3963,7 +3964,7 @@ mod tests {
         assert!(!database.commit(second.clone()).unwrap().deduplicated);
         assert!(database.commit(second).unwrap().deduplicated);
         assert_eq!(database.stats().unwrap().points, 2);
-        assert_eq!(database.query_history(7, 0, 1_000).len(), 2);
+        assert_eq!(database.query_history(7, 0, 1_000).unwrap().len(), 2);
         database.close().unwrap();
     }
 
@@ -3991,7 +3992,7 @@ mod tests {
             Err(Error::IngressCommitIdConflict { commit_id: 42 })
         ));
         assert_eq!(database.stats().unwrap().points, 1);
-        assert_eq!(database.query_history(7, 0, 1_000).len(), 1);
+        assert_eq!(database.query_history(7, 0, 1_000).unwrap().len(), 1);
 
         let mut exact = Transaction::new();
         exact.append_points(vec![first_point]).with_commit_id(42);
@@ -4111,7 +4112,7 @@ mod tests {
         assert_eq!(replay.bytes_written, original.bytes_written);
         assert!(replay.durable);
         assert_eq!(database.stats().unwrap().points, 1);
-        assert_eq!(database.query_history(7, 0, 1_000).len(), 1);
+        assert_eq!(database.query_history(7, 0, 1_000).unwrap().len(), 1);
     }
 
     #[test]
@@ -4516,7 +4517,7 @@ mod tests {
         assert!(!commit.deduplicated);
         assert_eq!(commit.points, 1);
         assert_eq!(database.stats().unwrap().points, 2);
-        assert_eq!(database.query_history(7, 0, 1_000).len(), 2);
+        assert_eq!(database.query_history(7, 0, 1_000).unwrap().len(), 2);
     }
 
     #[test]
@@ -4550,7 +4551,7 @@ mod tests {
         retry.append_points(vec![telemetry]).with_commit_id(77);
         assert!(!database.commit(retry).unwrap().deduplicated);
         assert_eq!(database.stats().unwrap().points, 1);
-        assert_eq!(database.query_history(7, 0, 1_000).len(), 1);
+        assert_eq!(database.query_history(7, 0, 1_000).unwrap().len(), 1);
     }
 
     #[test]
@@ -4639,6 +4640,6 @@ mod tests {
         let recovered = Database::open(&path).unwrap();
         assert_eq!(recovered.stats().unwrap().file_bytes, before);
         assert_eq!(recovered.catalog().stats().entities, 0);
-        assert!(recovered.query_latest(7, 0, 1_000).is_empty());
+        assert!(recovered.query_latest(7, 0, 1_000).unwrap().is_empty());
     }
 }

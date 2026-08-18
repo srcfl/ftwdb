@@ -49,6 +49,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         ShadowRuntimeConfig {
             queue_capacity: 8,
             max_queued_points: 32_768,
+            maintenance_interval: Some(Duration::from_secs(shadow_maintain_secs())),
+            ..ShadowRuntimeConfig::default()
         },
     )?;
     let submitter = runtime.submitter();
@@ -158,6 +160,13 @@ fn restore_signal(signal: libc::c_int, previous: &libc::sigaction) {
 
 fn usage() -> &'static str {
     "usage: ftwdb-shadow <store-directory> <socket-path>"
+}
+
+fn shadow_maintain_secs() -> u64 {
+    env::var("FTWDB_SHADOW_MAINTAIN_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(300)
 }
 
 fn prepare_private_store_root(path: &Path) -> io::Result<()> {
