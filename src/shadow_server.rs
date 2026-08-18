@@ -636,24 +636,82 @@ impl Drop for SocketGuard {
 fn prepare_parent(path: &Path) -> Result<(), ShadowServerError> {
     let parent = path
         .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
         .ok_or(ShadowServerError::MissingSocketParent)?;
     match fs::symlink_metadata(parent) {
-        Ok(metadata) if metadata.file_type().is_dir() => {
-            if metadata.permissions().mode() & 0o022 != 0 {
-                return Err(ShadowServerError::UnsafeSocketParent(parent.to_owned()));
-            }
-            return Ok(());
+        Ok(metadata) => check_private_socket_parent(parent, &metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            create_private_socket_ancestors(parent)
         }
-        Ok(_) => return Err(ShadowServerError::UnsafeSocketParent(parent.to_owned())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(ShadowServerError::Io(error)),
+        Err(error) => Err(ShadowServerError::Io(error)),
     }
-    let mut builder = DirBuilder::new();
-    builder.recursive(true).mode(0o700).create(parent)?;
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-    let metadata = fs::symlink_metadata(parent)?;
-    if !metadata.file_type().is_dir() {
-        return Err(ShadowServerError::UnsafeSocketParent(parent.to_owned()));
+}
+
+fn owned_by_effective_user(metadata: &fs::Metadata) -> bool {
+    metadata.uid() == rustix::process::geteuid().as_raw()
+}
+
+/// The socket directory itself must be owner-only. A 0755 parent lets another
+/// local user reach the inode during the bind-to-chmod window.
+fn check_private_socket_parent(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), ShadowServerError> {
+    if metadata.file_type().is_dir()
+        && owned_by_effective_user(metadata)
+        && metadata.permissions().mode() & 0o777 == 0o700
+    {
+        Ok(())
+    } else {
+        Err(ShadowServerError::UnsafeSocketParent(path.to_owned()))
+    }
+}
+
+/// An existing ancestor may be 0755 (home, `/var/lib`) but must not be
+/// group- or world-writable. Creating a 0700 child under `/tmp` is a
+/// classic symlink race.
+fn check_existing_ancestor(path: &Path, metadata: &fs::Metadata) -> Result<(), ShadowServerError> {
+    if metadata.file_type().is_dir()
+        && owned_by_effective_user(metadata)
+        && metadata.permissions().mode() & 0o022 == 0
+    {
+        Ok(())
+    } else {
+        Err(ShadowServerError::UnsafeSocketParent(path.to_owned()))
+    }
+}
+
+fn create_private_socket_ancestors(path: &Path) -> Result<(), ShadowServerError> {
+    let mut missing = vec![path.to_path_buf()];
+    let mut cursor = path;
+    loop {
+        let Some(parent) = cursor
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        else {
+            let cwd = Path::new(".");
+            check_existing_ancestor(cwd, &fs::symlink_metadata(cwd)?)?;
+            break;
+        };
+        match fs::symlink_metadata(parent) {
+            Ok(metadata) => {
+                check_existing_ancestor(parent, &metadata)?;
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(parent.to_path_buf());
+                cursor = parent;
+            }
+            Err(error) => return Err(ShadowServerError::Io(error)),
+        }
+    }
+
+    missing.reverse();
+    for directory in missing {
+        let mut builder = DirBuilder::new();
+        builder.mode(0o700).create(&directory)?;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+        check_private_socket_parent(&directory, &fs::symlink_metadata(&directory)?)?;
     }
     Ok(())
 }
@@ -705,7 +763,7 @@ fn is_socket(file_type: FileType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shadow_protocol::{HelloRequest, Response};
+    use crate::shadow_protocol::{FlushRequest, HelloRequest, Response};
     use crate::shadow_runtime::{ShadowRuntime, ShadowRuntimeConfig};
     use crate::{Entity, EntityId, Store};
     use std::fs::File;
@@ -722,6 +780,13 @@ mod tests {
         )
         .unwrap();
         (directory, runtime)
+    }
+
+    fn private_socket_path(directory: &tempfile::TempDir) -> PathBuf {
+        let parent = directory.path().join("run");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        parent.join("shadow.sock")
     }
 
     #[test]
@@ -991,7 +1056,7 @@ mod tests {
     #[test]
     fn bind_refuses_to_replace_regular_file() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("shadow.sock");
+        let path = private_socket_path(&directory);
         File::create(&path).unwrap();
         let error = match BoundSocket::bind(&path) {
             Ok(_) => panic!("bind unexpectedly replaced the file"),
@@ -1023,9 +1088,87 @@ mod tests {
     }
 
     #[test]
+    fn bind_rejects_world_accessible_existing_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("open-run");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = parent.join("shadow.sock");
+        let error = match BoundSocket::bind(&path) {
+            Ok(_) => panic!("bind unexpectedly used a world-traversable parent"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ShadowServerError::UnsafeSocketParent(found) if found == parent
+        ));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn bind_refuses_to_create_under_a_world_writable_ancestor() {
+        let directory = tempfile::tempdir().unwrap();
+        let world = directory.path().join("world");
+        fs::create_dir(&world).unwrap();
+        fs::set_permissions(&world, fs::Permissions::from_mode(0o777)).unwrap();
+        let path = world.join("run/shadow.sock");
+        let error = match BoundSocket::bind(&path) {
+            Ok(_) => panic!("bind unexpectedly created a socket under a world-writable directory"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, ShadowServerError::UnsafeSocketParent(_)));
+        assert!(!path.exists());
+        assert!(!world.join("run").exists());
+    }
+
+    #[test]
+    fn hello_binds_source_id_and_rejects_a_different_source() {
+        let (_directory, runtime) = runtime();
+        let submitter = runtime.submitter();
+        let config = ShadowServerConfig::new("/tmp/unused-ftwdb-shadow.sock");
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let join = thread::spawn(move || {
+            serve_connection(&mut server, &submitter, &config, &ShadowStopToken::new())
+        });
+        shadow_protocol::write_to(
+            &mut client,
+            &WireMessage::Request(Request::Hello(HelloRequest {
+                source_id: 17,
+                node_id: "box-test".to_owned(),
+                client_version: "test".to_owned(),
+                capabilities: 0,
+            })),
+        )
+        .unwrap();
+        assert!(matches!(
+            shadow_protocol::read_from(&mut client).unwrap(),
+            WireMessage::Response(Response::Hello(_))
+        ));
+        shadow_protocol::write_to(
+            &mut client,
+            &WireMessage::Request(Request::Flush(FlushRequest {
+                source_id: 18,
+                through_sequence: 1,
+            })),
+        )
+        .unwrap();
+        match shadow_protocol::read_from(&mut client).unwrap() {
+            WireMessage::Response(Response::Error(ErrorResponse {
+                code: ErrorCode::InvalidRequest,
+                retryable: false,
+                message,
+            })) => assert_eq!(message, "invalid request"),
+            other => panic!("expected a stable invalid-request error, got {other:?}"),
+        }
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
     fn bind_refuses_a_live_socket() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("shadow.sock");
+        let path = private_socket_path(&directory);
         let listener = UnixListener::bind(&path).unwrap();
         let error = match BoundSocket::bind(&path) {
             Ok(_) => panic!("bind unexpectedly replaced the live socket"),
@@ -1041,7 +1184,7 @@ mod tests {
     #[test]
     fn bind_replaces_a_proven_stale_socket() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("shadow.sock");
+        let path = private_socket_path(&directory);
         let listener = UnixListener::bind(&path).unwrap();
         drop(listener);
         let bound = BoundSocket::bind(&path).unwrap();

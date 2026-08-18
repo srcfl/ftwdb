@@ -95,15 +95,35 @@ impl Catalog {
         Ok(candidate)
     }
 
+    /// Point-only transactions leave the catalog identity unchanged so ingest
+    /// does not clone entities, series, runs, and plans on every telemetry batch.
+    pub(crate) fn apply_records(&self, records: &[Record]) -> Result<Option<Self>> {
+        if records
+            .iter()
+            .all(|record| matches!(record, Record::Points(_)))
+        {
+            for record in records {
+                if let Record::Points(points) = record {
+                    self.validate_points(points)?;
+                }
+            }
+            return Ok(None);
+        }
+        self.validate_and_apply(records).map(Some)
+    }
+
     pub(crate) fn apply_recovered(&mut self, records: &[Record], offset: u64) -> Result<()> {
-        let candidate = self
-            .validate_and_apply(records)
-            .map_err(|error| Error::Corruption {
+        match self.apply_records(records) {
+            Ok(None) => Ok(()),
+            Ok(Some(candidate)) => {
+                *self = candidate;
+                Ok(())
+            }
+            Err(error) => Err(Error::Corruption {
                 offset,
                 reason: format!("invalid recovered transaction: {error}"),
-            })?;
-        *self = candidate;
-        Ok(())
+            }),
+        }
     }
 
     fn apply(&mut self, record: &Record) -> Result<()> {
@@ -223,11 +243,14 @@ impl Catalog {
 /// The catalog-independent point invariants. Transaction commits enforce
 /// these through `validate_points`; the legacy catalog-less `append` path
 /// enforces exactly this subset so both writers reject a malformed interval
-/// with the same error.
+/// or a non-finite value with the same error.
 pub(crate) fn validate_point_intervals(points: &[Point]) -> Result<()> {
     for point in points {
         if point.valid_time_end < point.valid_time {
             return invalid("point interval ends before it starts".to_owned());
+        }
+        if !point.value.is_finite() {
+            return invalid("point value must be finite".to_owned());
         }
     }
     Ok(())

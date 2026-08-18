@@ -150,8 +150,12 @@ impl CalendarGaugeRollup {
         for pair in ordered.windows(2) {
             let previous = pair[0];
             let next = pair[1];
-            let gap = next.valid_time - previous.valid_time;
-            if gap <= 0 || gap > max_gap_micros {
+            let Some(gap) = next.valid_time.checked_sub(previous.valid_time) else {
+                return Err(Error::InvalidArgument(
+                    "calendar sample timestamps overflow a gap",
+                ));
+            };
+            if gap == 0 || gap > max_gap_micros {
                 continue;
             }
             add_calendar_interval(
@@ -220,17 +224,24 @@ impl FixedGaugeRollup {
 
         for point in &ordered {
             let start = bucket_start(point.valid_time, resolution_micros);
+            let end = start
+                .checked_add(resolution_micros)
+                .ok_or(Error::InvalidArgument("rollup bucket end overflows"))?;
             buckets
                 .entry(start)
-                .or_insert_with(|| GaugeBucket::empty(start, start + resolution_micros))
+                .or_insert_with(|| GaugeBucket::empty(start, end))
                 .add_sample(Sample::new(point.valid_time, point.value));
         }
 
         for pair in ordered.windows(2) {
             let previous = pair[0];
             let next = pair[1];
-            let gap = next.valid_time - previous.valid_time;
-            if gap <= 0 || gap > max_gap_micros {
+            let Some(gap) = next.valid_time.checked_sub(previous.valid_time) else {
+                return Err(Error::InvalidArgument(
+                    "rollup sample timestamps overflow a gap",
+                ));
+            };
+            if gap == 0 || gap > max_gap_micros {
                 continue;
             }
             add_interval(
@@ -239,7 +250,7 @@ impl FixedGaugeRollup {
                 previous.valid_time,
                 next.valid_time,
                 previous.value,
-            );
+            )?;
         }
 
         Ok(Self {
@@ -274,17 +285,23 @@ fn add_interval(
     mut start: i64,
     end: i64,
     value: f64,
-) {
+) -> Result<()> {
     while start < end {
         let bucket = bucket_start(start, resolution);
-        let bucket_end = bucket + resolution;
+        let bucket_end = bucket
+            .checked_add(resolution)
+            .ok_or(Error::InvalidArgument("rollup bucket end overflows"))?;
         let interval_end = end.min(bucket_end);
+        let duration = interval_end
+            .checked_sub(start)
+            .ok_or(Error::InvalidArgument("rollup coverage overflows"))?;
         buckets
             .entry(bucket)
             .or_insert_with(|| GaugeBucket::empty(bucket, bucket_end))
-            .add_covered_interval(value, interval_end - start);
+            .add_covered_interval(value, duration);
         start = interval_end;
     }
+    Ok(())
 }
 
 fn add_calendar_interval(
@@ -298,10 +315,13 @@ fn add_calendar_interval(
     while start < end {
         let (bucket_start, bucket_end) = calendar_bucket_bounds(start, unit, timezone)?;
         let interval_end = end.min(bucket_end);
+        let duration = interval_end
+            .checked_sub(start)
+            .ok_or(Error::InvalidArgument("calendar coverage overflows"))?;
         buckets
             .entry(bucket_start)
             .or_insert_with(|| GaugeBucket::empty(bucket_start, bucket_end))
-            .add_covered_interval(value, interval_end - start);
+            .add_covered_interval(value, duration);
         start = interval_end;
     }
     Ok(())
@@ -368,6 +388,27 @@ mod tests {
     use jiff::civil::date;
 
     const SECOND: i64 = 1_000_000;
+
+    #[test]
+    fn overflowing_bucket_end_errors_instead_of_wrapping() {
+        let points = [Point::actual(1, i64::MAX, 1.0)];
+        assert!(matches!(
+            FixedGaugeRollup::build(&points, 2, SECOND),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn extreme_calendar_timestamps_error_instead_of_panicking() {
+        assert!(matches!(
+            calendar_bucket_bounds(i64::MAX, CalendarUnit::Day, "UTC"),
+            Err(Error::InvalidModel(_))
+        ));
+        assert!(matches!(
+            calendar_bucket_bounds(i64::MIN, CalendarUnit::Day, "UTC"),
+            Err(Error::InvalidModel(_))
+        ));
+    }
 
     #[test]
     fn invalid_build_arguments_error_instead_of_panicking() {

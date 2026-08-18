@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 const DATABASE_MAGIC: &[u8; 8] = b"FTWDB001";
@@ -364,6 +364,7 @@ impl Database {
                 .read(true)
                 .write(true)
                 .truncate(false)
+                .mode(0o600)
                 .open(path)?
         };
 
@@ -537,9 +538,12 @@ impl Database {
                 return Err(error);
             }
         };
+        if durable {
+            self.mark_ingress_durable();
+        }
 
         for point in points {
-            self.index.entry(point.series_id).or_default().push(*point);
+            insert_indexed_point(&mut self.index, *point);
         }
         self.commits += 1;
         self.points += points.len() as u64;
@@ -608,7 +612,7 @@ impl Database {
             });
         }
 
-        let candidate_catalog = self.catalog.validate_and_apply(&transaction.records)?;
+        let candidate_catalog = self.catalog.apply_records(&transaction.records)?;
         let payload = encode_transaction(&transaction)?;
         if payload.len() > self.config.max_transaction_bytes {
             return Err(Error::InvalidModel(format!(
@@ -635,11 +639,13 @@ impl Database {
         for record in &transaction.records {
             if let Record::Points(points) = record {
                 for point in points {
-                    self.index.entry(point.series_id).or_default().push(*point);
+                    insert_indexed_point(&mut self.index, *point);
                 }
             }
         }
-        self.catalog = candidate_catalog;
+        if let Some(catalog) = candidate_catalog {
+            self.catalog = catalog;
+        }
         if let Some(commit_id) = transaction.commit_id {
             self.commit_ids.insert(commit_id);
         }
@@ -749,7 +755,7 @@ impl Database {
             )));
         }
 
-        let candidate_catalog = self.catalog.validate_and_apply(&transaction.records)?;
+        let candidate_catalog = self.catalog.apply_records(&transaction.records)?;
         let payload_len_u32 = u32::try_from(payload_len)
             .map_err(|_| Error::Serialization("transaction exceeds u32 length".to_owned()))?;
         let canonical_len_u32 = u32::try_from(canonical.len())
@@ -774,11 +780,13 @@ impl Database {
         for record in &transaction.records {
             if let Record::Points(points) = record {
                 for point in points {
-                    self.index.entry(point.series_id).or_default().push(*point);
+                    insert_indexed_point(&mut self.index, *point);
                 }
             }
         }
-        self.catalog = candidate_catalog;
+        if let Some(catalog) = candidate_catalog {
+            self.catalog = catalog;
+        }
         self.commits += 1;
         self.points += point_count as u64;
         let metadata_records = transaction.record_count()
@@ -1023,8 +1031,7 @@ impl Database {
         match write_result {
             Ok(durable) => {
                 if durable {
-                    self.ingress_durable_sequences
-                        .clone_from(&self.ingress_last_sequences);
+                    self.mark_ingress_durable();
                 }
                 Ok(durable)
             }
@@ -1033,6 +1040,11 @@ impl Database {
                 Err(error)
             }
         }
+    }
+
+    fn mark_ingress_durable(&mut self) {
+        self.ingress_durable_sequences
+            .clone_from(&self.ingress_last_sequences);
     }
 
     /// Makes all prior appends durable according to the operating system.
@@ -1054,8 +1066,7 @@ impl Database {
             return Err(Error::Io(error));
         }
         self.bytes_since_sync = 0;
-        self.ingress_durable_sequences
-            .clone_from(&self.ingress_last_sequences);
+        self.mark_ingress_durable();
         Ok(())
     }
 
@@ -1081,14 +1092,7 @@ impl Database {
     /// Returns every revision in deterministic temporal order.
     #[must_use]
     pub fn query_history(&self, series_id: u64, start: i64, end: i64) -> Vec<Point> {
-        let mut result: Vec<_> = self
-            .index
-            .get(&series_id)
-            .into_iter()
-            .flatten()
-            .filter(|point| point.valid_time >= start && point.valid_time < end)
-            .copied()
-            .collect();
+        let mut result = series_time_slice(self.series_points(series_id), start, end).to_vec();
         result.sort_by_key(|point| (point.valid_time, point.knowledge_time, point.change_time));
         result
     }
@@ -1112,19 +1116,13 @@ impl Database {
     /// Returns the latest correction within one forecast/optimization run.
     #[must_use]
     pub fn query_run(&self, series_id: u64, run_id: u128, start: i64, end: i64) -> Vec<Point> {
-        let mut winners = BTreeMap::<i64, Point>::new();
-        for point in self.index.get(&series_id).into_iter().flatten() {
-            if point.run_id != run_id || point.valid_time < start || point.valid_time >= end {
-                continue;
-            }
-            match winners.get(&point.valid_time) {
-                Some(current) if current.change_time > point.change_time => {}
-                _ => {
-                    winners.insert(point.valid_time, *point);
-                }
-            }
-        }
-        winners.into_values().collect()
+        winning_revisions(
+            self.series_points(series_id),
+            start,
+            end,
+            |point| point.run_id == run_id,
+            |candidate, current| candidate.change_time >= current.change_time,
+        )
     }
 
     /// Exact-time plan-versus-actual alignment. Higher-level resampling uses
@@ -1169,26 +1167,19 @@ impl Database {
         maximum_knowledge_time: Option<i64>,
         maximum_change_time: Option<i64>,
     ) -> Vec<Point> {
-        let mut winners = BTreeMap::<i64, Point>::new();
-        for point in self.index.get(&series_id).into_iter().flatten() {
-            if point.valid_time < start || point.valid_time >= end {
-                continue;
-            }
-            if maximum_knowledge_time.is_some_and(|cutoff| point.knowledge_time > cutoff)
-                || maximum_change_time.is_some_and(|cutoff| point.change_time > cutoff)
-            {
-                continue;
-            }
-
-            let candidate_key = (point.knowledge_time, point.change_time);
-            match winners.get(&point.valid_time) {
-                Some(current) if (current.knowledge_time, current.change_time) > candidate_key => {}
-                _ => {
-                    winners.insert(point.valid_time, *point);
-                }
-            }
-        }
-        winners.into_values().collect()
+        winning_revisions(
+            self.series_points(series_id),
+            start,
+            end,
+            |point| {
+                maximum_knowledge_time.is_none_or(|cutoff| point.knowledge_time <= cutoff)
+                    && maximum_change_time.is_none_or(|cutoff| point.change_time <= cutoff)
+            },
+            |candidate, current| {
+                (candidate.knowledge_time, candidate.change_time)
+                    >= (current.knowledge_time, current.change_time)
+            },
+        )
     }
 
     /// Materializes fixed UTC gauge buckets from the winning revisions in a
@@ -1264,6 +1255,47 @@ fn validate_config(config: Config) -> Result<()> {
     Ok(())
 }
 
+fn insert_indexed_point(index: &mut HashMap<u64, Vec<Point>>, point: Point) {
+    let series = index.entry(point.series_id).or_default();
+    match series.last() {
+        Some(last) if last.valid_time > point.valid_time => {
+            let at = series.partition_point(|existing| existing.valid_time <= point.valid_time);
+            series.insert(at, point);
+        }
+        _ => series.push(point),
+    }
+}
+
+fn series_time_slice(points: &[Point], start: i64, end: i64) -> &[Point] {
+    let lo = points.partition_point(|point| point.valid_time < start);
+    let hi = lo + points[lo..].partition_point(|point| point.valid_time < end);
+    &points[lo..hi]
+}
+
+fn winning_revisions(
+    points: &[Point],
+    start: i64,
+    end: i64,
+    keep: impl Fn(&Point) -> bool,
+    prefer: impl Fn(&Point, &Point) -> bool,
+) -> Vec<Point> {
+    let mut winners: Vec<Point> = Vec::new();
+    for point in series_time_slice(points, start, end) {
+        if !keep(point) {
+            continue;
+        }
+        match winners.last_mut() {
+            Some(current) if current.valid_time == point.valid_time => {
+                if prefer(point, current) {
+                    *current = *point;
+                }
+            }
+            _ => winners.push(*point),
+        }
+    }
+    winners
+}
+
 fn write_database_header(file: &mut File) -> Result<()> {
     let mut header = [0_u8; DATABASE_HEADER_BYTES];
     header[..8].copy_from_slice(DATABASE_MAGIC);
@@ -1323,9 +1355,11 @@ fn scan_log(
     max_transaction_bytes: usize,
     mode: ScanMode,
 ) -> Result<Scan> {
-    let mut database_header = [0_u8; DATABASE_HEADER_BYTES];
+    let original_len = file.metadata()?.len();
     file.seek(SeekFrom::Start(0))?;
-    file.read_exact(&mut database_header)?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    let mut database_header = [0_u8; DATABASE_HEADER_BYTES];
+    reader.read_exact(&mut database_header)?;
     if &database_header[..8] != DATABASE_MAGIC {
         return Err(Error::InvalidHeader);
     }
@@ -1338,7 +1372,6 @@ fn scan_log(
         return Err(Error::InvalidHeader);
     }
 
-    let original_len = file.metadata()?.len();
     let mut offset = DATABASE_HEADER_BYTES as u64;
     let mut index = HashMap::<u64, Vec<Point>>::new();
     let mut catalog = Catalog::default();
@@ -1352,6 +1385,7 @@ fn scan_log(
     let mut recovered_tail_bytes = 0_u64;
     let mut recovered_tail = RecoveredTail::None;
     let mut salvage_stop_reason = None;
+    let mut payload = Vec::new();
 
     macro_rules! stop_or_corruption {
         ($reason:expr, $message:expr) => {
@@ -1370,7 +1404,8 @@ fn scan_log(
                 recovered_tail_bytes = remaining;
                 recovered_tail = RecoveredTail::IncompleteHeader;
                 if !simulate {
-                    truncate_recovered_tail(file, offset)?;
+                    reader.seek(SeekFrom::Start(offset))?;
+                    truncate_recovered_tail(reader.get_mut(), offset)?;
                 }
             } else {
                 salvage_stop_reason = Some(SalvageStopReason::IncompleteFrameHeader);
@@ -1379,8 +1414,7 @@ fn scan_log(
         }
 
         let mut frame_header = [0_u8; FRAME_HEADER_BYTES];
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(&mut frame_header)?;
+        reader.read_exact(&mut frame_header)?;
         if &frame_header[..4] != FRAME_MAGIC {
             stop_or_corruption!(SalvageStopReason::InvalidFrameMagic, "invalid frame magic");
         }
@@ -1449,7 +1483,8 @@ fn scan_log(
                 recovered_tail_bytes = remaining;
                 recovered_tail = RecoveredTail::IncompletePayload;
                 if !simulate {
-                    truncate_recovered_tail(file, offset)?;
+                    reader.seek(SeekFrom::Start(offset))?;
+                    truncate_recovered_tail(reader.get_mut(), offset)?;
                 }
             } else {
                 salvage_stop_reason = Some(SalvageStopReason::IncompleteFramePayload);
@@ -1457,8 +1492,9 @@ fn scan_log(
             break;
         }
 
-        let mut payload = vec![0_u8; payload_len];
-        file.read_exact(&mut payload)?;
+        payload.clear();
+        payload.resize(payload_len, 0);
+        reader.read_exact(&mut payload)?;
         if hash(&payload) != payload_checksum {
             let reason = if remaining == frame_len {
                 "payload checksum mismatch in complete final frame"
@@ -1602,6 +1638,10 @@ fn scan_log(
 
     if matches!(mode, ScanMode::Salvage) && salvage_stop_reason.is_none() {
         salvage_stop_reason = Some(SalvageStopReason::CleanEof);
+    }
+
+    for series in index.values_mut() {
+        series.sort_by_key(|point| point.valid_time);
     }
 
     Ok(Scan {
@@ -2099,6 +2139,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
     fn point(valid_time: i64, knowledge_time: i64, change_time: i64, value: f64) -> Point {
@@ -2204,6 +2245,17 @@ mod tests {
         file.seek(SeekFrom::Start(offset)).unwrap();
         file.write_all(&header).unwrap();
         file.sync_all().unwrap();
+    }
+
+    #[test]
+    fn newly_created_database_file_is_owner_only() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("private.ftwdb");
+        Database::open(&path).unwrap().close().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     fn salvage_scan(path: &std::path::Path, max_batch_points: usize) -> super::Scan {
@@ -2574,6 +2626,29 @@ mod tests {
     }
 
     #[test]
+    fn recovered_late_valid_times_remain_visible_to_range_queries() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("late-valid-time.ftwdb");
+        {
+            let mut database = Database::open(&path).unwrap();
+            database
+                .append(&[point(100, 10, 11, 1.0), point(200, 10, 11, 2.0)])
+                .unwrap();
+            database.append(&[point(50, 20, 21, 3.0)]).unwrap();
+            assert_eq!(database.query_history(7, 0, 75).len(), 1);
+            database.close().unwrap();
+        }
+
+        let database = Database::open(&path).unwrap();
+        let early = database.query_history(7, 0, 75);
+        assert_eq!(early.len(), 1);
+        assert_eq!(early[0].valid_time, 50);
+        assert_eq!(early[0].value, 3.0);
+        assert_eq!(database.query_history(7, 0, 150).len(), 2);
+        assert_eq!(database.query_latest(7, 0, 1_000).len(), 3);
+    }
+
+    #[test]
     fn append_rejects_inverted_intervals_with_the_commit_error() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("append-validation.ftwdb");
@@ -2607,6 +2682,46 @@ mod tests {
             other => panic!("expected Error::InvalidModel, got {other:?}"),
         };
         assert_eq!(append_error.to_string(), commit_error.to_string());
+    }
+
+    #[test]
+    fn append_and_commit_reject_non_finite_values_before_writing() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("non-finite.ftwdb");
+        let mut database = Database::open(&path).unwrap();
+        let before = database.stats().unwrap().file_bytes;
+
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut invalid = point(100, 10, 11, value);
+            invalid.valid_time_end = invalid.valid_time;
+            match database.append(&[invalid]) {
+                Err(Error::InvalidModel(reason)) => {
+                    assert_eq!(reason, "point value must be finite");
+                }
+                other => panic!("expected finite-value rejection, got {other:?}"),
+            }
+        }
+        assert_eq!(database.stats().unwrap().file_bytes, before);
+        assert_eq!(database.stats().unwrap().points, 0);
+
+        let mut catalog = Transaction::new();
+        catalog
+            .upsert_entity(home())
+            .define_series(power_series())
+            .upsert_run(optimization_run());
+        database.commit(catalog).unwrap();
+        let mut committed = Transaction::new();
+        let mut invalid = point(100, 10, 11, f64::NAN);
+        invalid.series_id = 7;
+        invalid.run_id = 9;
+        committed.append_points(vec![invalid]);
+        match database.commit(committed) {
+            Err(Error::InvalidModel(reason)) => {
+                assert_eq!(reason, "point value must be finite");
+            }
+            other => panic!("expected finite-value rejection, got {other:?}"),
+        }
+        assert!(database.append(&[point(1, 1, 1, 1.0)]).is_ok());
     }
 
     #[test]
@@ -3385,6 +3500,38 @@ mod tests {
                 durable_through: None,
             }
         );
+    }
+
+    #[test]
+    fn append_sync_advances_ingress_durable_watermarks() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("append-sync-watermarks.ftwdb");
+        let mut database = Database::open_with(
+            &path,
+            Config {
+                durability: Durability::EveryBytes(2_048),
+                ..Config::default()
+            },
+        )
+        .unwrap();
+
+        database
+            .commit_ingress(IngressIdentity::new(3, 7, 70), Transaction::new())
+            .unwrap();
+        assert_eq!(
+            database.ingress_watermarks(3),
+            super::IngressWatermarks {
+                accepted_through: Some(7),
+                durable_through: None,
+            }
+        );
+
+        let points: Vec<_> = (0..64)
+            .map(|index| point(index, 1, 1, index as f64))
+            .collect();
+        let commit = database.append(&points).unwrap();
+        assert!(commit.durable);
+        assert_eq!(database.ingress_watermarks(3).durable_through, Some(7));
     }
 
     #[test]

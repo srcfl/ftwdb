@@ -81,6 +81,31 @@ fn storage_benchmarks(criterion: &mut Criterion) {
         bencher.iter(|| rollup.range(0, i64::MAX));
     });
     group.finish();
+
+    let mut group = criterion.benchmark_group("query_tail_1k_of_100k");
+    group.throughput(Throughput::Elements(1_000));
+    group.bench_function("latest_last_1000", |bencher| {
+        bencher.iter(|| database.query_latest(1, 99_000_000_000, i64::MAX));
+    });
+    group.finish();
+
+    drop(database);
+    let path = directory.path().join("query.ftwdb");
+    let mut group = criterion.benchmark_group("reopen_100k");
+    group.throughput(Throughput::Elements(100_000));
+    group.bench_function("scan_and_recover", |bencher| {
+        bencher.iter(|| {
+            Database::open_with(
+                &path,
+                Config {
+                    durability: Durability::Manual,
+                    ..Config::default()
+                },
+            )
+            .unwrap()
+        });
+    });
+    group.finish();
 }
 
 criterion_group!(benches, storage_benchmarks);

@@ -59,10 +59,17 @@ impl GaugeAggregate {
         if sample.timestamp < self.last.timestamp {
             return Err(Error::InvalidArgument("samples must be time ordered"));
         }
-        let gap = sample.timestamp - self.last.timestamp;
+        let gap = sample
+            .timestamp
+            .checked_sub(self.last.timestamp)
+            .ok_or(Error::InvalidArgument("sample timestamps overflow a gap"))?;
         if gap <= max_gap_micros {
+            let covered = self
+                .covered_micros
+                .checked_add(gap)
+                .ok_or(Error::InvalidArgument("aggregate coverage overflows"))?;
             self.integral_value_micros += self.last.value * gap as f64;
-            self.covered_micros += gap;
+            self.covered_micros = covered;
         }
         self.count += 1;
         self.sum += sample.value;
@@ -84,12 +91,23 @@ impl GaugeAggregate {
                 "aggregate states must be time ordered",
             ));
         }
-        let gap = next.first.timestamp - self.last.timestamp;
+        let gap = next
+            .first
+            .timestamp
+            .checked_sub(self.last.timestamp)
+            .ok_or(Error::InvalidArgument(
+                "aggregate timestamps overflow a gap",
+            ))?;
         let (bridge_integral, bridge_coverage) = if gap <= max_gap_micros {
             (self.last.value * gap as f64, gap)
         } else {
             (0.0, 0)
         };
+        let covered_micros = self
+            .covered_micros
+            .checked_add(bridge_coverage)
+            .and_then(|value| value.checked_add(next.covered_micros))
+            .ok_or(Error::InvalidArgument("aggregate coverage overflows"))?;
 
         Ok(Self {
             count: self.count + next.count,
@@ -101,7 +119,7 @@ impl GaugeAggregate {
             integral_value_micros: self.integral_value_micros
                 + bridge_integral
                 + next.integral_value_micros,
-            covered_micros: self.covered_micros + bridge_coverage + next.covered_micros,
+            covered_micros,
         })
     }
 
@@ -200,6 +218,17 @@ fn counter_step(previous: f64, next: f64) -> (f64, bool) {
 mod tests {
     use super::{CounterAggregate, GaugeAggregate, Sample};
     use crate::Error;
+
+    #[test]
+    fn overflowing_sample_gap_errors_instead_of_panicking() {
+        let mut aggregate = GaugeAggregate::from_sample(Sample::new(i64::MIN, 1.0));
+        assert!(matches!(
+            aggregate.push(Sample::new(i64::MAX, 2.0), i64::MAX),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert_eq!(aggregate.count, 1);
+        assert_eq!(aggregate.last.timestamp, i64::MIN);
+    }
 
     #[test]
     fn merged_gauge_matches_direct_aggregation() {

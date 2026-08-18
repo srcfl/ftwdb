@@ -11,9 +11,10 @@ use crate::{
     IngressWatermarks, Point, Result, RollupResolution, RollupSegment, SeriesSemantics,
     Transaction,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,6 +23,10 @@ const ACTIVE_LOG: &str = "active.wlog";
 const MANIFEST_DIRECTORY: &str = "manifests";
 const ROLLUP_DIRECTORY: &str = "rollups";
 const UTC_DAY_MICROS: i64 = 86_400_000_000;
+/// Process-local verified rollup files. Queries may temporarily hold more than
+/// this when a single range covers a larger working set; idle cache is trimmed
+/// back so open no longer preloads every generation into RAM.
+const MAX_CACHED_ROLLUP_SEGMENTS: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RollupSource {
@@ -162,22 +167,30 @@ impl Store {
 
     pub fn open_with(path: impl AsRef<Path>, config: Config) -> Result<Self> {
         let root = path.as_ref().to_path_buf();
-        let root_created = !root.exists();
+        let root_created = matches!(
+            std::fs::symlink_metadata(&root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        );
         std::fs::create_dir_all(&root)?;
+        if root_created {
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+        }
         let manifest_directory = root.join(MANIFEST_DIRECTORY);
         let rollup_directory = root.join(ROLLUP_DIRECTORY);
         std::fs::create_dir_all(&manifest_directory)?;
         std::fs::create_dir_all(&rollup_directory)?;
         // Make the manifests/ and rollups/ entries durable in the root, then
-        // make a freshly created root's own entry durable in its parent —
-        // the same order segment publication uses: contents first, then the
-        // directory entry that names them. `Database::open_with` below syncs
-        // the root again after it creates the active log, so the log's entry
-        // is covered even though the file does not exist yet here.
+        // make the root's own entry durable in its parent — the same order
+        // segment publication uses: contents first, then the directory entry
+        // that names them. Always sync the parent, even when the root already
+        // exists: the sidecar creates the directory before open, and a prior
+        // open can crash after mkdir but before this fsync. Skipping it would
+        // let later Always commits acknowledge durability for a store whose
+        // parent dirent can vanish on power loss. `Database::open_with` below
+        // syncs the root again after it creates the active log, so the log's
+        // entry is covered even though the file does not exist yet here.
         sync_directory(&root)?;
-        if root_created {
-            sync_parent_directory(&root)?;
-        }
+        sync_parent_directory(&root)?;
 
         // The exclusive advisory lock that `Database::open_with` takes on the
         // active log also guards the whole store directory: every mutation —
@@ -280,16 +293,21 @@ impl Store {
     /// not rewritten, and rollup provenance is already reconciled.
     pub fn commit(&mut self, transaction: Transaction) -> Result<Commit> {
         self.ensure_writable()?;
-        let committed_points: Vec<Point> = transaction
-            .records
-            .iter()
-            .filter_map(|record| match record {
-                Record::Points(points) => Some(points.as_slice()),
-                _ => None,
-            })
-            .flatten()
-            .copied()
-            .collect();
+        let has_active_rollups = self.manifest.rollups.iter().any(|rollup| rollup.active);
+        let committed_points: Vec<Point> = if has_active_rollups {
+            transaction
+                .records
+                .iter()
+                .filter_map(|record| match record {
+                    Record::Points(points) => Some(points.as_slice()),
+                    _ => None,
+                })
+                .flatten()
+                .copied()
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut commit = self.database.commit(transaction)?;
         if commit.deduplicated {
             return Ok(commit);
@@ -520,25 +538,7 @@ impl Store {
             .collect();
         let coverage = coverage_plan(candidates, required_start, required_end);
         if !coverage.descriptors.is_empty() {
-            let mut cache = self.rollup_cache.write().map_err(|_| Error::Poisoned)?;
-            for descriptor in &coverage.descriptors {
-                if !cache.contains_key(&descriptor.file) {
-                    cache.insert(
-                        descriptor.file.clone(),
-                        RollupSegment::open(self.rollup_directory.join(&descriptor.file))?,
-                    );
-                }
-            }
-            let mut buckets = Vec::new();
-            for descriptor in coverage.descriptors {
-                buckets.extend(
-                    cache
-                        .get(&descriptor.file)
-                        .expect("rollup was inserted")
-                        .query(start, end),
-                );
-            }
-            drop(cache);
+            let mut buckets = self.cached_rollup_buckets(&coverage.descriptors, start, end)?;
             for (gap_start, gap_end) in &coverage.gaps {
                 buckets.extend(self.materialize_raw_range(
                     series_id,
@@ -585,10 +585,8 @@ impl Store {
                 continue;
             };
             let cutoff = now_micros.saturating_sub(retention);
-            let raw = self
-                .database
-                .query_history(definition.id, i64::MIN, i64::MAX);
-            let Some(oldest) = raw.iter().map(|point| point.valid_time).min() else {
+            let raw = self.database.series_points(definition.id);
+            let Some(oldest) = raw.first().map(|point| point.valid_time) else {
                 gates.push(RetentionGate {
                     series_id: definition.id,
                     raw_before: cutoff,
@@ -1105,11 +1103,6 @@ impl Store {
                 // invalidation. Conservatively rebuild every stale descriptor.
                 descriptor.active = false;
                 changed = true;
-            } else {
-                self.rollup_cache
-                    .write()
-                    .map_err(|_| Error::Poisoned)?
-                    .insert(descriptor.file.clone(), segment);
             }
         }
         if changed {
@@ -1126,7 +1119,6 @@ impl Store {
     fn verify_manifest_read_only(&mut self) -> Result<()> {
         let stats = self.database.stats()?;
         let mut stale_rollup_files = 0_usize;
-        let mut cache = self.rollup_cache.write().map_err(|_| Error::Poisoned)?;
         for descriptor in self.manifest.rollups.iter().filter(|rollup| rollup.active) {
             if descriptor.source_points > stats.points {
                 return Err(Error::Corruption {
@@ -1148,11 +1140,8 @@ impl Store {
             }
             if descriptor.source_points < stats.points {
                 stale_rollup_files += 1;
-            } else {
-                cache.insert(descriptor.file.clone(), segment);
             }
         }
-        drop(cache);
         self.stale_rollup_files = stale_rollup_files;
         Ok(())
     }
@@ -1241,6 +1230,82 @@ impl Store {
             return Err(Error::ReadOnly);
         }
         self.ensure_healthy()
+    }
+
+    fn cached_rollup_buckets(
+        &self,
+        descriptors: &[&RollupDescriptor],
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<GaugeBucket>> {
+        let mut missing = Vec::new();
+        {
+            let cache = self.rollup_cache.read().map_err(|_| Error::Poisoned)?;
+            if descriptors
+                .iter()
+                .all(|descriptor| cache.contains_key(&descriptor.file))
+            {
+                return Ok(descriptors
+                    .iter()
+                    .flat_map(|descriptor| {
+                        cache
+                            .get(&descriptor.file)
+                            .expect("checked")
+                            .query(start, end)
+                    })
+                    .collect());
+            }
+            for descriptor in descriptors {
+                if !cache.contains_key(&descriptor.file) {
+                    missing.push(descriptor.file.clone());
+                }
+            }
+        }
+
+        let mut opened = Vec::with_capacity(missing.len());
+        for file in missing {
+            opened.push((
+                file.clone(),
+                RollupSegment::open(self.rollup_directory.join(&file))?,
+            ));
+        }
+
+        let mut cache = self.rollup_cache.write().map_err(|_| Error::Poisoned)?;
+        for (file, segment) in opened {
+            cache.entry(file).or_insert(segment);
+        }
+        let mut buckets = Vec::new();
+        for descriptor in descriptors {
+            if let Some(segment) = cache.get(&descriptor.file) {
+                buckets.extend(segment.query(start, end));
+                continue;
+            }
+            let segment = RollupSegment::open(self.rollup_directory.join(&descriptor.file))?;
+            buckets.extend(segment.query(start, end));
+            cache.insert(descriptor.file.clone(), segment);
+        }
+        trim_rollup_cache(&mut cache, descriptors);
+        Ok(buckets)
+    }
+}
+
+fn trim_rollup_cache(cache: &mut HashMap<String, RollupSegment>, keep: &[&RollupDescriptor]) {
+    if cache.len() <= MAX_CACHED_ROLLUP_SEGMENTS {
+        return;
+    }
+    let keep: HashSet<&str> = keep
+        .iter()
+        .map(|descriptor| descriptor.file.as_str())
+        .collect();
+    let overflow = cache.len() - MAX_CACHED_ROLLUP_SEGMENTS;
+    let evict: Vec<String> = cache
+        .keys()
+        .filter(|file| !keep.contains(file.as_str()))
+        .take(overflow)
+        .cloned()
+        .collect();
+    for file in evict {
+        cache.remove(&file);
     }
 }
 
@@ -1427,6 +1492,7 @@ fn rollup_file_name(
 
 fn copy_and_sync(source: &Path, destination: &Path) -> std::io::Result<u64> {
     let bytes = std::fs::copy(source, destination)?;
+    std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o600))?;
     std::fs::File::open(destination)?.sync_all()?;
     Ok(bytes)
 }
@@ -1441,6 +1507,7 @@ fn write_salvage_stage(source: &mut SalvageSource, temporary: &Path) -> Result<(
     let mut active = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
+        .mode(0o600)
         .open(temporary.join(ACTIVE_LOG))?;
     let mut prefix = std::io::Read::by_ref(&mut source.file).take(source.recovered_prefix_bytes);
     let copied = std::io::copy(&mut prefix, &mut active)?;
@@ -1576,6 +1643,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::error::Error as _;
     use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -1930,6 +1998,46 @@ mod tests {
             store.close().unwrap();
         }
         let store = Store::open(&root).unwrap();
+        assert_eq!(store.database().stats().unwrap().catalog_records, 2);
+    }
+
+    #[test]
+    fn open_creates_an_owner_only_root_and_active_log() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("private-store");
+        Store::open(&root).unwrap().close().unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(&root)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(root.join("active.wlog"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn open_of_a_precreated_root_still_publishes_the_parent_entry() {
+        // ftwdb-shadow creates the private store directory before Store::open.
+        // The parent fsync must still run; otherwise Always commits can be
+        // acknowledged for a directory whose parent dirent is not durable.
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("precreated");
+        std::fs::create_dir(&root).unwrap();
+        {
+            let mut store = Store::open(&root).unwrap();
+            initialize(&mut store, Vec::new(), None);
+            store.close().unwrap();
+        }
+        let store = Store::open_read_only(&root).unwrap();
         assert_eq!(store.database().stats().unwrap().catalog_records, 2);
     }
 

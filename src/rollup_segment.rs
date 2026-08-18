@@ -4,6 +4,7 @@ use crc32fast::hash;
 use lz4_flex::block::{compress_prepend_size, decompress};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -183,11 +184,9 @@ impl RollupSegment {
 
     #[must_use]
     pub fn query(&self, start: i64, end: i64) -> Vec<GaugeBucket> {
-        self.buckets
-            .iter()
-            .filter(|bucket| bucket.end > start && bucket.start < end)
-            .copied()
-            .collect()
+        let lo = self.buckets.partition_point(|bucket| bucket.end <= start);
+        let hi = lo + self.buckets[lo..].partition_point(|bucket| bucket.start < end);
+        self.buckets[lo..hi].to_vec()
     }
 }
 
@@ -223,7 +222,11 @@ fn write_temporary(path: &Path, buckets: &[GaugeBucket]) -> Result<RollupSegment
     let header_crc = hash(&header[..44]);
     header[44..48].copy_from_slice(&header_crc.to_le_bytes());
 
-    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
     file.write_all(&header)?;
     file.write_all(&payload)?;
     file.sync_all()?;

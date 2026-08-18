@@ -4,6 +4,7 @@ use crc32fast::hash;
 use lz4_flex::block::{compress_prepend_size, decompress};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -226,6 +227,7 @@ fn write_temporary_segment(
         .create_new(true)
         .read(true)
         .write(true)
+        .mode(0o600)
         .open(path)?;
     file.write_all(&[0_u8; SEGMENT_HEADER_BYTES])?;
 

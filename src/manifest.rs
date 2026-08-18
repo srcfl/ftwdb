@@ -4,6 +4,7 @@ use crc32fast::hash;
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -87,6 +88,7 @@ impl Manifest {
             let mut file = OpenOptions::new()
                 .create_new(true)
                 .write(true)
+                .mode(0o600)
                 .open(&temporary)?;
             file.write_all(&header)?;
             file.write_all(&payload)?;
