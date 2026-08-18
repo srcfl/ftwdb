@@ -8,8 +8,8 @@ use crate::storage::{SalvageSource, sync_directory, sync_parent_directory};
 use crate::transaction::{IngressIdentity, Record};
 use crate::{
     CalendarGaugeRollup, Commit, Config, Database, Error, FixedGaugeRollup, GaugeBucket,
-    IngressWatermarks, Point, Result, RollupResolution, RollupSegment, SeriesSemantics,
-    Transaction,
+    IngressWatermarks, Point, Result, RollupResolution, RollupSegment, SeriesDefinition,
+    SeriesSemantics, Transaction,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -158,6 +158,11 @@ pub struct Store {
     poisoned: bool,
     read_only: bool,
     stale_rollup_files: usize,
+    /// Last materialized `series_points(id).len()` for each gauge series.
+    /// Empty after open, so the first maintain may still scan; later calls
+    /// skip `query_latest` for series whose revision vector is unchanged.
+    materialized_series_revisions: HashMap<u64, usize>,
+    last_maintain_now_micros: Option<i64>,
 }
 
 impl Store {
@@ -211,6 +216,8 @@ impl Store {
             poisoned: false,
             read_only: false,
             stale_rollup_files: 0,
+            materialized_series_revisions: HashMap::new(),
+            last_maintain_now_micros: None,
         };
         store.verify_and_reconcile_manifest()?;
         // Reclaims superseded manifests/segments and any segment orphaned by
@@ -250,6 +257,8 @@ impl Store {
             poisoned: false,
             read_only: true,
             stale_rollup_files: 0,
+            materialized_series_revisions: HashMap::new(),
+            last_maintain_now_micros: None,
         };
         store.verify_manifest_read_only()?;
         Ok(store)
@@ -277,10 +286,13 @@ impl Store {
     /// Commits catalog and data records atomically, then durably advances the
     /// rollup manifest if new points affect or supersede materialized state.
     ///
-    /// A transaction tagged with [`Transaction::with_commit_id`] makes a
-    /// retry of this multi-step sequence safe. The identifier is checked
-    /// inside [`Database::commit`] before the raw frame is written, so a
-    /// replayed commit stores nothing and reports [`Commit::deduplicated`].
+    /// A transaction tagged with [`Transaction::with_commit_id`] makes an
+    /// exact retry of this multi-step sequence safe. The identifier and
+    /// payload are checked inside [`Database::commit`] before the raw frame
+    /// is written, so a matching replay stores nothing and reports
+    /// [`Commit::deduplicated`]. Prefer [`Self::commit_ingress`] for
+    /// production writers. A reused identifier with different records
+    /// conflicts instead of silently dropping the mutation.
     /// The failure mode this closes: the raw commit becomes durable, then
     /// manifest advancement fails and poisons this store (or the process
     /// crashes), so the caller saw an error for data that is permanently in
@@ -388,8 +400,9 @@ impl Store {
         Ok(commit)
     }
 
-    /// Builds every completed configured gauge bucket and atomically publishes
-    /// one manifest generation after all new segment files are durable.
+    /// Materializes completed configured gauge buckets that are dirty or newly
+    /// closable, then atomically publishes one manifest generation when
+    /// descriptors or segment files change.
     pub fn maintain(&mut self, now_micros: i64) -> Result<MaintenanceReport> {
         self.ensure_writable()?;
         // A durable rollup may never get ahead of the raw source it summarizes.
@@ -401,6 +414,17 @@ impl Store {
             .series_definitions()
             .cloned()
             .collect();
+        if self.can_skip_maintain_scan(now_micros, stats.points, &definitions)? {
+            self.remember_materialized_revisions(&definitions);
+            self.last_maintain_now_micros = Some(now_micros);
+            return Ok(MaintenanceReport {
+                manifest_generation: self.manifest.generation,
+                rollup_files_written: 0,
+                rollup_buckets_written: 0,
+                rollup_bytes_written: 0,
+                retention_gates: self.retention_gates(now_micros)?,
+            });
+        }
         let next_generation = self.manifest.generation.saturating_add(1);
         let mut next = self.manifest.clone();
         let mut files_written = 0_usize;
@@ -408,8 +432,18 @@ impl Store {
         let mut bytes_written = 0_u64;
         let mut changed = false;
 
-        for definition in definitions {
+        for definition in &definitions {
             if definition.semantics != SeriesSemantics::Gauge {
+                continue;
+            }
+            if deactivate_expired_rollups(&mut next, definition, now_micros) {
+                changed = true;
+            }
+            if self.can_skip_series_latest_query(definition, now_micros, &next.rollups)? {
+                if stamp_active_series_source(&mut next, definition.id, stats.commits, stats.points)
+                {
+                    changed = true;
+                }
                 continue;
             }
             let points = self
@@ -422,16 +456,6 @@ impl Store {
                 let retention_cutoff = tier
                     .retain_for_micros
                     .map(|retention| now_micros.saturating_sub(retention));
-                for rollup in &mut next.rollups {
-                    if rollup.active
-                        && rollup.series_id == definition.id
-                        && rollup.resolution == tier.resolution
-                        && retention_cutoff.is_some_and(|cutoff| rollup.end < cutoff)
-                    {
-                        rollup.active = false;
-                        changed = true;
-                    }
-                }
                 let shards = rollup_shards(&buckets, &tier.resolution, now_micros)?;
                 for shard in shards
                     .into_iter()
@@ -487,6 +511,8 @@ impl Store {
             next.generation = next_generation;
             self.publish_or_poison(next)?;
         }
+        self.remember_materialized_revisions(&definitions);
+        self.last_maintain_now_micros = Some(now_micros);
         let retention_gates = self.retention_gates(now_micros)?;
         Ok(MaintenanceReport {
             manifest_generation: self.manifest.generation,
@@ -936,6 +962,69 @@ impl Store {
         &self.root
     }
 
+    fn can_skip_maintain_scan(
+        &self,
+        now_micros: i64,
+        source_points: u64,
+        definitions: &[SeriesDefinition],
+    ) -> Result<bool> {
+        if self
+            .manifest
+            .rollups
+            .iter()
+            .any(|rollup| rollup.active && rollup.source_points != source_points)
+        {
+            return Ok(false);
+        }
+        if has_retention_work(&self.manifest, definitions, now_micros) {
+            return Ok(false);
+        }
+        for definition in definitions {
+            if definition.semantics != SeriesSemantics::Gauge {
+                continue;
+            }
+            if !self.can_skip_series_latest_query(definition, now_micros, &self.manifest.rollups)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn can_skip_series_latest_query(
+        &self,
+        definition: &SeriesDefinition,
+        now_micros: i64,
+        rollups: &[RollupDescriptor],
+    ) -> Result<bool> {
+        let raw = self.database.series_points(definition.id);
+        let known_unchanged =
+            self.materialized_series_revisions.get(&definition.id) == Some(&raw.len());
+        let no_new_completed_shard = match (known_unchanged, self.last_maintain_now_micros) {
+            (true, Some(prev_now)) => {
+                !series_gained_completed_shard(definition, prev_now, now_micros)?
+            }
+            _ => false,
+        };
+        if no_new_completed_shard {
+            return Ok(true);
+        }
+        Ok(!series_has_missing_completed_shard(
+            definition, raw, now_micros, rollups,
+        )?)
+    }
+
+    fn remember_materialized_revisions(&mut self, definitions: &[SeriesDefinition]) {
+        self.materialized_series_revisions.clear();
+        for definition in definitions {
+            if definition.semantics == SeriesSemantics::Gauge {
+                self.materialized_series_revisions.insert(
+                    definition.id,
+                    self.database.series_points(definition.id).len(),
+                );
+            }
+        }
+    }
+
     fn advance_after_points(&mut self, points: &[Point]) -> Result<()> {
         let stats = self.database.stats()?;
         let mut next = self.manifest.clone();
@@ -1344,6 +1433,171 @@ struct RollupShard {
     buckets: Vec<GaugeBucket>,
 }
 
+fn has_retention_work(
+    manifest: &Manifest,
+    definitions: &[SeriesDefinition],
+    now_micros: i64,
+) -> bool {
+    definitions.iter().any(|definition| {
+        definition.semantics == SeriesSemantics::Gauge
+            && definition.rollup_policy.tiers.iter().any(|tier| {
+                let Some(retention) = tier.retain_for_micros else {
+                    return false;
+                };
+                let cutoff = now_micros.saturating_sub(retention);
+                manifest.rollups.iter().any(|rollup| {
+                    rollup.active
+                        && rollup.series_id == definition.id
+                        && rollup.resolution == tier.resolution
+                        && rollup.end < cutoff
+                })
+            })
+    })
+}
+
+fn deactivate_expired_rollups(
+    next: &mut Manifest,
+    definition: &SeriesDefinition,
+    now_micros: i64,
+) -> bool {
+    let mut changed = false;
+    for tier in &definition.rollup_policy.tiers {
+        let retention_cutoff = tier
+            .retain_for_micros
+            .map(|retention| now_micros.saturating_sub(retention));
+        for rollup in &mut next.rollups {
+            if rollup.active
+                && rollup.series_id == definition.id
+                && rollup.resolution == tier.resolution
+                && retention_cutoff.is_some_and(|cutoff| rollup.end < cutoff)
+            {
+                rollup.active = false;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn stamp_active_series_source(
+    next: &mut Manifest,
+    series_id: u64,
+    source_commit: u64,
+    source_points: u64,
+) -> bool {
+    let mut changed = false;
+    for rollup in &mut next.rollups {
+        if rollup.active
+            && rollup.series_id == series_id
+            && (rollup.source_commit != source_commit || rollup.source_points != source_points)
+        {
+            rollup.source_commit = source_commit;
+            rollup.source_points = source_points;
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn series_gained_completed_shard(
+    definition: &SeriesDefinition,
+    prev_now: i64,
+    now_micros: i64,
+) -> Result<bool> {
+    if now_micros <= prev_now {
+        return Ok(false);
+    }
+    for tier in &definition.rollup_policy.tiers {
+        if latest_completed_shard_end(now_micros, &tier.resolution)?
+            > latest_completed_shard_end(prev_now, &tier.resolution)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn series_has_missing_completed_shard(
+    definition: &SeriesDefinition,
+    raw: &[Point],
+    now_micros: i64,
+    rollups: &[RollupDescriptor],
+) -> Result<bool> {
+    if raw.is_empty() {
+        return Ok(false);
+    }
+    for tier in &definition.rollup_policy.tiers {
+        let covered: HashSet<(i64, i64)> = rollups
+            .iter()
+            .filter(|rollup| {
+                rollup.active
+                    && rollup.series_id == definition.id
+                    && rollup.resolution == tier.resolution
+            })
+            .map(|rollup| (rollup.start, rollup.end))
+            .collect();
+        match &tier.resolution {
+            RollupResolution::FixedMicros(micros) => {
+                let width = fixed_shard_width(*micros)?;
+                for point in raw {
+                    let start = point.valid_time.div_euclid(width) * width;
+                    let end = start.saturating_add(width);
+                    if end <= now_micros && !covered.contains(&(start, end)) {
+                        return Ok(true);
+                    }
+                }
+            }
+            RollupResolution::Calendar {
+                unit,
+                iana_timezone,
+            } => {
+                for point in raw {
+                    let (start, end) =
+                        calendar_bucket_bounds(point.valid_time, *unit, iana_timezone)?;
+                    if end <= now_micros && !covered.contains(&(start, end)) {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn latest_completed_shard_end(
+    now_micros: i64,
+    resolution: &RollupResolution,
+) -> Result<Option<i64>> {
+    match resolution {
+        RollupResolution::FixedMicros(micros) => {
+            let width = fixed_shard_width(*micros)?;
+            Ok(Some(now_micros.div_euclid(width) * width))
+        }
+        RollupResolution::Calendar {
+            unit,
+            iana_timezone,
+        } => {
+            let (start, _) = calendar_bucket_bounds(now_micros, *unit, iana_timezone)?;
+            Ok(Some(start))
+        }
+    }
+}
+
+fn fixed_shard_width(micros: i64) -> Result<i64> {
+    if micros <= 0 {
+        return Err(Error::InvalidModel(
+            "fixed rollup resolution must be positive".to_owned(),
+        ));
+    }
+    Ok(
+        if micros <= UTC_DAY_MICROS && UTC_DAY_MICROS % micros == 0 {
+            UTC_DAY_MICROS
+        } else {
+            micros
+        },
+    )
+}
+
 fn rollup_shards(
     buckets: &[GaugeBucket],
     resolution: &RollupResolution,
@@ -1582,6 +1836,18 @@ where
 }
 
 fn hard_link_or_copy(source: &Path, destination: &Path) -> std::io::Result<LinkOrCopy> {
+    let mode = std::fs::symlink_metadata(source)?.permissions().mode();
+    if mode & 0o077 != 0 {
+        // A shared inode keeps the source mode. Copying into a 0755 backup
+        // directory must not republish a 0644 rollup or manifest.
+        copy_and_sync(source, destination)?;
+        return Ok(LinkOrCopy::Copied {
+            link_error: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "refusing to hard-link a group- or world-accessible inode",
+            ),
+        });
+    }
     hard_link_or_copy_with(
         source,
         destination,
@@ -1632,7 +1898,8 @@ fn snapshot_mismatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        BackupReport, LinkOrCopy, RollupSource, SalvageStatus, Store, hard_link_or_copy_with,
+        BackupReport, LinkOrCopy, RollupSource, SalvageStatus, Store, hard_link_or_copy,
+        hard_link_or_copy_with,
     };
     use crate::snapshot::{PublicationStep, StagedDirectory, fail_next_publication_step};
     use crate::storage::mutate_salvage_source_after_identity_checks;
@@ -1643,7 +1910,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::error::Error as _;
     use std::io::{Seek, SeekFrom, Write};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -1661,6 +1928,53 @@ mod tests {
         .unwrap();
 
         assert!(matches!(result, LinkOrCopy::Linked));
+    }
+
+    #[test]
+    fn hard_link_copies_group_readable_source_as_private() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("destination");
+        std::fs::write(&source, b"rollup-bytes").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        match hard_link_or_copy(&source, &destination).unwrap() {
+            LinkOrCopy::Copied { link_error } => {
+                assert_eq!(link_error.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            LinkOrCopy::Linked => panic!("group-readable source must be copied"),
+        }
+        assert_eq!(std::fs::read(&destination).unwrap(), b"rollup-bytes");
+        assert_eq!(
+            std::fs::metadata(&destination)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_ne!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(&destination).unwrap().ino()
+        );
+    }
+
+    #[test]
+    fn hard_link_keeps_a_private_source_inode() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("destination");
+        std::fs::write(&source, b"private").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(matches!(
+            hard_link_or_copy(&source, &destination).unwrap(),
+            LinkOrCopy::Linked
+        ));
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(&destination).unwrap().ino()
+        );
     }
 
     #[test]
@@ -2475,6 +2789,165 @@ mod tests {
     }
 
     #[test]
+    fn second_maintain_without_new_points_writes_no_rollup_files() {
+        let directory = tempdir().unwrap();
+        let resolution = RollupResolution::FixedMicros(5 * SECOND);
+        let mut store = Store::open(directory.path()).unwrap();
+        initialize(
+            &mut store,
+            vec![RollupTier {
+                resolution: resolution.clone(),
+                retain_for_micros: None,
+            }],
+            None,
+        );
+        let mut transaction = Transaction::new();
+        transaction.append_points(points());
+        store.commit(transaction).unwrap();
+        let first = store.maintain(DAY).unwrap();
+        assert_eq!(first.rollup_files_written, 1);
+        let generation = store.manifest_generation();
+
+        let second = store.maintain(DAY).unwrap();
+        assert_eq!(second.rollup_files_written, 0);
+        assert_eq!(second.manifest_generation, generation);
+        assert_eq!(store.manifest_generation(), generation);
+        assert_eq!(
+            store
+                .query_gauge(1, 0, 20 * SECOND, &resolution)
+                .unwrap()
+                .source,
+            RollupSource::Materialized
+        );
+    }
+
+    #[test]
+    fn maintain_does_not_rewrite_unchanged_series_when_another_ingests() {
+        let directory = tempdir().unwrap();
+        let resolution = RollupResolution::FixedMicros(5 * SECOND);
+        let mut store = Store::open(directory.path()).unwrap();
+        initialize(
+            &mut store,
+            vec![RollupTier {
+                resolution: resolution.clone(),
+                retain_for_micros: None,
+            }],
+            None,
+        );
+        let mut transaction = Transaction::new();
+        transaction.define_series(SeriesDefinition {
+            id: 2,
+            owner_entity: Some(EntityId(1)),
+            owner_relation: None,
+            name: "site_power".to_owned(),
+            physical_quantity: "power".to_owned(),
+            canonical_unit: "W".to_owned(),
+            semantics: SeriesSemantics::Gauge,
+            maximum_gap_micros: Some(2 * SECOND),
+            rollup_policy: RollupPolicy {
+                raw_retain_for_micros: None,
+                tiers: vec![RollupTier {
+                    resolution: resolution.clone(),
+                    retain_for_micros: None,
+                }],
+            },
+        });
+        store.commit(transaction).unwrap();
+
+        let mut transaction = Transaction::new();
+        transaction.append_points(points());
+        store.commit(transaction).unwrap();
+        store.maintain(DAY).unwrap();
+        let series_a_files: Vec<_> = store
+            .active_rollups()
+            .filter(|rollup| rollup.series_id == 1)
+            .map(|rollup| rollup.file.clone())
+            .collect();
+        assert_eq!(series_a_files.len(), 1);
+
+        let mut transaction = Transaction::new();
+        transaction.append_points(
+            (0..=20)
+                .map(|second| Point::actual(2, second * SECOND, second as f64))
+                .collect::<Vec<_>>(),
+        );
+        store.commit(transaction).unwrap();
+        assert_eq!(
+            store
+                .query_gauge(1, 0, 20 * SECOND, &resolution)
+                .unwrap()
+                .source,
+            RollupSource::Materialized
+        );
+
+        let report = store.maintain(DAY).unwrap();
+        assert_eq!(report.rollup_files_written, 1);
+        let series_a_after: Vec<_> = store
+            .active_rollups()
+            .filter(|rollup| rollup.series_id == 1)
+            .map(|rollup| rollup.file.clone())
+            .collect();
+        assert_eq!(series_a_after, series_a_files);
+        let current_points = store.database().stats().unwrap().points;
+        assert!(
+            store
+                .active_rollups()
+                .filter(|rollup| rollup.series_id == 1)
+                .all(|rollup| rollup.source_points == current_points)
+        );
+        assert_eq!(
+            store
+                .query_gauge(1, 0, 20 * SECOND, &resolution)
+                .unwrap()
+                .source,
+            RollupSource::Materialized
+        );
+        assert_eq!(
+            store
+                .query_gauge(2, 0, 20 * SECOND, &resolution)
+                .unwrap()
+                .source,
+            RollupSource::Materialized
+        );
+    }
+
+    #[test]
+    fn later_maintain_closes_completed_shards_without_new_points() {
+        let directory = tempdir().unwrap();
+        let resolution = RollupResolution::FixedMicros(5 * SECOND);
+        let mut store = Store::open(directory.path()).unwrap();
+        initialize(
+            &mut store,
+            vec![RollupTier {
+                resolution: resolution.clone(),
+                retain_for_micros: None,
+            }],
+            None,
+        );
+        let mut transaction = Transaction::new();
+        transaction.append_points(points());
+        store.commit(transaction).unwrap();
+        assert_eq!(store.maintain(20 * SECOND).unwrap().rollup_files_written, 0);
+        assert_eq!(
+            store
+                .query_gauge(1, 0, 20 * SECOND, &resolution)
+                .unwrap()
+                .source,
+            RollupSource::Raw
+        );
+
+        let report = store.maintain(DAY).unwrap();
+        assert_eq!(report.rollup_files_written, 1);
+        assert_eq!(
+            store
+                .query_gauge(1, 0, 20 * SECOND, &resolution)
+                .unwrap()
+                .source,
+            RollupSource::Materialized
+        );
+    }
+
+    #[test]
     fn manifest_generations_stay_bounded_across_commits() {
         let directory = tempdir().unwrap();
         let resolution = RollupResolution::FixedMicros(5 * SECOND);
@@ -2745,6 +3218,56 @@ mod tests {
         store.commit(transaction).unwrap();
         assert_eq!(backup.database().stats().unwrap().points, backup_points);
         assert_eq!(store.database().stats().unwrap().points, backup_points + 1);
+    }
+
+    #[test]
+    fn backup_copies_a_group_readable_rollup_instead_of_hard_linking() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("backup");
+        let mut store = Store::open(&source).unwrap();
+        initialize(
+            &mut store,
+            vec![RollupTier {
+                resolution: RollupResolution::FixedMicros(5 * SECOND),
+                retain_for_micros: None,
+            }],
+            None,
+        );
+        let mut transaction = Transaction::new();
+        transaction.append_points(points());
+        store.commit(transaction).unwrap();
+        store.maintain(DAY).unwrap();
+        let rollup = store
+            .active_rollups()
+            .next()
+            .expect("maintain wrote a rollup")
+            .file
+            .clone();
+        let source_rollup = source.join("rollups").join(&rollup);
+        std::fs::set_permissions(&source_rollup, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let report = store.backup_to(&destination).unwrap();
+        assert!(report.hard_link_fallbacks >= 1);
+        assert!(
+            report
+                .hard_link_fallback_error_kinds
+                .contains(&std::io::ErrorKind::PermissionDenied)
+        );
+
+        let destination_rollup = destination.join("rollups").join(&rollup);
+        assert_eq!(
+            std::fs::metadata(&destination_rollup)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_ne!(
+            std::fs::metadata(&source_rollup).unwrap().ino(),
+            std::fs::metadata(&destination_rollup).unwrap().ino()
+        );
     }
 
     #[test]

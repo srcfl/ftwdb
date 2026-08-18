@@ -27,14 +27,23 @@ calculation on the hot materialized path.
 
 ## Durable publication
 
-`Store::maintain(now)` performs this order:
+`Store::maintain(now)` syncs the raw commit log, then materializes only gauge
+series that need work. A series is skipped when existing rollups already cover
+every completed shard — typically because its append-only revision vector is
+unchanged and `now` has not closed a new shard. Retention deactivation still
+runs from existing descriptors. Unchanged series keep their `.rseg` files; if
+another series moved the global point count, their active descriptors receive
+a metadata-only `source_points` stamp so `query_gauge` stays on the
+materialized path. When every active rollup is already current and nothing
+needs retention or a newly closed shard, maintain publishes nothing.
 
-1. sync the raw commit log;
-2. compute every completed configured bucket;
-3. write and checksum an immutable `.rseg` file;
-4. sync the file and publish its no-replace hard link;
-5. sync the rollup directory;
-6. publish and sync a new `MANIFEST.<generation>` file.
+When a series does need work:
+
+1. compute every completed configured bucket from its latest revisions;
+2. write and checksum an immutable `.rseg` file;
+3. sync the file and publish its no-replace hard link;
+4. sync the rollup directory;
+5. publish and sync a new `MANIFEST.<generation>` file.
 
 Fixed 5-minute, 30-minute, and hourly buckets are grouped into stable completed
 UTC-day segments. Calendar day/month buckets are each an independent segment.

@@ -7,9 +7,9 @@ use crc32fast::hash;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{File, TryLockError};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 
 const DATABASE_MAGIC: &[u8; 8] = b"FTWDB001";
@@ -182,6 +182,14 @@ struct StoredIngressReceipt {
     commit: Commit,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct StoredIdentifiedReceipt {
+    payload_offset: u64,
+    payload_len: u32,
+    payload_crc32: u32,
+    commit: Commit,
+}
+
 /// Why the final bytes of a log were recovered.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RecoveredTail {
@@ -286,6 +294,10 @@ pub struct Database {
     /// log — acceptable because the whole log is already replayed into memory
     /// by design (the README acknowledges that ceiling).
     commit_ids: HashSet<u128>,
+    /// Payload receipts for legacy [`Transaction::with_commit_id`] frames.
+    /// A replay compares encoded bytes (and re-reads the stored frame) so a
+    /// reused identifier with different records cannot silently deduplicate.
+    identified_receipts: HashMap<u128, StoredIdentifiedReceipt>,
     /// One small receipt per ordered ingress frame. Canonical transaction
     /// bytes stay in the log; a replay reads them only after an identity hit,
     /// so the index stays bounded to fixed metadata per commit.
@@ -359,13 +371,7 @@ impl Database {
         let mut file = if read_only {
             open_regular_file_read_only(path)?
         } else {
-            OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .mode(0o600)
-                .open(path)?
+            open_regular_file_read_write(path)?
         };
 
         // Take an advisory lock before recovery so a writer and a reader can
@@ -437,6 +443,7 @@ impl Database {
             index: scan.index,
             catalog: scan.catalog,
             commit_ids: scan.commit_ids,
+            identified_receipts: scan.identified_receipts,
             ingress_receipts: scan.ingress_receipts,
             ingress_commit_ids: scan.ingress_commit_ids,
             ingress_last_sequences: scan.ingress_last_sequences,
@@ -561,12 +568,12 @@ impl Database {
     /// Atomically commits catalog changes and point batches in one frame.
     ///
     /// When the transaction carries a [`Transaction::with_commit_id`]
-    /// identifier that is already in the log, nothing is validated or
-    /// written and the returned commit reports
-    /// [`Commit::deduplicated`]: the identifier is checked before any other
-    /// work, so a retried commit can never duplicate points. The check keys
-    /// on the identifier alone — a retry that reuses an identifier with
-    /// different records is also answered from the original commit. An empty
+    /// identifier that is already in the log, the encoded payload is checked
+    /// against the original frame. An exact retry writes nothing and reports
+    /// [`Commit::deduplicated`]. Reusing the identifier with different
+    /// records returns [`Error::IngressCommitIdConflict`]. Prefer
+    /// [`Self::commit_ingress`] at a production writer boundary so retries
+    /// carry a source cursor and cannot drop a mutated payload. An empty
     /// transaction writes no frame, so its identifier (if any) is not
     /// recorded; there is nothing a replay could duplicate.
     pub fn commit(&mut self, transaction: Transaction) -> Result<Commit> {
@@ -584,14 +591,21 @@ impl Database {
                 return Err(Error::IngressCommitIdConflict { commit_id });
             }
             if self.commit_ids.contains(&commit_id) {
-                return Ok(Commit {
-                    frame_offset: self.file.seek(SeekFrom::End(0))?,
-                    points: 0,
-                    records: 0,
-                    bytes_written: 0,
-                    durable: self.bytes_since_sync == 0,
-                    deduplicated: true,
-                });
+                let payload = encode_transaction(&transaction)?;
+                if let Some(receipt) = self.identified_receipts.get(&commit_id).copied() {
+                    if !self.identified_payload_matches(receipt, &payload)? {
+                        return Err(Error::IngressCommitIdConflict { commit_id });
+                    }
+                    return Ok(Commit {
+                        frame_offset: self.file.seek(SeekFrom::End(0))?,
+                        points: 0,
+                        records: 0,
+                        bytes_written: 0,
+                        durable: self.bytes_since_sync == 0,
+                        deduplicated: true,
+                    });
+                }
+                return Err(Error::IngressCommitIdConflict { commit_id });
             }
         }
         if transaction.is_empty() {
@@ -648,6 +662,22 @@ impl Database {
         }
         if let Some(commit_id) = transaction.commit_id {
             self.commit_ids.insert(commit_id);
+            self.identified_receipts.insert(
+                commit_id,
+                StoredIdentifiedReceipt {
+                    payload_offset: frame_offset + FRAME_HEADER_BYTES as u64,
+                    payload_len,
+                    payload_crc32: hash(&payload),
+                    commit: Commit {
+                        frame_offset,
+                        points: point_count,
+                        records: transaction.record_count(),
+                        bytes_written,
+                        durable,
+                        deduplicated: false,
+                    },
+                },
+            );
         }
         self.commits += 1;
         self.points += point_count as u64;
@@ -824,6 +854,83 @@ impl Database {
                 .insert(identity.source_id, identity.sequence);
         }
         Ok(commit)
+    }
+
+    fn identified_payload_matches(
+        &mut self,
+        receipt: StoredIdentifiedReceipt,
+        candidate: &[u8],
+    ) -> Result<bool> {
+        let result = self.identified_payload_matches_at(receipt, candidate);
+        if matches!(result, Err(Error::Io(_) | Error::Corruption { .. })) {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn identified_payload_matches_at(
+        &self,
+        receipt: StoredIdentifiedReceipt,
+        candidate: &[u8],
+    ) -> Result<bool> {
+        if candidate.len() != receipt.payload_len as usize
+            || hash(candidate) != receipt.payload_crc32
+        {
+            return Ok(false);
+        }
+        let expected_payload_offset = receipt
+            .commit
+            .frame_offset
+            .checked_add(FRAME_HEADER_BYTES as u64)
+            .ok_or_else(|| Error::Serialization("identified replay offset overflows".to_owned()))?;
+        if receipt.payload_offset != expected_payload_offset {
+            return corruption(
+                receipt.commit.frame_offset,
+                "stored identified receipt offset is invalid",
+            );
+        }
+        let record_count = u32::try_from(receipt.commit.records).map_err(|_| {
+            Error::Serialization("identified replay record count overflows".to_owned())
+        })?;
+        let expected_header = encode_frame_header(
+            FRAME_KIND_IDENTIFIED_TRANSACTION,
+            record_count,
+            receipt.payload_len,
+            receipt.payload_crc32,
+        );
+        let mut stored_header = [0_u8; FRAME_HEADER_BYTES];
+        self.file
+            .read_exact_at(&mut stored_header, receipt.commit.frame_offset)?;
+        if stored_header != expected_header {
+            return corruption(
+                receipt.commit.frame_offset,
+                "stored identified frame header changed after open",
+            );
+        }
+
+        let mut stored = [0_u8; 8 * 1024];
+        let mut candidate_offset = 0_usize;
+        while candidate_offset < candidate.len() {
+            let chunk_len = stored.len().min(candidate.len() - candidate_offset);
+            let file_offset = receipt
+                .payload_offset
+                .checked_add(u64::try_from(candidate_offset).map_err(|_| {
+                    Error::Serialization("identified replay offset overflows".to_owned())
+                })?)
+                .ok_or_else(|| {
+                    Error::Serialization("identified replay offset overflows".to_owned())
+                })?;
+            self.file
+                .read_exact_at(&mut stored[..chunk_len], file_offset)?;
+            if stored[..chunk_len] != candidate[candidate_offset..candidate_offset + chunk_len] {
+                return corruption(
+                    receipt.commit.frame_offset,
+                    "stored identified payload changed after open",
+                );
+            }
+            candidate_offset += chunk_len;
+        }
+        Ok(true)
     }
 
     fn ingress_payload_matches(
@@ -1313,6 +1420,7 @@ struct Scan {
     index: HashMap<u64, Vec<Point>>,
     catalog: Catalog,
     commit_ids: HashSet<u128>,
+    identified_receipts: HashMap<u128, StoredIdentifiedReceipt>,
     ingress_receipts: HashMap<IngressKey, StoredIngressReceipt>,
     ingress_commit_ids: HashMap<u128, IngressKey>,
     ingress_last_sequences: HashMap<u128, u64>,
@@ -1376,6 +1484,7 @@ fn scan_log(
     let mut index = HashMap::<u64, Vec<Point>>::new();
     let mut catalog = Catalog::default();
     let mut commit_ids = HashSet::<u128>::new();
+    let mut identified_receipts = HashMap::<u128, StoredIdentifiedReceipt>::new();
     let mut ingress_receipts = HashMap::<IngressKey, StoredIngressReceipt>::new();
     let mut ingress_commit_ids = HashMap::<u128, IngressKey>::new();
     let mut ingress_last_sequences = HashMap::<u128, u64>::new();
@@ -1512,6 +1621,7 @@ fn scan_log(
             points += item_count as u64;
         } else {
             let mut ingress_identity = None;
+            let mut identified_commit_id = None;
             let transaction_payload = if frame_kind == FRAME_KIND_IDENTIFIED_TRANSACTION {
                 let commit_id = u128::from_le_bytes(payload[..COMMIT_ID_BYTES].try_into().unwrap());
                 // The writer refuses to append a frame whose identifier is
@@ -1524,6 +1634,7 @@ fn scan_log(
                         "duplicate commit identifier"
                     );
                 }
+                identified_commit_id = Some(commit_id);
                 &payload[COMMIT_ID_BYTES..]
             } else if frame_kind == FRAME_KIND_INGRESS_TRANSACTION {
                 let identity = IngressIdentity {
@@ -1604,6 +1715,24 @@ fn scan_log(
                     _ => catalog_records += 1,
                 }
             }
+            if let Some(commit_id) = identified_commit_id {
+                identified_receipts.insert(
+                    commit_id,
+                    StoredIdentifiedReceipt {
+                        payload_offset: offset + FRAME_HEADER_BYTES as u64,
+                        payload_len: u32::try_from(payload.len()).unwrap(),
+                        payload_crc32: payload_checksum,
+                        commit: Commit {
+                            frame_offset: offset,
+                            points: recovered_point_count,
+                            records: records.len(),
+                            bytes_written: frame_len,
+                            durable: false,
+                            deduplicated: false,
+                        },
+                    },
+                );
+            }
             if let Some(identity) = ingress_identity {
                 let key = IngressKey::from(identity);
                 let receipt = StoredIngressReceipt {
@@ -1648,6 +1777,7 @@ fn scan_log(
         index,
         catalog,
         commit_ids,
+        identified_receipts,
         ingress_receipts,
         ingress_commit_ids,
         ingress_last_sequences,
@@ -1817,7 +1947,10 @@ impl SalvageSource {
         });
         #[cfg(test)]
         if mutate {
-            let mut writer = OpenOptions::new().read(true).write(true).open(&self.path)?;
+            let mut writer = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.path)?;
             writer.seek(SeekFrom::End(-1))?;
             let mut byte = [0_u8; 1];
             writer.read_exact(&mut byte)?;
@@ -1844,6 +1977,63 @@ impl SalvageSource {
             });
         }
         Ok(())
+    }
+}
+
+/// Opens or creates one regular file without following a final symlink or
+/// blocking on a FIFO or device. Existing paths use the same identity check
+/// as [`open_regular_file_read_only`]; a missing path is created as `0600`.
+fn open_regular_file_read_write(path: &Path) -> Result<File> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    match std::fs::symlink_metadata(path) {
+        Ok(path_metadata) => {
+            if !path_metadata.file_type().is_file() {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("writable path is not a regular file: {}", path.display()),
+                )));
+            }
+            let descriptor = open(
+                path,
+                OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+                Mode::empty(),
+            )
+            .map_err(|error| Error::Io(error.into()))?;
+            let file = File::from(descriptor);
+            let opened_metadata = file.metadata()?;
+            if !opened_metadata.file_type().is_file()
+                || opened_metadata.dev() != path_metadata.dev()
+                || opened_metadata.ino() != path_metadata.ino()
+            {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("writable path changed while opening: {}", path.display()),
+                )));
+            }
+            Ok(file)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let descriptor = open(
+                path,
+                OFlags::RDWR
+                    | OFlags::CLOEXEC
+                    | OFlags::NOFOLLOW
+                    | OFlags::CREATE
+                    | OFlags::NONBLOCK,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .map_err(|error| Error::Io(error.into()))?;
+            let file = File::from(descriptor);
+            if !file.metadata()?.file_type().is_file() {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("writable path is not a regular file: {}", path.display()),
+                )));
+            }
+            Ok(file)
+        }
+        Err(error) => Err(Error::Io(error)),
     }
 }
 
@@ -3242,6 +3432,117 @@ mod tests {
         assert_eq!(database.stats().unwrap().points, 2);
         assert_eq!(database.query_history(7, 0, 1_000).len(), 2);
         database.close().unwrap();
+    }
+
+    #[test]
+    fn identified_commit_rejects_a_reused_id_with_different_bytes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("identified-conflict.ftwdb");
+        let mut first_point = point(100, 10, 10, 1.0);
+        first_point.run_id = 0;
+        let mut second_point = point(200, 20, 20, 2.0);
+        second_point.run_id = 0;
+        let mut database = Database::open(&path).unwrap();
+        let mut catalog = Transaction::new();
+        catalog.upsert_entity(home()).define_series(power_series());
+        database.commit(catalog).unwrap();
+
+        let mut first = Transaction::new();
+        first.append_points(vec![first_point]).with_commit_id(42);
+        assert!(!database.commit(first).unwrap().deduplicated);
+
+        let mut mutated = Transaction::new();
+        mutated.append_points(vec![second_point]).with_commit_id(42);
+        assert!(matches!(
+            database.commit(mutated),
+            Err(Error::IngressCommitIdConflict { commit_id: 42 })
+        ));
+        assert_eq!(database.stats().unwrap().points, 1);
+        assert_eq!(database.query_history(7, 0, 1_000).len(), 1);
+
+        let mut exact = Transaction::new();
+        exact.append_points(vec![first_point]).with_commit_id(42);
+        assert!(database.commit(exact).unwrap().deduplicated);
+
+        database.close().unwrap();
+        let mut reopened = Database::open(&path).unwrap();
+        let mut mutated_after_reopen = Transaction::new();
+        mutated_after_reopen
+            .append_points(vec![second_point])
+            .with_commit_id(42);
+        assert!(matches!(
+            reopened.commit(mutated_after_reopen),
+            Err(Error::IngressCommitIdConflict { commit_id: 42 })
+        ));
+        let mut exact_after_reopen = Transaction::new();
+        exact_after_reopen
+            .append_points(vec![first_point])
+            .with_commit_id(42);
+        assert!(reopened.commit(exact_after_reopen).unwrap().deduplicated);
+        assert_eq!(reopened.stats().unwrap().points, 1);
+    }
+
+    #[test]
+    fn writable_open_rejects_symlink_fifo_and_directory_without_blocking() {
+        for kind in ["symlink", "fifo", "directory"] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("not-a-regular-file.ftwdb");
+            match kind {
+                "symlink" => std::os::unix::fs::symlink("outside", &path).unwrap(),
+                "fifo" => create_fifo(&path),
+                "directory" => std::fs::create_dir(&path).unwrap(),
+                _ => unreachable!(),
+            }
+            match Database::open(&path) {
+                Ok(_) => panic!("{kind}: writable open must reject a non-file"),
+                Err(Error::Io(io_error)) => {
+                    assert!(
+                        io_error.to_string().contains("not a regular file"),
+                        "{kind}: {io_error}"
+                    );
+                }
+                Err(other) => panic!("{kind}: expected I/O rejection, got {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn writable_open_creates_a_private_regular_file() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("created.ftwdb");
+        let database = Database::open(&path).unwrap();
+        drop(database);
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_fifo(path: &std::path::Path) {
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn create_fifo(path: &std::path::Path) {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path` is a live NUL-terminated string and mode has no
+        // platform-dependent bits beyond user read/write permissions.
+        let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        if result != 0 {
+            panic!("mkfifo failed: {}", std::io::Error::last_os_error());
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn create_fifo(_path: &std::path::Path) {
+        panic!("FIFO open tests require Linux or macOS");
     }
 
     #[test]

@@ -46,8 +46,8 @@ pub enum Error {
         source_id: u128,
         sequence: u64,
     },
-    /// A producer reused one ingress commit identifier for another source,
-    /// sequence, or transaction. The writer remains usable.
+    /// A producer reused one commit identifier for another source, sequence,
+    /// or transaction payload. The writer remains usable.
     IngressCommitIdConflict {
         commit_id: u128,
     },
@@ -110,7 +110,7 @@ impl fmt::Display for Error {
             ),
             Self::IngressCommitIdConflict { commit_id } => write!(
                 f,
-                "ingress commit identifier {commit_id:032x} conflicts with its stored transaction"
+                "commit identifier {commit_id:032x} conflicts with its stored transaction"
             ),
             Self::IngressSequenceNotIncreasing {
                 source_id,
