@@ -2373,7 +2373,11 @@ impl ReadOnlyFileIdentity {
 }
 
 impl SalvageSource {
-    pub(crate) fn open(root_path: &Path, file_name: &str) -> Result<Self> {
+    pub(crate) fn open(
+        root_path: &Path,
+        file_name: &str,
+        published_seals: &HashSet<u64>,
+    ) -> Result<Self> {
         use rustix::fs::{Mode, OFlags, open, openat};
 
         let root_descriptor = open(
@@ -2442,7 +2446,7 @@ impl SalvageSource {
             Config::default().max_batch_points,
             Config::default().max_transaction_bytes,
             ScanMode::Salvage,
-            &HashSet::new(),
+            published_seals,
         )?;
         Ok(Self {
             file,
@@ -3275,7 +3279,7 @@ mod tests {
         std::fs::create_dir(&source_root).unwrap();
         let active = source_root.join("active.wlog");
         legacy_log(&active, 1);
-        let source = SalvageSource::open(&source_root, "active.wlog").unwrap();
+        let source = SalvageSource::open(&source_root, "active.wlog", &HashSet::new()).unwrap();
 
         let mut writer = OpenOptions::new().write(true).open(&active).unwrap();
         writer.seek(SeekFrom::End(-1)).unwrap();

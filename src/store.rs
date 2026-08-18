@@ -2,7 +2,7 @@ use crate::manifest::{self, Manifest, RawSegmentDescriptor, RollupDescriptor};
 use crate::rollup::calendar_bucket_bounds;
 use crate::snapshot::{
     PublicationStep, StagedDirectory, inject_checksum_mismatch, publication_checkpoint,
-    snapshot_digest, snapshot_file_prefix_digest,
+    snapshot_digest, snapshot_digest_with_open_prefix, snapshot_file_prefix_digest,
 };
 use crate::storage::{SalvageSource, sync_directory, sync_parent_directory};
 use crate::transaction::{IngressIdentity, Record};
@@ -999,24 +999,37 @@ impl Store {
     }
 
     /// Copies the longest raw-log prefix that validates from the first frame
-    /// into a new store. Derived manifests and rollups are never opened.
+    /// into a new store, together with sealed raw segments the recovered
+    /// manifest still names. Derived rollups are never opened.
     pub fn salvage_from(
         damaged_store: impl AsRef<Path>,
         destination: impl AsRef<Path>,
     ) -> Result<SalvageReport> {
-        refuse_sealed_salvage(damaged_store.as_ref())?;
-        let mut source = SalvageSource::open(damaged_store.as_ref(), ACTIVE_LOG)?;
+        let damaged_store = damaged_store.as_ref();
+        let sealed = plan_sealed_salvage(damaged_store)?;
+        let published_seals = published_seal_generations(&sealed.manifest);
+        let mut source = SalvageSource::open(damaged_store, ACTIVE_LOG, &published_seals)?;
         let destination = destination.as_ref();
-        let relative_paths = vec![ACTIVE_LOG.to_owned()];
-        let source_digest = snapshot_file_prefix_digest(
-            &mut source.file,
-            ACTIVE_LOG,
-            source.recovered_prefix_bytes,
-        )?;
+        let relative_paths = salvage_snapshot_paths(&sealed);
+        let source_digest = if sealed.manifest.segments.is_empty() {
+            snapshot_file_prefix_digest(
+                &mut source.file,
+                ACTIVE_LOG,
+                source.recovered_prefix_bytes,
+            )?
+        } else {
+            snapshot_digest_with_open_prefix(
+                damaged_store,
+                &relative_paths,
+                ACTIVE_LOG,
+                &mut source.file,
+                source.recovered_prefix_bytes,
+            )?
+        };
         source.ensure_unchanged()?;
 
         let staged = StagedDirectory::create(destination, "salvage")?;
-        write_salvage_stage(&mut source, staged.path())?;
+        write_salvage_stage(&mut source, damaged_store, staged.path(), &sealed)?;
         let stage_digest =
             inject_checksum_mismatch(snapshot_digest(staged.path(), &relative_paths)?);
         if stage_digest != source_digest {
@@ -1031,8 +1044,11 @@ impl Store {
         let stage = Self::open_read_only(staged.path())?;
         let stage_integrity = stage.check_integrity()?;
         stage.require_clean_restore_source(&stage_integrity)?;
+        let expected_points = source
+            .recovered_points
+            .saturating_add(sealed.sealed_points());
         if stage_integrity.raw_commits != source.recovered_commits
-            || stage_integrity.raw_points != source.recovered_points
+            || stage_integrity.raw_points != expected_points
         {
             return Err(Error::Corruption {
                 offset: 0,
@@ -1056,7 +1072,7 @@ impl Store {
                 ));
             }
             if destination_integrity.raw_commits != source.recovered_commits
-                || destination_integrity.raw_points != source.recovered_points
+                || destination_integrity.raw_points != expected_points
             {
                 return Err(Error::Corruption {
                     offset: 0,
@@ -1989,22 +2005,129 @@ fn raw_segment_file_name(generation: u64) -> String {
     format!("g{generation}-{nonce}.wseg")
 }
 
-fn refuse_sealed_salvage(root: &Path) -> Result<()> {
-    let segments = root.join(SEGMENT_DIRECTORY);
-    let Ok(entries) = std::fs::read_dir(&segments) else {
-        return Ok(());
-    };
-    if entries.flatten().any(|entry| {
-        entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| name.ends_with(".wseg"))
-    }) {
-        return Err(Error::InvalidModel(
-            "salvage does not reconstruct sealed raw segments; restore from a backup".to_owned(),
-        ));
+#[derive(Clone, Debug, Default)]
+struct SealedSalvagePlan {
+    manifest: Manifest,
+}
+
+impl SealedSalvagePlan {
+    fn sealed_points(&self) -> u64 {
+        self.manifest
+            .segments
+            .iter()
+            .map(|segment| segment.points)
+            .sum()
     }
-    Ok(())
+}
+
+fn salvage_snapshot_paths(sealed: &SealedSalvagePlan) -> Vec<String> {
+    let mut files = vec![ACTIVE_LOG.to_owned()];
+    files.extend(
+        sealed
+            .manifest
+            .segments
+            .iter()
+            .map(|descriptor| format!("{SEGMENT_DIRECTORY}/{}", descriptor.file)),
+    );
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn list_wseg_names(root: &Path) -> Result<Vec<String>> {
+    let segments = root.join(SEGMENT_DIRECTORY);
+    let entries = match std::fs::read_dir(&segments) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(Error::Io(error)),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name.ends_with(".wseg") {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// Recovers sealed `.wseg` coverage from the highest valid manifest. Missing
+/// or unreadable sealed files fail closed so salvage never publishes a store
+/// that silently dropped historical raw.
+fn plan_sealed_salvage(root: &Path) -> Result<SealedSalvagePlan> {
+    let on_disk = list_wseg_names(root)?;
+    let manifests = root.join(MANIFEST_DIRECTORY);
+    let loaded = if manifests.is_dir() {
+        match Manifest::load(&manifests) {
+            Ok(manifest) => manifest,
+            Err(_) if on_disk.is_empty() => Manifest::default(),
+            Err(error) => return Err(error),
+        }
+    } else if on_disk.is_empty() {
+        Manifest::default()
+    } else {
+        return Err(Error::Corruption {
+            offset: 0,
+            reason: "salvage found sealed raw segments but no readable manifest descriptors"
+                .to_owned(),
+        });
+    };
+
+    if loaded.segments.is_empty() && !on_disk.is_empty() {
+        return Err(Error::Corruption {
+            offset: 0,
+            reason: "salvage found sealed raw segments but no manifest descriptors".to_owned(),
+        });
+    }
+
+    let referenced: HashSet<&str> = loaded
+        .segments
+        .iter()
+        .map(|segment| segment.file.as_str())
+        .collect();
+    for name in &on_disk {
+        if !referenced.contains(name.as_str()) {
+            return Err(Error::Corruption {
+                offset: 0,
+                reason: format!(
+                    "salvage found sealed segment {name} not named by the recovered manifest"
+                ),
+            });
+        }
+    }
+
+    let segment_directory = root.join(SEGMENT_DIRECTORY);
+    for descriptor in &loaded.segments {
+        let path = segment_directory.join(&descriptor.file);
+        let segment = Segment::open(&path).map_err(|error| Error::Corruption {
+            offset: 0,
+            reason: format!(
+                "sealed raw segment {} is unreadable: {error}",
+                descriptor.file
+            ),
+        })?;
+        if segment.stats().points != descriptor.points {
+            return Err(Error::Corruption {
+                offset: 0,
+                reason: format!(
+                    "sealed raw segment {} does not match its manifest point count",
+                    descriptor.file
+                ),
+            });
+        }
+    }
+
+    Ok(SealedSalvagePlan {
+        manifest: Manifest {
+            generation: loaded.generation,
+            rollups: Vec::new(),
+            segments: loaded.segments,
+        },
+    })
 }
 
 fn rollup_file_name(
@@ -2031,11 +2154,20 @@ fn copy_and_sync(source: &Path, destination: &Path) -> std::io::Result<u64> {
     Ok(bytes)
 }
 
-fn write_salvage_stage(source: &mut SalvageSource, temporary: &Path) -> Result<()> {
+fn write_salvage_stage(
+    source: &mut SalvageSource,
+    source_root: &Path,
+    temporary: &Path,
+    sealed: &SealedSalvagePlan,
+) -> Result<()> {
     let manifests = temporary.join(MANIFEST_DIRECTORY);
     let rollups = temporary.join(ROLLUP_DIRECTORY);
+    let segments = temporary.join(SEGMENT_DIRECTORY);
     std::fs::create_dir(&manifests)?;
     std::fs::create_dir(&rollups)?;
+    if !sealed.manifest.segments.is_empty() {
+        std::fs::create_dir(&segments)?;
+    }
     publication_checkpoint(PublicationStep::Copy)?;
     source.file.seek(SeekFrom::Start(0))?;
     let mut active = std::fs::OpenOptions::new()
@@ -2051,10 +2183,26 @@ fn write_salvage_stage(source: &mut SalvageSource, temporary: &Path) -> Result<(
         });
     }
     active.sync_all()?;
+    for descriptor in &sealed.manifest.segments {
+        hard_link_or_copy(
+            &source_root.join(SEGMENT_DIRECTORY).join(&descriptor.file),
+            &segments.join(&descriptor.file),
+        )?;
+    }
+    if !sealed.manifest.segments.is_empty() {
+        let mut salvage_manifest = sealed.manifest.clone();
+        if salvage_manifest.generation == 0 {
+            salvage_manifest.generation = 1;
+        }
+        salvage_manifest.publish(&manifests)?;
+    }
     source.ensure_unchanged()?;
     publication_checkpoint(PublicationStep::Sync)?;
     sync_directory(&manifests)?;
     sync_directory(&rollups)?;
+    if !sealed.manifest.segments.is_empty() {
+        sync_directory(&segments)?;
+    }
     sync_directory(temporary)?;
     Ok(())
 }
@@ -4447,26 +4595,198 @@ mod tests {
         assert_eq!(store.database().query_history(1, 0, DAY), vec![sample]);
     }
 
+    fn sealed_wseg_paths(root: &Path) -> Vec<std::path::PathBuf> {
+        let mut paths: Vec<_> = std::fs::read_dir(root.join("segments"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("wseg"))
+            .collect();
+        paths.sort();
+        paths
+    }
+
     #[test]
-    fn salvage_refuses_a_store_with_sealed_raw_segments() {
+    fn salvage_recovers_a_point_that_exists_only_in_a_sealed_segment() {
         let directory = tempdir().unwrap();
         let source = directory.path().join("source");
         let target = directory.path().join("salvaged");
+        let sealed = Point::actual(1, SECOND, 1.0);
+        let live = Point::actual(1, 2 * SECOND, 2.0);
         {
             let mut store = Store::open(&source).unwrap();
             initialize(&mut store, Vec::new(), None);
             let mut transaction = Transaction::new();
-            transaction.append_points(vec![Point::actual(1, SECOND, 1.0)]);
+            transaction.append_points(vec![sealed]);
             store.commit(transaction).unwrap();
             store.seal_and_reclaim().unwrap();
+            assert_eq!(store.database().live_index_len(), 0);
+            let mut transaction = Transaction::new();
+            transaction.append_points(vec![live]);
+            store.commit(transaction).unwrap();
             store.close().unwrap();
         }
-        let error = Store::salvage_from(&source, &target).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("does not reconstruct sealed raw segments")
+        let source_before = directory_snapshot(&source);
+
+        let report = Store::salvage_from(&source, &target).unwrap();
+        assert_eq!(report.status, SalvageStatus::Clean);
+        assert_eq!(report.stop_reason, SalvageStopReason::CleanEof);
+        assert_eq!(report.recovered_points, 2);
+        assert_eq!(
+            report.source_prefix_crc32,
+            report.destination_snapshot_crc32
         );
-        assert!(!target.exists());
+
+        let salvaged = Store::open_read_only(&target).unwrap();
+        assert_eq!(salvaged.database().sealed_point_count(), 1);
+        assert_eq!(salvaged.database().live_index_len(), 1);
+        assert_eq!(
+            salvaged.database().query_history(1, 0, DAY),
+            vec![sealed, live]
+        );
+        assert_eq!(
+            salvaged.database().query_history(1, 0, SECOND + 1),
+            vec![sealed]
+        );
+        drop(salvaged);
+
+        let reopened = Store::open(&target).unwrap();
+        assert_eq!(
+            reopened.database().query_history(1, 0, SECOND + 1),
+            vec![sealed]
+        );
+        assert_eq!(directory_snapshot(&source), source_before);
+    }
+
+    #[test]
+    fn salvage_recovers_a_torn_live_tail_with_sealed_history_intact() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        let target = directory.path().join("salvaged");
+        let sealed = Point::actual(1, SECOND, 1.0);
+        let live = Point::actual(1, 3 * SECOND, 3.0);
+        {
+            let mut store = Store::open(&source).unwrap();
+            initialize(&mut store, Vec::new(), None);
+            let mut transaction = Transaction::new();
+            transaction.append_points(vec![sealed]);
+            store.commit(transaction).unwrap();
+            store.seal_and_reclaim().unwrap();
+            let mut transaction = Transaction::new();
+            transaction.append_points(vec![live]);
+            store.commit(transaction).unwrap();
+            store.close().unwrap();
+        }
+        let active = source.join("active.wlog");
+        let clean_bytes = std::fs::metadata(&active).unwrap().len();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&active)
+            .unwrap();
+        file.write_all(b"partial").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let source_before = directory_snapshot(&source);
+
+        let report = Store::salvage_from(&source, &target).unwrap();
+        assert_eq!(report.status, SalvageStatus::Partial);
+        assert_eq!(report.stop_reason, SalvageStopReason::IncompleteFrameHeader);
+        assert_eq!(report.recovered_prefix_bytes, clean_bytes);
+        assert_eq!(report.discarded_bytes, 7);
+        assert_eq!(report.recovered_points, 2);
+        assert_eq!(
+            std::fs::metadata(target.join("active.wlog")).unwrap().len(),
+            clean_bytes
+        );
+
+        let salvaged = Store::open_read_only(&target).unwrap();
+        assert_eq!(
+            salvaged.database().query_history(1, 0, DAY),
+            vec![sealed, live]
+        );
+        assert_eq!(salvaged.database().sealed_point_count(), 1);
+        assert_eq!(directory_snapshot(&source), source_before);
+    }
+
+    #[test]
+    fn salvage_fails_closed_on_an_unreadable_or_unreferenced_sealed_segment() {
+        for kind in ["corrupt", "missing", "no-manifest"] {
+            let directory = tempdir().unwrap();
+            let source = directory.path().join("source");
+            let target = directory.path().join("salvaged");
+            {
+                let mut store = Store::open(&source).unwrap();
+                initialize(&mut store, Vec::new(), None);
+                let mut transaction = Transaction::new();
+                transaction.append_points(vec![Point::actual(1, SECOND, 1.0)]);
+                store.commit(transaction).unwrap();
+                store.seal_and_reclaim().unwrap();
+                store.close().unwrap();
+            }
+            match kind {
+                "corrupt" => flip_last_byte(&sealed_wseg_paths(&source)[0]),
+                "missing" => std::fs::remove_file(&sealed_wseg_paths(&source)[0]).unwrap(),
+                "no-manifest" => {
+                    for entry in std::fs::read_dir(source.join("manifests")).unwrap() {
+                        std::fs::remove_file(entry.unwrap().path()).unwrap();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let source_before = directory_snapshot(&source);
+            let error = Store::salvage_from(&source, &target).unwrap_err();
+            assert!(
+                matches!(error, crate::Error::Corruption { .. }),
+                "{kind} must fail closed, got {error}"
+            );
+            assert!(!target.exists(), "{kind} published a target");
+            assert!(
+                salvage_stages(directory.path(), "salvaged").is_empty(),
+                "{kind} left a stage"
+            );
+            assert_eq!(directory_snapshot(&source), source_before);
+        }
+    }
+
+    #[test]
+    fn backup_and_restore_preserve_sealed_segment_history() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        let backup = directory.path().join("backup");
+        let restored = directory.path().join("restored");
+        let sealed = Point::actual(1, SECOND, 1.0);
+        let live = Point::actual(1, 4 * SECOND, 4.0);
+        {
+            let mut store = Store::open(&source).unwrap();
+            initialize(&mut store, Vec::new(), None);
+            let mut transaction = Transaction::new();
+            transaction.append_points(vec![sealed]);
+            store.commit(transaction).unwrap();
+            store.seal_and_reclaim().unwrap();
+            let mut transaction = Transaction::new();
+            transaction.append_points(vec![live]);
+            store.commit(transaction).unwrap();
+            store.backup_to(&backup).unwrap();
+            store.close().unwrap();
+        }
+
+        let report = Store::restore_from(&backup, &restored).unwrap();
+        assert!(report.raw_points >= 2);
+        assert_eq!(
+            report.source_snapshot_crc32,
+            report.destination_snapshot_crc32
+        );
+
+        let store = Store::open_read_only(&restored).unwrap();
+        assert_eq!(store.database().sealed_point_count(), 1);
+        assert_eq!(
+            store.database().query_history(1, 0, DAY),
+            vec![sealed, live]
+        );
+        assert_eq!(
+            store.database().query_history(1, 0, SECOND + 1),
+            vec![sealed]
+        );
+        assert!(!sealed_wseg_paths(&restored).is_empty());
+        assert!(!sealed_wseg_paths(&backup).is_empty());
     }
 }

@@ -115,19 +115,24 @@ on the result.
 ## Strict salvage
 
 `ftw salvage <damaged-store> <absent-target>` copies the longest valid raw-log
-prefix into a new store. The command exits with code 2 for missing or extra
+prefix into a new store, together with sealed raw segments the recovered
+manifest still names. The command exits with code 2 for missing or extra
 arguments. A valid database header followed by a damaged frame produces a
 verified `partial` result and exit code 0. Header, source-open, lock,
-source-race, stage-check, or publication errors use exit code 1. The command
-never changes the source. It has no replace option, and it leaves any existing
-target, including an empty directory or dangling symlink, unchanged.
+source-race, sealed-segment, stage-check, or publication errors use exit code
+1. The command never changes the source. It has no replace option, and it
+leaves any existing target, including an empty directory or dangling symlink,
+unchanged.
 
 Salvage opens the source directory without following a symlink, then opens
-only `active.wlog` relative to that directory with no-follow and nonblocking
-flags. Both paths must keep the same file identity during the run, and
-`active.wlog` must be a regular file. The command takes a shared lock on that
-file. It does not read a manifest or rollup, so damaged, stale, and orphan
-derived files do not affect the recovered raw prefix.
+`active.wlog` relative to that directory with no-follow and nonblocking flags.
+Both the directory and that file must keep the same file identity during the
+run, and `active.wlog` must be a regular file. The command takes a shared lock
+on that file. Damaged, stale, and orphan rollups do not affect the recovered
+raw prefix. Sealed `.wseg` files named by a readable manifest are copied and
+re-attached so historical raw stays queryable. A missing or unreadable sealed
+segment fails closed; salvage never publishes a store that silently dropped
+that coverage.
 
 The scanner first requires a valid FTWDB-v1 database header. It then validates
 each frame in order: bounds, kind and version, header and payload CRC, payload
@@ -156,18 +161,20 @@ After a valid database header, each listed frame or transaction fault yields a
 commits and points. An invalid or unsupported database header is fatal and
 publishes no target.
 
-The new store contains the header and validated frames as `active.wlog`, plus
-empty `manifests` and `rollups` directories. Salvage uses the same hidden-stage,
+The new store contains the header and validated frames as `active.wlog`, empty
+`rollups`, and — when sealed coverage exists — the recovered segment files plus
+a manifest that names only those segments. Salvage uses the same hidden-stage,
 file sync, directory sync, identity rollback, and atomic no-clobber publication
 as restore. It opens both the stage and target read-only and runs the full store
 check with no recovery. The shared stage lock stays held through publication,
 the target check, and any rollback.
 
-The source-prefix CRC32 uses the restore snapshot domain and one relative path,
-`active.wlog`. It covers that path length and bytes, the recovered prefix
-length, and the exact prefix bytes. The destination snapshot covers the same
-path and bytes. Salvage compares the values before and after publication. CRC32
-detects many accidental changes but does not prove authenticity.
+The source-prefix CRC32 uses the restore snapshot domain. It always covers
+`active.wlog` at the recovered prefix length and bytes. When sealed segments
+are recovered, their relative paths and exact bytes are included too. The
+destination snapshot covers the same paths and bytes. Salvage compares the
+values before and after publication. CRC32 detects many accidental changes but
+does not prove authenticity.
 
 On success, `ftwdb-salvage-v1` reports `status`, `source_bytes`,
 `recovered_prefix_bytes`, `discarded_bytes`, `stop_offset`, `stop_reason`,

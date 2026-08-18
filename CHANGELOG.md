@@ -12,6 +12,9 @@ steps in [docs/releases.md](docs/releases.md).
   query path. `Store::seal_and_reclaim` rewrites `active.wlog` to catalog,
   identity receipts, and the unsealed tail so reopen does not reload every
   historical point.
+- Salvage recovers sealed `.wseg` coverage and the live `active.wlog` tail
+  instead of refusing stores that have already sealed raw history. A missing
+  or unreadable sealed segment fails closed.
 - Ordered ingress frames now store source, sequence, commit ID, and transaction
   as one checked unit. Exact retries compare the original bytes and return the
   original receipt across reopen.

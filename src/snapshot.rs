@@ -126,6 +126,94 @@ pub(crate) fn snapshot_file_prefix_digest(
     })
 }
 
+/// Snapshot digest over `relative_paths`, hashing `prefix_bytes` of an already
+/// open `prefix_relative` file and the full contents of every other selected
+/// path. Salvage uses this so a torn live tail does not enter the checksum
+/// while sealed segment bytes still do.
+pub(crate) fn snapshot_digest_with_open_prefix(
+    root: &Path,
+    relative_paths: &[String],
+    prefix_relative: &str,
+    prefix_file: &mut File,
+    prefix_bytes: u64,
+) -> Result<SnapshotDigest> {
+    if !relative_paths.iter().any(|path| path == prefix_relative) {
+        return Err(Error::InvalidArgument(
+            "snapshot prefix path must be one of the selected files",
+        ));
+    }
+    validate_relative_path(prefix_relative)?;
+    let metadata = prefix_file.metadata()?;
+    if !metadata.file_type().is_file() || metadata.len() < prefix_bytes {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "snapshot prefix is no longer present in the source file",
+        )));
+    }
+
+    let root_metadata = std::fs::symlink_metadata(root)?;
+    if relative_paths.len() > 1 && !root_metadata.file_type().is_dir() {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "snapshot root is not a directory",
+        )));
+    }
+
+    let mut previous: Option<&str> = None;
+    let mut hasher = Hasher::new();
+    hasher.update(SNAPSHOT_CRC32_DOMAIN);
+    let mut bytes = 0_u64;
+
+    for relative in relative_paths {
+        validate_relative_path(relative)?;
+        if previous.is_some_and(|previous| previous >= relative.as_str()) {
+            return Err(Error::InvalidArgument(
+                "snapshot paths must be unique and sorted",
+            ));
+        }
+        previous = Some(relative);
+
+        let path_bytes = relative.as_bytes();
+        let path_len = u64::try_from(path_bytes.len())
+            .map_err(|_| Error::Serialization("snapshot path is too long".to_owned()))?;
+        let mut selected = None;
+        let file_len = if relative == prefix_relative {
+            prefix_bytes
+        } else {
+            let file = open_snapshot_file(root, relative)?;
+            let file_len = file.metadata()?.len();
+            selected = Some(file);
+            file_len
+        };
+        bytes = bytes
+            .checked_add(file_len)
+            .ok_or_else(|| Error::Serialization("snapshot byte count exceeds u64".to_owned()))?;
+
+        hasher.update(&path_len.to_le_bytes());
+        hasher.update(path_bytes);
+        hasher.update(&file_len.to_le_bytes());
+        if relative == prefix_relative {
+            prefix_file.seek(SeekFrom::Start(0))?;
+            hash_exact_bytes(prefix_file, prefix_bytes, relative, &mut hasher)?;
+        } else {
+            let mut file = selected.expect("opened selected snapshot file");
+            hash_exact_bytes(&mut file, file_len, relative, &mut hasher)?;
+            if file.read(&mut [0_u8; 1])? != 0 {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("snapshot file grew while reading {relative}"),
+                )));
+            }
+        }
+    }
+
+    Ok(SnapshotDigest {
+        files: relative_paths.len(),
+        bytes,
+        crc32: hasher.finalize(),
+    })
+}
+
 fn hash_exact_bytes(
     file: &mut File,
     mut remaining: u64,
