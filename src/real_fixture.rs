@@ -22,16 +22,39 @@ pub struct RealFixtureLoadReport {
     pub last_offset_millis: i64,
 }
 
+/// Cumulative store watermark after one fixture commit returned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FixtureAck {
+    pub commits: u64,
+    pub points: u64,
+    pub durable: bool,
+}
+
 /// Loads the repository's sanitized real-installation CSV fixture.
 ///
 /// The input uses offsets instead of source timestamps. This keeps cadence,
 /// jitter, gaps, ordering, and values without retaining the installation's
 /// exact dates. The caller must decompress `points.csv.gz` before calling.
 pub fn load_real_fixture<R: BufRead>(
-    mut reader: R,
+    reader: R,
     store: &mut Store,
     batch_points: usize,
 ) -> Result<RealFixtureLoadReport> {
+    load_real_fixture_with_ack(reader, store, batch_points, |_| Ok(()))
+}
+
+/// Same as [`load_real_fixture`], and calls `on_ack` after every successful
+/// commit so a power-cut harness can record the last durable watermark.
+pub fn load_real_fixture_with_ack<R, F>(
+    mut reader: R,
+    store: &mut Store,
+    batch_points: usize,
+    mut on_ack: F,
+) -> Result<RealFixtureLoadReport>
+where
+    R: BufRead,
+    F: FnMut(FixtureAck) -> Result<()>,
+{
     if batch_points == 0 || batch_points > crate::Config::default().max_batch_points {
         return Err(Error::InvalidModel(format!(
             "real fixture batch points must be between 1 and {}",
@@ -144,6 +167,11 @@ pub fn load_real_fixture<R: BufRead>(
             let commit = store.commit(std::mem::take(&mut transaction))?;
             commits += 1;
             durable_commits += u64::from(commit.durable);
+            on_ack(FixtureAck {
+                commits,
+                points: points_total,
+                durable: commit.durable,
+            })?;
         }
     }
 
@@ -155,6 +183,11 @@ pub fn load_real_fixture<R: BufRead>(
         let commit = store.commit(transaction)?;
         commits += 1;
         durable_commits += u64::from(commit.durable);
+        on_ack(FixtureAck {
+            commits,
+            points: points_total,
+            durable: commit.durable,
+        })?;
     }
     store.flush()?;
 
@@ -217,7 +250,7 @@ fn update_point_checksum(hasher: &mut Hasher, point: Point) {
 
 #[cfg(test)]
 mod tests {
-    use super::{REAL_FIXTURE_START_MICROS, load_real_fixture};
+    use super::{REAL_FIXTURE_START_MICROS, load_real_fixture, load_real_fixture_with_ack};
     use crate::{Config, Durability, Store};
     use std::io::Cursor;
 
@@ -249,14 +282,43 @@ mod tests {
         assert_eq!(report.first_offset_millis, 0);
         assert_eq!(report.last_offset_millis, 20);
 
-        let history = store.database().query_history(
-            1,
-            REAL_FIXTURE_START_MICROS,
-            REAL_FIXTURE_START_MICROS + 21_000,
-        );
+        let history = store
+            .database()
+            .query_history(
+                1,
+                REAL_FIXTURE_START_MICROS,
+                REAL_FIXTURE_START_MICROS + 21_000,
+            )
+            .unwrap();
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].value, 12.5);
         assert_eq!(history[1].value, 13.5);
+    }
+
+    #[test]
+    fn ack_callback_records_each_durable_commit_watermark() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open_with(
+            directory.path(),
+            Config {
+                durability: Durability::Always,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        let mut acks = Vec::new();
+        let report = load_real_fixture_with_ack(Cursor::new(FIXTURE), &mut store, 2, |ack| {
+            acks.push(ack);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(report.commits, 2);
+        assert_eq!(acks.len(), 2);
+        assert!(acks.iter().all(|ack| ack.durable));
+        assert_eq!(acks[0].commits, 1);
+        assert_eq!(acks[0].points, 2);
+        assert_eq!(acks[1].commits, 2);
+        assert_eq!(acks[1].points, 4);
     }
 
     #[test]

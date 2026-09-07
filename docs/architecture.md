@@ -45,11 +45,15 @@ database/
     MANIFEST.00000000000000000001
   rollups/
     g1-s42-f300000000-*.rseg
+  segments/
+    g2-*.wseg
 ```
 
-This is the current M3 directory shape. Raw immutable segments exist as a
-standalone format but are not yet installed into the manifest or used to
-reclaim the mixed active log.
+This is the current directory shape. Immutable raw segments are published
+through the same manifest generations as rollups. After `seal_and_reclaim`,
+`active.wlog` holds catalog records, identity receipts, and the unsealed tail.
+Open replays only that tail and streams sealed files to verify their manifest
+checksums; it decodes older raw points from segments only when a query needs them.
 
 ## Write path
 
@@ -76,9 +80,10 @@ Readers use a stable manifest snapshot. The planner:
 4. merges immutable blocks and recent committed frames;
 5. applies revision winner rules `(knowledge_time, change_time, append_order)`.
 
-The active log currently rebuilds an in-memory per-series index on open.
-Materialized rollups use verified immutable files and a process-local cache;
-M4 moves raw reads to sparse segment indexes and bounds both caches.
+Open rebuilds an in-memory per-series index from the unsealed tail only.
+Sealed raw points stay on the sparse segment index and are merged at query
+time. Materialized rollups use verified immutable files and a process-local
+cache. A full sparse on-disk tail index remains later M4 hardening.
 
 ## Crash and corruption model
 
@@ -106,3 +111,22 @@ The first production shape is one writer with snapshot readers. This matches
 edge ingestion, makes commit order unambiguous, and avoids a coordination-heavy
 write path. Concurrent producers feed one bounded writer queue. Independent
 readers never mutate segment files.
+
+## FTW shadow boundary
+
+The first FTW link runs FTWDB as a local Unix sidecar while FTW keeps its
+current data path and all control duties. The sidecar has its own process,
+failure state, update path, and kill switch. A missing, slow, full, corrupt, or
+stopped sidecar must not delay device reads, planning, dispatch, or safety
+checks.
+
+One versioned wire batch maps to one atomic ordered-ingress frame. The batch
+keeps catalog changes, runs, plans, points, and its source/sequence/commit
+identity in the same recovery unit. A bounded nonblocking queue feeds the only
+writer. Client errors reject one request; storage errors poison the writer and
+require a checked reopen.
+
+FTWDB does not serve authoritative FTW reads during shadow collection. Read
+promotion starts with a diagnostic comparison after replay, retry, overload,
+soak, target-board power-cut, and rollback checks pass. See
+[FTW shadow sidecar](shadow-sidecar.md).

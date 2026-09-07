@@ -2,15 +2,16 @@ use crate::FixedGaugeRollup;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::segment::{Segment, SegmentStats};
-use crate::transaction::{Record, Transaction};
+use crate::transaction::{IngressIdentity, Record, Transaction};
 use crc32fast::hash;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const DATABASE_MAGIC: &[u8; 8] = b"FTWDB001";
 const DATABASE_VERSION: u16 = 1;
@@ -33,6 +34,29 @@ const FRAME_KIND_TRANSACTION: u16 = 1;
 /// this feature exists to close.
 const FRAME_KIND_IDENTIFIED_TRANSACTION: u16 = 2;
 const COMMIT_ID_BYTES: usize = 16;
+/// An ordered ingress transaction.
+///
+/// Its payload starts with `source_id: u128`, `sequence: u64`, and
+/// `commit_id: u128`, all little-endian, followed by the canonical kind-1
+/// transaction payload. One frame checksum therefore covers both identity
+/// and data. Kinds 0 through 2 remain unchanged.
+const FRAME_KIND_INGRESS_TRANSACTION: u16 = 3;
+/// Marks the durable prefix that a later manifest generation sealed into an
+/// immutable raw segment. Recovery drops live-index points accumulated before
+/// a checkpoint whose generation is published, so reopen stays bounded by the
+/// unsealed tail even when reclaim has not yet rewritten `active.wlog`.
+const FRAME_KIND_SEAL_CHECKPOINT: u16 = 4;
+/// Compact identity receipts after WAL reclaim. Payload is postcard-encoded
+/// receipt metadata plus exact retry bytes; recovery does not rebuild point
+/// records into the live query index.
+const FRAME_KIND_IDENTITY_INDEX: u16 = 5;
+const IDENTITY_INDEX_MAGIC_V2: &[u8; 8] = b"WIDX0002";
+/// A single retained transaction may already use the configured transaction
+/// limit. Kind 5 needs a small amount of receipt metadata around those exact
+/// bytes, while the writer splits multiple receipts across frames.
+const IDENTITY_INDEX_ENTRY_OVERHEAD_BYTES: usize = 1024;
+const INGRESS_IDENTITY_BYTES: usize = 16 + 8 + 16;
+const SEAL_CHECKPOINT_BYTES: usize = 16;
 const TRANSACTION_MAGIC: &[u8; 4] = b"WTXN";
 const TRANSACTION_VERSION: u16 = 1;
 const TRANSACTION_HEADER_BYTES: usize = 12;
@@ -82,10 +106,11 @@ impl Point {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Durability {
     /// Sync every committed batch before returning. Safest and hardest on
     /// flash media.
+    #[default]
     Always,
     /// Sync when at least this many frame bytes have accumulated. Recent
     /// acknowledged batches may be lost on power failure.
@@ -120,9 +145,173 @@ pub struct Commit {
     pub durable: bool,
     /// True when the transaction's [`Transaction::with_commit_id`] identifier
     /// was already committed, so this call wrote nothing: the original
-    /// commit's records and points are stored exactly once. `points`,
-    /// `records`, and `bytes_written` are zero for such a replayed commit.
+    /// commit's records and points are stored exactly once. Legacy identified
+    /// replays return zero counts. Ordered ingress replays return the original
+    /// frame offset, counts, and byte count as a durable receipt.
     pub deduplicated: bool,
+}
+
+/// Durable progress for one ordered ingress source.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IngressWatermarks {
+    /// Highest sequence present in the current process view.
+    pub accepted_through: Option<u64>,
+    /// Highest sequence covered by a successful sync.
+    pub durable_through: Option<u64>,
+}
+
+/// Read-only proof that one ordered ingress frame exists in the current log.
+///
+/// `durable` reflects the current handle's proven durable watermark. A
+/// read-only opener cannot prove that a prior writer synced a recovered frame,
+/// so it reports `false` until a writable opener has synced that prefix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IngressReceipt {
+    pub identity: IngressIdentity,
+    pub frame_offset: u64,
+    pub records: usize,
+    pub points: usize,
+    pub bytes_written: u64,
+    pub durable: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct IngressKey {
+    source_id: u128,
+    sequence: u64,
+}
+
+impl From<IngressIdentity> for IngressKey {
+    fn from(identity: IngressIdentity) -> Self {
+        Self {
+            source_id: identity.source_id,
+            sequence: identity.sequence,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct StoredIngressReceipt {
+    identity: IngressIdentity,
+    canonical_payload_offset: u64,
+    canonical_payload_len: u32,
+    canonical_payload_crc32: u32,
+    /// Exact canonical bytes retained by a compact identity index. Live
+    /// receipts instead point at their original frame in `active.wlog`.
+    compact_payload: Option<Arc<[u8]>>,
+    commit: Commit,
+}
+
+#[derive(Clone, Debug)]
+struct StoredIdentifiedReceipt {
+    payload_offset: u64,
+    payload_len: u32,
+    payload_crc32: u32,
+    /// Exact identified-frame payload retained by a compact identity index.
+    compact_payload: Option<Arc<[u8]>>,
+    commit: Commit,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CompactIdentifiedReceipt {
+    commit_id: u128,
+    payload_len: u32,
+    payload_crc32: u32,
+    points: u64,
+    records: u64,
+    /// Empty only when reading an index written by the first kind-5 format,
+    /// which stored CRC metadata but no bytes. Such receipts stay known but
+    /// fail closed on retry instead of treating CRC equality as exact proof.
+    #[serde(default)]
+    payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CompactIngressReceipt {
+    source_id: u128,
+    sequence: u64,
+    commit_id: u128,
+    canonical_payload_len: u32,
+    canonical_payload_crc32: u32,
+    points: u64,
+    records: u64,
+    /// See [`CompactIdentifiedReceipt::payload`].
+    #[serde(default)]
+    canonical_payload: Vec<u8>,
+    #[serde(default)]
+    frame_offset: u64,
+    #[serde(default)]
+    bytes_written: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct CompactIdentityIndex {
+    identified: Vec<CompactIdentifiedReceipt>,
+    ingress: Vec<CompactIngressReceipt>,
+}
+
+/// Old writers created this kind-5 payload before they retained exact retry
+/// bytes. Keep a decoder so those stores still open; their known identifiers
+/// fail closed on retry because this format cannot prove byte equality.
+#[derive(Deserialize)]
+struct LegacyCompactIdentifiedReceipt {
+    commit_id: u128,
+    payload_len: u32,
+    payload_crc32: u32,
+    points: u64,
+    records: u64,
+}
+
+#[derive(Deserialize)]
+struct LegacyCompactIngressReceipt {
+    source_id: u128,
+    sequence: u64,
+    commit_id: u128,
+    canonical_payload_len: u32,
+    canonical_payload_crc32: u32,
+    points: u64,
+    records: u64,
+}
+
+#[derive(Deserialize)]
+struct LegacyCompactIdentityIndex {
+    identified: Vec<LegacyCompactIdentifiedReceipt>,
+    ingress: Vec<LegacyCompactIngressReceipt>,
+}
+
+impl From<LegacyCompactIdentityIndex> for CompactIdentityIndex {
+    fn from(index: LegacyCompactIdentityIndex) -> Self {
+        Self {
+            identified: index
+                .identified
+                .into_iter()
+                .map(|receipt| CompactIdentifiedReceipt {
+                    commit_id: receipt.commit_id,
+                    payload_len: receipt.payload_len,
+                    payload_crc32: receipt.payload_crc32,
+                    points: receipt.points,
+                    records: receipt.records,
+                    payload: Vec::new(),
+                })
+                .collect(),
+            ingress: index
+                .ingress
+                .into_iter()
+                .map(|receipt| CompactIngressReceipt {
+                    source_id: receipt.source_id,
+                    sequence: receipt.sequence,
+                    commit_id: receipt.commit_id,
+                    canonical_payload_len: receipt.canonical_payload_len,
+                    canonical_payload_crc32: receipt.canonical_payload_crc32,
+                    points: receipt.points,
+                    records: receipt.records,
+                    canonical_payload: Vec::new(),
+                    frame_offset: 0,
+                    bytes_written: 0,
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Why the final bytes of a log were recovered.
@@ -146,15 +335,21 @@ pub enum SalvageStopReason {
     UnsupportedFrameVersion,
     FrameHeaderChecksumMismatch,
     InvalidLegacyFrameSize,
+    InvalidLegacyPoint,
     TransactionFrameTooLarge,
     IdentifiedTransactionTooShort,
+    IngressTransactionTooShort,
     UnknownFrameKind,
     IncompleteFramePayload,
     PayloadChecksumMismatch,
     DuplicateCommitId,
+    DuplicateIngressSequence,
+    InvalidIngressSequence,
     InvalidTransaction,
     TransactionPointCountTooLarge,
     InvalidCatalogTransaction,
+    SealCheckpointInvalid,
+    IdentityIndexInvalid,
 }
 
 impl fmt::Display for SalvageStopReason {
@@ -166,15 +361,21 @@ impl fmt::Display for SalvageStopReason {
             Self::UnsupportedFrameVersion => "unsupported-frame-version",
             Self::FrameHeaderChecksumMismatch => "frame-header-checksum-mismatch",
             Self::InvalidLegacyFrameSize => "invalid-legacy-frame-size",
+            Self::InvalidLegacyPoint => "invalid-legacy-point",
             Self::TransactionFrameTooLarge => "transaction-frame-too-large",
             Self::IdentifiedTransactionTooShort => "identified-transaction-too-short",
+            Self::IngressTransactionTooShort => "ingress-transaction-too-short",
             Self::UnknownFrameKind => "unknown-frame-kind",
             Self::IncompleteFramePayload => "incomplete-frame-payload",
             Self::PayloadChecksumMismatch => "payload-checksum-mismatch",
             Self::DuplicateCommitId => "duplicate-commit-id",
+            Self::DuplicateIngressSequence => "duplicate-ingress-sequence",
+            Self::InvalidIngressSequence => "invalid-ingress-sequence",
             Self::InvalidTransaction => "invalid-transaction",
             Self::TransactionPointCountTooLarge => "transaction-point-count-too-large",
             Self::InvalidCatalogTransaction => "invalid-catalog-transaction",
+            Self::SealCheckpointInvalid => "seal-checkpoint-invalid",
+            Self::IdentityIndexInvalid => "identity-index-invalid",
         };
         f.write_str(name)
     }
@@ -212,10 +413,18 @@ pub struct PlanOutcome {
 
 /// A single-writer embedded database.
 pub struct Database {
+    path: PathBuf,
     file: File,
     config: Config,
     read_only: bool,
     index: HashMap<u64, Vec<Point>>,
+    /// Immutable raw segments published by the store. Queries merge these
+    /// with the live tail; they are never rebuilt into `index`.
+    sealed: Vec<Segment>,
+    sealed_points: u64,
+    /// True when recovery dropped sealed frames from the live index because
+    /// a published checkpoint is still sitting in an unreclaimed log.
+    pending_reclaim: bool,
     catalog: Catalog,
     /// Every client-supplied commit identifier in the log, rebuilt on open by
     /// `scan_and_recover` so idempotency survives a crash or reopen. Growth is
@@ -223,6 +432,17 @@ pub struct Database {
     /// log — acceptable because the whole log is already replayed into memory
     /// by design (the README acknowledges that ceiling).
     commit_ids: HashSet<u128>,
+    /// Payload receipts for legacy [`Transaction::with_commit_id`] frames.
+    /// A replay compares encoded bytes (and re-reads the stored frame) so a
+    /// reused identifier with different records cannot silently deduplicate.
+    identified_receipts: HashMap<u128, StoredIdentifiedReceipt>,
+    /// One receipt per ordered ingress frame. Live receipts read canonical
+    /// transaction bytes from the log. Reclaim retains those exact bytes in
+    /// kind 5 so CRC equality never becomes the retry decision.
+    ingress_receipts: HashMap<IngressKey, StoredIngressReceipt>,
+    ingress_commit_ids: HashMap<u128, IngressKey>,
+    ingress_last_sequences: HashMap<u128, u64>,
+    ingress_durable_sequences: HashMap<u128, u64>,
     commits: u64,
     points: u64,
     catalog_records: u64,
@@ -268,7 +488,7 @@ impl Database {
     }
 
     pub fn open_with(path: impl AsRef<Path>, config: Config) -> Result<Self> {
-        Self::open_mode(path.as_ref(), config, false)
+        Self::open_mode(path.as_ref(), config, false, &HashSet::new())
     }
 
     /// Opens an existing database without any possibility of mutating it.
@@ -281,20 +501,35 @@ impl Database {
     /// still blocks (and is blocked by) read-only opens, preventing reads of a
     /// mid-write file.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_mode(path.as_ref(), Config::default(), true)
+        Self::open_mode(path.as_ref(), Config::default(), true, &HashSet::new())
     }
 
-    fn open_mode(path: &Path, config: Config, read_only: bool) -> Result<Self> {
+    pub(crate) fn open_with_published_seals(
+        path: impl AsRef<Path>,
+        config: Config,
+        published_seals: &HashSet<u64>,
+    ) -> Result<Self> {
+        Self::open_mode(path.as_ref(), config, false, published_seals)
+    }
+
+    pub(crate) fn open_read_only_with_published_seals(
+        path: impl AsRef<Path>,
+        published_seals: &HashSet<u64>,
+    ) -> Result<Self> {
+        Self::open_mode(path.as_ref(), Config::default(), true, published_seals)
+    }
+
+    fn open_mode(
+        path: &Path,
+        config: Config,
+        read_only: bool,
+        published_seals: &HashSet<u64>,
+    ) -> Result<Self> {
         validate_config(config)?;
         let mut file = if read_only {
             open_regular_file_read_only(path)?
         } else {
-            OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .open(path)?
+            open_regular_file_read_write(path)?
         };
 
         // Take an advisory lock before recovery so a writer and a reader can
@@ -336,19 +571,46 @@ impl Database {
             sync_parent_directory(path)?;
         }
 
-        let scan = scan_and_recover(
+        let mut scan = scan_and_recover(
             &mut file,
             config.max_batch_points,
             config.max_transaction_bytes,
             read_only,
+            published_seals,
         )?;
+        let ingress_durable_sequences = if read_only {
+            // A complete frame proves only that the kernel can read it. The
+            // prior writer may have used Manual or EveryBytes durability and
+            // died before syncing, so a read-only opener cannot tell a client
+            // that it is safe to discard its source copy.
+            HashMap::new()
+        } else {
+            // Recovery can see complete frames left in the page cache by a
+            // process crash. Sync the recovered prefix before publishing a
+            // durable watermark or replay receipt. This also makes a tail
+            // truncation durable before the writer accepts more frames.
+            sync_database_file(&file)?;
+            for receipt in scan.ingress_receipts.values_mut() {
+                receipt.commit.durable = true;
+            }
+            scan.ingress_last_sequences.clone()
+        };
         Ok(Self {
+            path: path.to_path_buf(),
             file,
             config,
             read_only,
             index: scan.index,
+            sealed: Vec::new(),
+            sealed_points: 0,
+            pending_reclaim: scan.pending_reclaim,
             catalog: scan.catalog,
             commit_ids: scan.commit_ids,
+            identified_receipts: scan.identified_receipts,
+            ingress_receipts: scan.ingress_receipts,
+            ingress_commit_ids: scan.ingress_commit_ids,
+            ingress_last_sequences: scan.ingress_last_sequences,
+            ingress_durable_sequences,
             commits: scan.commits,
             points: scan.points,
             catalog_records: scan.catalog_records,
@@ -446,9 +708,12 @@ impl Database {
                 return Err(error);
             }
         };
+        if durable {
+            self.mark_ingress_durable();
+        }
 
         for point in points {
-            self.index.entry(point.series_id).or_default().push(*point);
+            insert_indexed_point(&mut self.index, *point);
         }
         self.commits += 1;
         self.points += points.len() as u64;
@@ -466,12 +731,12 @@ impl Database {
     /// Atomically commits catalog changes and point batches in one frame.
     ///
     /// When the transaction carries a [`Transaction::with_commit_id`]
-    /// identifier that is already in the log, nothing is validated or
-    /// written and the returned commit reports
-    /// [`Commit::deduplicated`]: the identifier is checked before any other
-    /// work, so a retried commit can never duplicate points. The check keys
-    /// on the identifier alone — a retry that reuses an identifier with
-    /// different records is also answered from the original commit. An empty
+    /// identifier that is already in the log, the encoded payload is checked
+    /// against the original frame. An exact retry writes nothing and reports
+    /// [`Commit::deduplicated`]. Reusing the identifier with different
+    /// records returns [`Error::IngressCommitIdConflict`]. Prefer
+    /// [`Self::commit_ingress`] at a production writer boundary so retries
+    /// carry a source cursor and cannot drop a mutated payload. An empty
     /// transaction writes no frame, so its identifier (if any) is not
     /// recorded; there is nothing a replay could duplicate.
     pub fn commit(&mut self, transaction: Transaction) -> Result<Commit> {
@@ -481,17 +746,30 @@ impl Database {
         if self.poisoned {
             return Err(Error::Poisoned);
         }
-        if let Some(commit_id) = transaction.commit_id
-            && self.commit_ids.contains(&commit_id)
-        {
-            return Ok(Commit {
-                frame_offset: self.file.seek(SeekFrom::End(0))?,
-                points: 0,
-                records: 0,
-                bytes_written: 0,
-                durable: self.bytes_since_sync == 0,
-                deduplicated: true,
-            });
+        if let Some(identity) = transaction.ingress_identity {
+            return self.commit_ordered_ingress(identity, transaction);
+        }
+        if let Some(commit_id) = transaction.commit_id {
+            if self.ingress_commit_ids.contains_key(&commit_id) {
+                return Err(Error::IngressCommitIdConflict { commit_id });
+            }
+            if self.commit_ids.contains(&commit_id) {
+                let payload = encode_transaction(&transaction)?;
+                if let Some(receipt) = self.identified_receipts.get(&commit_id).cloned() {
+                    if !self.identified_payload_matches(receipt, &payload)? {
+                        return Err(Error::IngressCommitIdConflict { commit_id });
+                    }
+                    return Ok(Commit {
+                        frame_offset: self.file.seek(SeekFrom::End(0))?,
+                        points: 0,
+                        records: 0,
+                        bytes_written: 0,
+                        durable: self.bytes_since_sync == 0,
+                        deduplicated: true,
+                    });
+                }
+                return Err(Error::IngressCommitIdConflict { commit_id });
+            }
         }
         if transaction.is_empty() {
             return Ok(Commit {
@@ -511,7 +789,7 @@ impl Database {
             });
         }
 
-        let candidate_catalog = self.catalog.validate_and_apply(&transaction.records)?;
+        let candidate_catalog = self.catalog.apply_records(&transaction.records)?;
         let payload = encode_transaction(&transaction)?;
         if payload.len() > self.config.max_transaction_bytes {
             return Err(Error::InvalidModel(format!(
@@ -538,13 +816,32 @@ impl Database {
         for record in &transaction.records {
             if let Record::Points(points) = record {
                 for point in points {
-                    self.index.entry(point.series_id).or_default().push(*point);
+                    insert_indexed_point(&mut self.index, *point);
                 }
             }
         }
-        self.catalog = candidate_catalog;
+        if let Some(catalog) = candidate_catalog {
+            self.catalog = catalog;
+        }
         if let Some(commit_id) = transaction.commit_id {
             self.commit_ids.insert(commit_id);
+            self.identified_receipts.insert(
+                commit_id,
+                StoredIdentifiedReceipt {
+                    payload_offset: frame_offset + FRAME_HEADER_BYTES as u64,
+                    payload_len,
+                    payload_crc32: hash(&payload),
+                    compact_payload: None,
+                    commit: Commit {
+                        frame_offset,
+                        points: point_count,
+                        records: transaction.record_count(),
+                        bytes_written,
+                        durable,
+                        deduplicated: false,
+                    },
+                },
+            );
         }
         self.commits += 1;
         self.points += point_count as u64;
@@ -566,11 +863,429 @@ impl Database {
         })
     }
 
+    /// Commits one ordered producer transaction with two durable retry keys.
+    ///
+    /// FTWDB stores `identity` and the canonical transaction bytes in one
+    /// checksummed frame. An exact replay returns the original frame receipt
+    /// with `deduplicated: true` and writes nothing. Reusing either key with
+    /// different bytes returns a nonfatal ingress conflict. After a source's
+    /// first commit, only a strictly greater source cursor is accepted. The
+    /// cursor may contain gaps; source reconciliation detects missing data.
+    pub fn commit_ingress(
+        &mut self,
+        identity: IngressIdentity,
+        mut transaction: Transaction,
+    ) -> Result<Commit> {
+        transaction.with_ingress_identity(identity);
+        self.commit(transaction)
+    }
+
+    fn commit_ordered_ingress(
+        &mut self,
+        identity: IngressIdentity,
+        transaction: Transaction,
+    ) -> Result<Commit> {
+        if identity.source_id == 0 {
+            return Err(Error::InvalidArgument("ingress source id zero is reserved"));
+        }
+        let canonical = encode_canonical_transaction(&transaction)?;
+        let key = IngressKey::from(identity);
+
+        if let Some(receipt) = self.ingress_receipts.get(&key).cloned() {
+            if receipt.identity.commit_id != identity.commit_id
+                || !self.ingress_payload_matches(receipt.clone(), &canonical)?
+            {
+                return Err(Error::IngressSourceSequenceConflict {
+                    source_id: identity.source_id,
+                    sequence: identity.sequence,
+                });
+            }
+            let mut replay = receipt.commit;
+            replay.deduplicated = true;
+            // The source watermark, not an empty dirty-byte counter, is the
+            // durability proof. A read-only recovery has no such proof.
+            replay.durable = self
+                .ingress_durable_sequences
+                .get(&identity.source_id)
+                .is_some_and(|sequence| *sequence >= identity.sequence);
+            return Ok(replay);
+        }
+
+        if self.commit_ids.contains(&identity.commit_id) {
+            return Err(Error::IngressCommitIdConflict {
+                commit_id: identity.commit_id,
+            });
+        }
+
+        if let Some(last) = self
+            .ingress_last_sequences
+            .get(&identity.source_id)
+            .copied()
+            && identity.sequence <= last
+        {
+            return Err(Error::IngressSequenceNotIncreasing {
+                source_id: identity.source_id,
+                previous: last,
+                actual: identity.sequence,
+            });
+        }
+
+        let point_count = transaction.point_count();
+        if point_count > self.config.max_batch_points {
+            return Err(Error::BatchTooLarge {
+                points: point_count,
+                maximum: self.config.max_batch_points,
+            });
+        }
+        let payload_len = INGRESS_IDENTITY_BYTES
+            .checked_add(canonical.len())
+            .ok_or_else(|| {
+                Error::Serialization("ingress transaction length overflows".to_owned())
+            })?;
+        if payload_len > self.config.max_transaction_bytes {
+            return Err(Error::InvalidModel(format!(
+                "transaction has {payload_len} encoded bytes; maximum is {}",
+                self.config.max_transaction_bytes
+            )));
+        }
+
+        let candidate_catalog = self.catalog.apply_records(&transaction.records)?;
+        let payload_len_u32 = u32::try_from(payload_len)
+            .map_err(|_| Error::Serialization("transaction exceeds u32 length".to_owned()))?;
+        let canonical_len_u32 = u32::try_from(canonical.len())
+            .map_err(|_| Error::Serialization("transaction exceeds u32 length".to_owned()))?;
+        let record_count = u32::try_from(transaction.record_count())
+            .map_err(|_| Error::Serialization("too many transaction records".to_owned()))?;
+        let mut payload = Vec::with_capacity(payload_len);
+        payload.extend_from_slice(&identity.source_id.to_le_bytes());
+        payload.extend_from_slice(&identity.sequence.to_le_bytes());
+        payload.extend_from_slice(&identity.commit_id.to_le_bytes());
+        payload.extend_from_slice(&canonical);
+        let frame_header = encode_frame_header(
+            FRAME_KIND_INGRESS_TRANSACTION,
+            record_count,
+            payload_len_u32,
+            hash(&payload),
+        );
+        let bytes_written = (FRAME_HEADER_BYTES + payload.len()) as u64;
+        let frame_offset = self.file.seek(SeekFrom::End(0))?;
+        let durable = self.write_frame(&frame_header, &payload, bytes_written)?;
+
+        for record in &transaction.records {
+            if let Record::Points(points) = record {
+                for point in points {
+                    insert_indexed_point(&mut self.index, *point);
+                }
+            }
+        }
+        if let Some(catalog) = candidate_catalog {
+            self.catalog = catalog;
+        }
+        self.commits += 1;
+        self.points += point_count as u64;
+        let metadata_records = transaction.record_count()
+            - transaction
+                .records
+                .iter()
+                .filter(|record| matches!(record, Record::Points(_)))
+                .count();
+        self.catalog_records += metadata_records as u64;
+
+        let commit = Commit {
+            frame_offset,
+            points: point_count,
+            records: transaction.record_count(),
+            bytes_written,
+            durable,
+            deduplicated: false,
+        };
+        let receipt = StoredIngressReceipt {
+            identity,
+            canonical_payload_offset: frame_offset
+                + FRAME_HEADER_BYTES as u64
+                + INGRESS_IDENTITY_BYTES as u64,
+            canonical_payload_len: canonical_len_u32,
+            canonical_payload_crc32: hash(&canonical),
+            compact_payload: None,
+            commit,
+        };
+        self.commit_ids.insert(identity.commit_id);
+        self.ingress_receipts.insert(key, receipt);
+        self.ingress_commit_ids.insert(identity.commit_id, key);
+        self.ingress_last_sequences
+            .insert(identity.source_id, identity.sequence);
+        if durable {
+            self.ingress_durable_sequences
+                .insert(identity.source_id, identity.sequence);
+        }
+        Ok(commit)
+    }
+
+    fn identified_payload_matches(
+        &mut self,
+        receipt: StoredIdentifiedReceipt,
+        candidate: &[u8],
+    ) -> Result<bool> {
+        let result = self.identified_payload_matches_at(receipt, candidate);
+        if matches!(result, Err(Error::Io(_) | Error::Corruption { .. })) {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn identified_payload_matches_at(
+        &self,
+        receipt: StoredIdentifiedReceipt,
+        candidate: &[u8],
+    ) -> Result<bool> {
+        if candidate.len() != receipt.payload_len as usize
+            || hash(candidate) != receipt.payload_crc32
+        {
+            return Ok(false);
+        }
+        if receipt.payload_offset == 0 {
+            // An old compact index may lack exact bytes. Treat it as a known
+            // identifier that conflicts on retry; CRC equality alone cannot
+            // prove that the transaction is the same.
+            return Ok(receipt.compact_payload.as_deref() == Some(candidate));
+        }
+        let expected_payload_offset = receipt
+            .commit
+            .frame_offset
+            .checked_add(FRAME_HEADER_BYTES as u64)
+            .ok_or_else(|| Error::Serialization("identified replay offset overflows".to_owned()))?;
+        if receipt.payload_offset != expected_payload_offset {
+            return corruption(
+                receipt.commit.frame_offset,
+                "stored identified receipt offset is invalid",
+            );
+        }
+        let record_count = u32::try_from(receipt.commit.records).map_err(|_| {
+            Error::Serialization("identified replay record count overflows".to_owned())
+        })?;
+        let expected_header = encode_frame_header(
+            FRAME_KIND_IDENTIFIED_TRANSACTION,
+            record_count,
+            receipt.payload_len,
+            receipt.payload_crc32,
+        );
+        let mut stored_header = [0_u8; FRAME_HEADER_BYTES];
+        self.file
+            .read_exact_at(&mut stored_header, receipt.commit.frame_offset)?;
+        if stored_header != expected_header {
+            return corruption(
+                receipt.commit.frame_offset,
+                "stored identified frame header changed after open",
+            );
+        }
+
+        let mut stored = [0_u8; 8 * 1024];
+        let mut candidate_offset = 0_usize;
+        while candidate_offset < candidate.len() {
+            let chunk_len = stored.len().min(candidate.len() - candidate_offset);
+            let file_offset = receipt
+                .payload_offset
+                .checked_add(u64::try_from(candidate_offset).map_err(|_| {
+                    Error::Serialization("identified replay offset overflows".to_owned())
+                })?)
+                .ok_or_else(|| {
+                    Error::Serialization("identified replay offset overflows".to_owned())
+                })?;
+            self.file
+                .read_exact_at(&mut stored[..chunk_len], file_offset)?;
+            if stored[..chunk_len] != candidate[candidate_offset..candidate_offset + chunk_len] {
+                return corruption(
+                    receipt.commit.frame_offset,
+                    "stored identified payload changed after open",
+                );
+            }
+            candidate_offset += chunk_len;
+        }
+        Ok(true)
+    }
+
+    fn ingress_payload_matches(
+        &mut self,
+        receipt: StoredIngressReceipt,
+        candidate: &[u8],
+    ) -> Result<bool> {
+        let result = self.ingress_payload_matches_at(receipt, candidate);
+        if matches!(result, Err(Error::Io(_) | Error::Corruption { .. })) {
+            // The in-memory catalog and index may no longer match the log.
+            // Stop all later writes until a fresh scan proves a sound prefix.
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn ingress_payload_matches_at(
+        &self,
+        receipt: StoredIngressReceipt,
+        candidate: &[u8],
+    ) -> Result<bool> {
+        if candidate.len() != receipt.canonical_payload_len as usize
+            || hash(candidate) != receipt.canonical_payload_crc32
+        {
+            return Ok(false);
+        }
+        if receipt.canonical_payload_offset == 0 {
+            return Ok(receipt.compact_payload.as_deref() == Some(candidate));
+        }
+        let expected_canonical_offset = receipt
+            .commit
+            .frame_offset
+            .checked_add((FRAME_HEADER_BYTES + INGRESS_IDENTITY_BYTES) as u64)
+            .ok_or_else(|| Error::Serialization("ingress replay offset overflows".to_owned()))?;
+        if receipt.canonical_payload_offset != expected_canonical_offset {
+            return corruption(
+                receipt.commit.frame_offset,
+                "stored ingress receipt offset is invalid",
+            );
+        }
+        let mut identity_bytes = [0_u8; INGRESS_IDENTITY_BYTES];
+        identity_bytes[..16].copy_from_slice(&receipt.identity.source_id.to_le_bytes());
+        identity_bytes[16..24].copy_from_slice(&receipt.identity.sequence.to_le_bytes());
+        identity_bytes[24..40].copy_from_slice(&receipt.identity.commit_id.to_le_bytes());
+        let mut expected_payload_checksum = crc32fast::Hasher::new();
+        expected_payload_checksum.update(&identity_bytes);
+        expected_payload_checksum.update(candidate);
+        let payload_len = u32::try_from(INGRESS_IDENTITY_BYTES + candidate.len())
+            .map_err(|_| Error::Serialization("ingress replay length overflows".to_owned()))?;
+        let record_count = u32::try_from(receipt.commit.records).map_err(|_| {
+            Error::Serialization("ingress replay record count overflows".to_owned())
+        })?;
+        let expected_header = encode_frame_header(
+            FRAME_KIND_INGRESS_TRANSACTION,
+            record_count,
+            payload_len,
+            expected_payload_checksum.finalize(),
+        );
+
+        let mut stored_header = [0_u8; FRAME_HEADER_BYTES];
+        self.file
+            .read_exact_at(&mut stored_header, receipt.commit.frame_offset)?;
+        if stored_header != expected_header {
+            return corruption(
+                receipt.commit.frame_offset,
+                "stored ingress frame header changed after open",
+            );
+        }
+
+        let identity_offset = receipt
+            .commit
+            .frame_offset
+            .checked_add(FRAME_HEADER_BYTES as u64)
+            .ok_or_else(|| Error::Serialization("ingress replay offset overflows".to_owned()))?;
+        let mut stored_identity = [0_u8; INGRESS_IDENTITY_BYTES];
+        self.file
+            .read_exact_at(&mut stored_identity, identity_offset)?;
+        if stored_identity != identity_bytes {
+            return corruption(
+                receipt.commit.frame_offset,
+                "stored ingress identity changed after open",
+            );
+        }
+
+        let mut stored = [0_u8; 8 * 1024];
+        let mut stored_checksum = crc32fast::Hasher::new();
+        let mut equal = true;
+        let mut candidate_offset = 0_usize;
+        while candidate_offset < candidate.len() {
+            let chunk_len = stored.len().min(candidate.len() - candidate_offset);
+            let file_offset = receipt
+                .canonical_payload_offset
+                .checked_add(u64::try_from(candidate_offset).map_err(|_| {
+                    Error::Serialization("ingress replay offset overflows".to_owned())
+                })?)
+                .ok_or_else(|| {
+                    Error::Serialization("ingress replay offset overflows".to_owned())
+                })?;
+            self.file
+                .read_exact_at(&mut stored[..chunk_len], file_offset)?;
+            stored_checksum.update(&stored[..chunk_len]);
+            equal &=
+                stored[..chunk_len] == candidate[candidate_offset..candidate_offset + chunk_len];
+            candidate_offset += chunk_len;
+        }
+        if stored_checksum.finalize() != receipt.canonical_payload_crc32 {
+            return corruption(
+                receipt.commit.frame_offset,
+                "stored ingress transaction checksum changed after open",
+            );
+        }
+        Ok(equal)
+    }
+
+    /// Checks one expected ingress transaction against its exact stored
+    /// canonical bytes without changing the file cursor or writing the store.
+    pub(crate) fn verify_ingress_payload(
+        &self,
+        identity: IngressIdentity,
+        transaction: &Transaction,
+    ) -> Result<Option<bool>> {
+        let Some(receipt) = self
+            .ingress_receipts
+            .get(&IngressKey::from(identity))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        if receipt.identity != identity {
+            return Ok(Some(false));
+        }
+        let canonical = encode_canonical_transaction(transaction)?;
+        self.ingress_payload_matches_at(receipt, &canonical)
+            .map(Some)
+    }
+
     /// Whether a [`Transaction::with_commit_id`] identifier has been applied
     /// by this handle — recovered from the log on open or committed since.
     #[must_use]
     pub fn contains_commit_id(&self, commit_id: u128) -> bool {
         self.commit_ids.contains(&commit_id)
+    }
+
+    /// Returns accepted and synced progress for one ordered source.
+    #[must_use]
+    pub fn ingress_watermarks(&self, source_id: u128) -> IngressWatermarks {
+        IngressWatermarks {
+            accepted_through: self.ingress_last_sequences.get(&source_id).copied(),
+            durable_through: self.ingress_durable_sequences.get(&source_id).copied(),
+        }
+    }
+
+    /// Returns the stored identity and frame receipt for one source sequence.
+    ///
+    /// This does not reread the frame payload. Open-time recovery already
+    /// checked it; integrity checks and exact retry perform the stronger byte
+    /// validation when required.
+    #[must_use]
+    pub fn ingress_receipt(&self, source_id: u128, sequence: u64) -> Option<IngressReceipt> {
+        let stored = self.ingress_receipts.get(&IngressKey {
+            source_id,
+            sequence,
+        })?;
+        Some(IngressReceipt {
+            identity: stored.identity,
+            frame_offset: stored.commit.frame_offset,
+            records: stored.commit.records,
+            points: stored.commit.points,
+            bytes_written: stored.commit.bytes_written,
+            durable: self
+                .ingress_durable_sequences
+                .get(&source_id)
+                .is_some_and(|durable| *durable >= sequence),
+        })
+    }
+
+    /// Returns every known ingress source in stable source-ID order.
+    #[must_use]
+    pub fn all_ingress_watermarks(&self) -> BTreeMap<u128, IngressWatermarks> {
+        self.ingress_last_sequences
+            .keys()
+            .copied()
+            .map(|source_id| (source_id, self.ingress_watermarks(source_id)))
+            .collect()
     }
 
     fn write_frame(
@@ -595,12 +1310,22 @@ impl Database {
             Ok(should_sync)
         })();
         match write_result {
-            Ok(durable) => Ok(durable),
+            Ok(durable) => {
+                if durable {
+                    self.mark_ingress_durable();
+                }
+                Ok(durable)
+            }
             Err(error) => {
                 self.poisoned = true;
                 Err(error)
             }
         }
+    }
+
+    fn mark_ingress_durable(&mut self) {
+        self.ingress_durable_sequences
+            .clone_from(&self.ingress_last_sequences);
     }
 
     /// Makes all prior appends durable according to the operating system.
@@ -622,6 +1347,7 @@ impl Database {
             return Err(Error::Io(error));
         }
         self.bytes_since_sync = 0;
+        self.mark_ingress_durable();
         Ok(())
     }
 
@@ -645,53 +1371,140 @@ impl Database {
     }
 
     /// Returns every revision in deterministic temporal order.
-    #[must_use]
-    pub fn query_history(&self, series_id: u64, start: i64, end: i64) -> Vec<Point> {
-        let mut result: Vec<_> = self
-            .index
-            .get(&series_id)
-            .into_iter()
-            .flatten()
-            .filter(|point| point.valid_time >= start && point.valid_time < end)
-            .copied()
-            .collect();
+    ///
+    /// Sealed raw segments are merged with the live tail. A sealed-segment
+    /// read error is fail-closed: the call returns [`Error::Corruption`]
+    /// rather than a silent partial history.
+    pub fn query_history(&self, series_id: u64, start: i64, end: i64) -> Result<Vec<Point>> {
+        let mut result = self.collect_raw_points(series_id, start, end)?;
         result.sort_by_key(|point| (point.valid_time, point.knowledge_time, point.change_time));
-        result
+        Ok(result)
+    }
+
+    /// Visits raw history without collecting or sorting the whole result.
+    /// The caller reserves scan work before each sealed block or live slice.
+    pub(crate) fn visit_history<E: From<Error>>(
+        &self,
+        series_id: u64,
+        start: i64,
+        end: i64,
+        mut reserve: impl FnMut(usize) -> std::result::Result<(), E>,
+        mut visit: impl FnMut(Point) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        for segment in &self.sealed {
+            segment.visit_query(series_id, start, end, &mut reserve, &mut visit)?;
+        }
+        let live = series_time_slice(self.series_points(series_id), start, end);
+        reserve(live.len())?;
+        for point in live {
+            visit(*point)?;
+        }
+        Ok(())
+    }
+
+    /// Live-index revisions only. Sealed history is not included.
+    pub(crate) fn series_points(&self, series_id: u64) -> &[Point] {
+        self.index.get(&series_id).map_or(&[], Vec::as_slice)
+    }
+
+    #[must_use]
+    pub fn live_index_len(&self) -> usize {
+        self.index.values().map(Vec::len).sum()
+    }
+
+    #[must_use]
+    pub const fn sealed_point_count(&self) -> u64 {
+        self.sealed_points
+    }
+
+    #[must_use]
+    pub(crate) const fn pending_reclaim(&self) -> bool {
+        self.pending_reclaim
+    }
+
+    pub(crate) fn series_revision_count(&self, series_id: u64) -> usize {
+        let live = self.series_points(series_id).len();
+        let sealed = self
+            .sealed
+            .iter()
+            .map(|segment| segment.series_point_count(series_id) as usize)
+            .sum::<usize>();
+        live.saturating_add(sealed)
+    }
+
+    pub(crate) fn series_valid_bounds(&self, series_id: u64) -> Option<(i64, i64)> {
+        let mut min_time = i64::MAX;
+        let mut max_time = i64::MIN;
+        if let Some((first, last)) = self
+            .series_points(series_id)
+            .first()
+            .zip(self.series_points(series_id).last())
+        {
+            min_time = min_time.min(first.valid_time);
+            max_time = max_time.max(last.valid_time);
+        }
+        for segment in &self.sealed {
+            if let Some((start, end)) = segment.series_bounds(series_id) {
+                min_time = min_time.min(start);
+                max_time = max_time.max(end);
+            }
+        }
+        (min_time <= max_time).then_some((min_time, max_time))
+    }
+
+    fn collect_raw_points(&self, series_id: u64, start: i64, end: i64) -> Result<Vec<Point>> {
+        // Segment order follows seal order. Read those older revisions before
+        // the live tail so the stable sort below keeps append order when two
+        // revisions have identical bitemporal keys. `winning_revisions` uses
+        // the later item as the tie-breaker, matching the documented
+        // `(knowledge_time, change_time, append_order)` rule.
+        let mut points = Vec::new();
+        for segment in &self.sealed {
+            if !segment.overlaps(series_id, start, end) {
+                continue;
+            }
+            points.extend(segment.query(series_id, start, end)?);
+        }
+        points.extend_from_slice(series_time_slice(self.series_points(series_id), start, end));
+        points.sort_by_key(|point| (point.valid_time, point.knowledge_time, point.change_time));
+        Ok(points)
     }
 
     /// Returns the winning revision for each valid timestamp.
-    #[must_use]
-    pub fn query_latest(&self, series_id: u64, start: i64, end: i64) -> Vec<Point> {
+    pub fn query_latest(&self, series_id: u64, start: i64, end: i64) -> Result<Vec<Point>> {
         self.query_with_cutoffs(series_id, start, end, None, None)
     }
 
     /// Replays what was visible at one historical instant.
-    #[must_use]
-    pub fn query_as_of(&self, series_id: u64, start: i64, end: i64, as_of: i64) -> Vec<Point> {
+    pub fn query_as_of(
+        &self,
+        series_id: u64,
+        start: i64,
+        end: i64,
+        as_of: i64,
+    ) -> Result<Vec<Point>> {
         self.query_with_cutoffs(series_id, start, end, Some(as_of), Some(as_of))
     }
 
     /// Returns the latest correction within one forecast/optimization run.
-    #[must_use]
-    pub fn query_run(&self, series_id: u64, run_id: u128, start: i64, end: i64) -> Vec<Point> {
-        let mut winners = BTreeMap::<i64, Point>::new();
-        for point in self.index.get(&series_id).into_iter().flatten() {
-            if point.run_id != run_id || point.valid_time < start || point.valid_time >= end {
-                continue;
-            }
-            match winners.get(&point.valid_time) {
-                Some(current) if current.change_time > point.change_time => {}
-                _ => {
-                    winners.insert(point.valid_time, *point);
-                }
-            }
-        }
-        winners.into_values().collect()
+    pub fn query_run(
+        &self,
+        series_id: u64,
+        run_id: u128,
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<Point>> {
+        Ok(winning_revisions(
+            &self.collect_raw_points(series_id, start, end)?,
+            start,
+            end,
+            |point| point.run_id == run_id,
+            |candidate, current| candidate.change_time >= current.change_time,
+        ))
     }
 
     /// Exact-time plan-versus-actual alignment. Higher-level resampling uses
     /// persistent rollups before calling this primitive.
-    #[must_use]
     pub fn compare_plan_to_actual(
         &self,
         planned_series_id: u64,
@@ -699,15 +1512,15 @@ impl Database {
         run_id: u128,
         start: i64,
         end: i64,
-    ) -> Vec<PlanOutcome> {
+    ) -> Result<Vec<PlanOutcome>> {
         let mut aligned = BTreeMap::<i64, (Option<Point>, Option<Point>)>::new();
-        for point in self.query_run(planned_series_id, run_id, start, end) {
+        for point in self.query_run(planned_series_id, run_id, start, end)? {
             aligned.entry(point.valid_time).or_default().0 = Some(point);
         }
-        for point in self.query_run(actual_series_id, 0, start, end) {
+        for point in self.query_run(actual_series_id, 0, start, end)? {
             aligned.entry(point.valid_time).or_default().1 = Some(point);
         }
-        aligned
+        Ok(aligned
             .into_iter()
             .map(|(valid_time, (planned, actual))| PlanOutcome {
                 valid_time,
@@ -717,12 +1530,11 @@ impl Database {
                 planned,
                 actual,
             })
-            .collect()
+            .collect())
     }
 
     /// Separates forecast issue-time and correction-time cutoffs for strict
     /// point-in-time backtests.
-    #[must_use]
     pub fn query_with_cutoffs(
         &self,
         series_id: u64,
@@ -730,27 +1542,20 @@ impl Database {
         end: i64,
         maximum_knowledge_time: Option<i64>,
         maximum_change_time: Option<i64>,
-    ) -> Vec<Point> {
-        let mut winners = BTreeMap::<i64, Point>::new();
-        for point in self.index.get(&series_id).into_iter().flatten() {
-            if point.valid_time < start || point.valid_time >= end {
-                continue;
-            }
-            if maximum_knowledge_time.is_some_and(|cutoff| point.knowledge_time > cutoff)
-                || maximum_change_time.is_some_and(|cutoff| point.change_time > cutoff)
-            {
-                continue;
-            }
-
-            let candidate_key = (point.knowledge_time, point.change_time);
-            match winners.get(&point.valid_time) {
-                Some(current) if (current.knowledge_time, current.change_time) > candidate_key => {}
-                _ => {
-                    winners.insert(point.valid_time, *point);
-                }
-            }
-        }
-        winners.into_values().collect()
+    ) -> Result<Vec<Point>> {
+        Ok(winning_revisions(
+            &self.collect_raw_points(series_id, start, end)?,
+            start,
+            end,
+            |point| {
+                maximum_knowledge_time.is_none_or(|cutoff| point.knowledge_time <= cutoff)
+                    && maximum_change_time.is_none_or(|cutoff| point.change_time <= cutoff)
+            },
+            |candidate, current| {
+                (candidate.knowledge_time, candidate.change_time)
+                    >= (current.knowledge_time, current.change_time)
+            },
+        ))
     }
 
     /// Materializes fixed UTC gauge buckets from the winning revisions in a
@@ -769,7 +1574,7 @@ impl Database {
         max_gap_micros: i64,
     ) -> Result<FixedGaugeRollup> {
         FixedGaugeRollup::build(
-            &self.query_latest(series_id, start, end),
+            &self.query_latest(series_id, start, end)?,
             resolution_micros,
             max_gap_micros,
         )
@@ -787,6 +1592,211 @@ impl Database {
         Segment::create(path, &points, block_points)
     }
 
+    pub(crate) fn attach_sealed_segments(&mut self, segments: Vec<Segment>) {
+        self.sealed_points = segments.iter().map(|segment| segment.stats().points).sum();
+        self.sealed = segments;
+    }
+
+    pub(crate) fn live_points_snapshot(&self) -> Vec<Point> {
+        self.index.values().flatten().copied().collect()
+    }
+
+    pub(crate) fn clear_live_index(&mut self) {
+        self.index.clear();
+        self.points = 0;
+    }
+
+    pub(crate) fn write_seal_checkpoint(&mut self, generation: u64, points: u64) -> Result<()> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        let mut payload = [0_u8; SEAL_CHECKPOINT_BYTES];
+        payload[..8].copy_from_slice(&generation.to_le_bytes());
+        payload[8..16].copy_from_slice(&points.to_le_bytes());
+        let payload_len = u32::try_from(payload.len())
+            .map_err(|_| Error::Serialization("seal checkpoint exceeds u32 length".to_owned()))?;
+        let header =
+            encode_frame_header(FRAME_KIND_SEAL_CHECKPOINT, 0, payload_len, hash(&payload));
+        let bytes_written = (FRAME_HEADER_BYTES + payload.len()) as u64;
+        self.file.seek(SeekFrom::End(0))?;
+        self.write_frame(&header, &payload, bytes_written)?;
+        self.flush()?;
+        self.commits += 1;
+        Ok(())
+    }
+
+    fn compact_identity_index(&self) -> Result<CompactIdentityIndex> {
+        let mut identified = Vec::with_capacity(self.identified_receipts.len());
+        for (commit_id, receipt) in &self.identified_receipts {
+            let payload = if receipt.payload_offset == 0 {
+                receipt
+                    .compact_payload
+                    .as_deref()
+                    .map(<[u8]>::to_vec)
+                    .unwrap_or_default()
+            } else {
+                let mut payload = vec![0_u8; receipt.payload_len as usize];
+                self.file
+                    .read_exact_at(&mut payload, receipt.payload_offset)?;
+                if !self.identified_payload_matches_at(receipt.clone(), &payload)? {
+                    return corruption(
+                        receipt.commit.frame_offset,
+                        "stored identified payload changed before reclaim",
+                    );
+                }
+                payload
+            };
+            identified.push(CompactIdentifiedReceipt {
+                commit_id: *commit_id,
+                payload_len: receipt.payload_len,
+                payload_crc32: receipt.payload_crc32,
+                points: receipt.commit.points as u64,
+                records: receipt.commit.records as u64,
+                payload,
+            });
+        }
+        identified.sort_by_key(|receipt| receipt.commit_id);
+
+        let mut ingress = Vec::with_capacity(self.ingress_receipts.len());
+        for receipt in self.ingress_receipts.values() {
+            let canonical_payload = if receipt.canonical_payload_offset == 0 {
+                receipt
+                    .compact_payload
+                    .as_deref()
+                    .map(<[u8]>::to_vec)
+                    .unwrap_or_default()
+            } else {
+                let mut payload = vec![0_u8; receipt.canonical_payload_len as usize];
+                self.file
+                    .read_exact_at(&mut payload, receipt.canonical_payload_offset)?;
+                if !self.ingress_payload_matches_at(receipt.clone(), &payload)? {
+                    return corruption(
+                        receipt.commit.frame_offset,
+                        "stored ingress payload changed before reclaim",
+                    );
+                }
+                payload
+            };
+            ingress.push(CompactIngressReceipt {
+                source_id: receipt.identity.source_id,
+                sequence: receipt.identity.sequence,
+                commit_id: receipt.identity.commit_id,
+                canonical_payload_len: receipt.canonical_payload_len,
+                canonical_payload_crc32: receipt.canonical_payload_crc32,
+                points: receipt.commit.points as u64,
+                records: receipt.commit.records as u64,
+                canonical_payload,
+                frame_offset: receipt.commit.frame_offset,
+                bytes_written: receipt.commit.bytes_written,
+            });
+        }
+        // Recovery advances one cursor per source while it reads this list.
+        // HashMap iteration has no stable order, so sort before serializing.
+        ingress.sort_by_key(|receipt| (receipt.source_id, receipt.sequence));
+
+        Ok(CompactIdentityIndex {
+            identified,
+            ingress,
+        })
+    }
+
+    /// Rewrites `active.wlog` to catalog + identity receipts + the live tail.
+    ///
+    /// The exclusive lock moves with the new inode: the compact file is locked
+    /// before it is renamed over the live name, so a concurrent opener never
+    /// sees an unlocked `active.wlog`.
+    pub(crate) fn reclaim_live_log(&mut self) -> Result<()> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        self.flush()?;
+        let identity_index = self.compact_identity_index()?;
+        let compact_path = compact_log_path(&self.path)?;
+        if let Err(error) = write_compact_log(
+            &compact_path,
+            &self.catalog,
+            &identity_index,
+            &self.index,
+            self.config.max_batch_points,
+            self.config.max_transaction_bytes,
+        ) {
+            let _ = std::fs::remove_file(&compact_path);
+            return Err(error);
+        }
+
+        let mut new_file = open_regular_file_read_write(&compact_path)?;
+        match new_file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                let _ = std::fs::remove_file(&compact_path);
+                return Err(Error::Locked { path: compact_path });
+            }
+            Err(TryLockError::Error(error)) => {
+                let _ = std::fs::remove_file(&compact_path);
+                return Err(Error::Io(error));
+            }
+        }
+        let mut scan = match scan_and_recover(
+            &mut new_file,
+            self.config.max_batch_points,
+            self.config.max_transaction_bytes,
+            false,
+            &HashSet::new(),
+        ) {
+            Ok(scan) => scan,
+            Err(error) => {
+                drop(new_file);
+                let _ = std::fs::remove_file(&compact_path);
+                return Err(error);
+            }
+        };
+        if let Err(error) = sync_database_file(&new_file) {
+            self.poisoned = true;
+            drop(new_file);
+            let _ = std::fs::remove_file(&compact_path);
+            return Err(Error::Io(error));
+        }
+        for receipt in scan.ingress_receipts.values_mut() {
+            receipt.commit.durable = true;
+        }
+
+        if let Err(error) = std::fs::rename(&compact_path, &self.path) {
+            self.poisoned = true;
+            drop(new_file);
+            let _ = std::fs::remove_file(&compact_path);
+            return Err(Error::Io(error));
+        }
+        if let Err(error) = sync_parent_directory(&self.path) {
+            self.poisoned = true;
+            return Err(error);
+        }
+
+        let old = std::mem::replace(&mut self.file, new_file);
+        drop(old);
+        self.index = scan.index;
+        self.catalog = scan.catalog;
+        self.commit_ids = scan.commit_ids;
+        self.identified_receipts = scan.identified_receipts;
+        self.ingress_receipts = scan.ingress_receipts;
+        self.ingress_commit_ids = scan.ingress_commit_ids;
+        self.ingress_last_sequences = scan.ingress_last_sequences;
+        self.ingress_durable_sequences = self.ingress_last_sequences.clone();
+        self.commits = scan.commits;
+        self.points = scan.points;
+        self.catalog_records = scan.catalog_records;
+        self.recovered_tail_bytes = 0;
+        self.recovered_tail = RecoveredTail::None;
+        self.bytes_since_sync = 0;
+        self.pending_reclaim = false;
+        Ok(())
+    }
+
     pub fn stats(&self) -> Result<Stats> {
         // A read-only open leaves a torn tail on disk, so its physical length
         // is reduced by the simulated truncation to report the same logical
@@ -798,14 +1808,25 @@ impl Database {
             physical_bytes
         };
         Ok(Stats {
-            points: self.points,
+            points: self.points.saturating_add(self.sealed_points),
             commits: self.commits,
-            series: self.index.len(),
+            series: {
+                let mut ids: HashSet<u64> = self.index.keys().copied().collect();
+                for segment in &self.sealed {
+                    ids.extend(segment.series_ids());
+                }
+                ids.len()
+            },
             catalog_records: self.catalog_records,
             file_bytes,
             recovered_tail_bytes: self.recovered_tail_bytes,
             recovered_tail: self.recovered_tail,
         })
+    }
+
+    #[must_use]
+    pub const fn durability(&self) -> Durability {
+        self.config.durability
     }
 }
 
@@ -813,15 +1834,410 @@ fn validate_config(config: Config) -> Result<()> {
     if config.max_batch_points == 0 {
         return Err(Error::InvalidConfig("max_batch_points must be positive"));
     }
+    if config.max_batch_points > u32::MAX as usize {
+        return Err(Error::InvalidConfig(
+            "max_batch_points exceeds the on-disk u32 count",
+        ));
+    }
     if config.max_transaction_bytes < TRANSACTION_HEADER_BYTES + RECORD_HEADER_BYTES {
         return Err(Error::InvalidConfig(
             "max_transaction_bytes is too small for one record",
+        ));
+    }
+    if config.max_transaction_bytes > u32::MAX as usize {
+        return Err(Error::InvalidConfig(
+            "max_transaction_bytes exceeds the on-disk u32 length",
         ));
     }
     if matches!(config.durability, Durability::EveryBytes(0)) {
         return Err(Error::InvalidConfig(
             "EveryBytes durability threshold must be positive",
         ));
+    }
+    Ok(())
+}
+
+fn insert_indexed_point(index: &mut HashMap<u64, Vec<Point>>, point: Point) {
+    let series = index.entry(point.series_id).or_default();
+    match series.last() {
+        Some(last) if last.valid_time > point.valid_time => {
+            let at = series.partition_point(|existing| existing.valid_time <= point.valid_time);
+            series.insert(at, point);
+        }
+        _ => series.push(point),
+    }
+}
+
+fn series_time_slice(points: &[Point], start: i64, end: i64) -> &[Point] {
+    let lo = points.partition_point(|point| point.valid_time < start);
+    let hi = lo + points[lo..].partition_point(|point| point.valid_time < end);
+    &points[lo..hi]
+}
+
+fn winning_revisions(
+    points: &[Point],
+    start: i64,
+    end: i64,
+    keep: impl Fn(&Point) -> bool,
+    prefer: impl Fn(&Point, &Point) -> bool,
+) -> Vec<Point> {
+    let mut winners: Vec<Point> = Vec::new();
+    for point in series_time_slice(points, start, end) {
+        if !keep(point) {
+            continue;
+        }
+        match winners.last_mut() {
+            Some(current) if current.valid_time == point.valid_time => {
+                if prefer(point, current) {
+                    *current = *point;
+                }
+            }
+            _ => winners.push(*point),
+        }
+    }
+    winners
+}
+
+fn compact_log_path(active: &Path) -> Result<PathBuf> {
+    let parent = parent_directory(active);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    Ok(parent.join(format!(
+        ".active.wlog.reclaim-{}-{nonce}",
+        std::process::id()
+    )))
+}
+
+fn write_compact_log(
+    path: &Path,
+    catalog: &Catalog,
+    identity_index: &CompactIdentityIndex,
+    live_index: &HashMap<u64, Vec<Point>>,
+    max_batch_points: usize,
+    max_transaction_bytes: usize,
+) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    write_database_header(&mut file)?;
+
+    let catalog_records = catalog.snapshot_records()?;
+    if !catalog_records.is_empty() {
+        let mut transaction = Transaction::new();
+        transaction.records = catalog_records;
+        write_standalone_transaction(&mut file, &transaction, max_transaction_bytes)?;
+    }
+
+    if !identity_index.identified.is_empty() || !identity_index.ingress.is_empty() {
+        write_identity_index_frames(&mut file, identity_index, max_transaction_bytes)?;
+    }
+
+    let tail: Vec<Point> = live_index.values().flatten().copied().collect();
+    if tail.len() > max_batch_points {
+        return Err(Error::BatchTooLarge {
+            points: tail.len(),
+            maximum: max_batch_points,
+        });
+    }
+    if !tail.is_empty() {
+        let mut transaction = Transaction::new();
+        transaction.records.push(Record::Points(tail));
+        write_standalone_transaction(&mut file, &transaction, max_transaction_bytes)?;
+    }
+
+    file.sync_all()?;
+    Ok(())
+}
+
+fn identity_index_frame_limit(max_transaction_bytes: usize) -> usize {
+    max_transaction_bytes
+        .saturating_add(IDENTITY_INDEX_ENTRY_OVERHEAD_BYTES)
+        .min(u32::MAX as usize)
+}
+
+fn write_identity_index_frames(
+    file: &mut File,
+    index: &CompactIdentityIndex,
+    max_transaction_bytes: usize,
+) -> Result<()> {
+    let limit = identity_index_frame_limit(max_transaction_bytes);
+    let mut chunk = CompactIdentityIndex::default();
+    let mut estimated_bytes = 0_usize;
+
+    for receipt in &index.identified {
+        let singleton = CompactIdentityIndex {
+            identified: vec![receipt.clone()],
+            ingress: Vec::new(),
+        };
+        let bytes = encoded_identity_index(&singleton)?.len();
+        if bytes > limit {
+            return Err(Error::Serialization(
+                "one identified receipt exceeds the identity-index frame limit".to_owned(),
+            ));
+        }
+        if estimated_bytes > 0 && estimated_bytes.saturating_add(bytes) > limit {
+            write_identity_index_frame(file, &chunk, limit)?;
+            chunk = CompactIdentityIndex::default();
+            estimated_bytes = 0;
+        }
+        chunk.identified.push(receipt.clone());
+        estimated_bytes = estimated_bytes.saturating_add(bytes);
+    }
+    for receipt in &index.ingress {
+        let singleton = CompactIdentityIndex {
+            identified: Vec::new(),
+            ingress: vec![receipt.clone()],
+        };
+        let bytes = encoded_identity_index(&singleton)?.len();
+        if bytes > limit {
+            return Err(Error::Serialization(
+                "one ingress receipt exceeds the identity-index frame limit".to_owned(),
+            ));
+        }
+        if estimated_bytes > 0 && estimated_bytes.saturating_add(bytes) > limit {
+            write_identity_index_frame(file, &chunk, limit)?;
+            chunk = CompactIdentityIndex::default();
+            estimated_bytes = 0;
+        }
+        chunk.ingress.push(receipt.clone());
+        estimated_bytes = estimated_bytes.saturating_add(bytes);
+    }
+    if !chunk.identified.is_empty() || !chunk.ingress.is_empty() {
+        write_identity_index_frame(file, &chunk, limit)?;
+    }
+    Ok(())
+}
+
+fn encoded_identity_index(index: &CompactIdentityIndex) -> Result<Vec<u8>> {
+    let encoded = postcard::to_stdvec(index)
+        .map_err(|error| Error::Serialization(format!("identity index encode failed: {error}")))?;
+    let mut payload = Vec::with_capacity(IDENTITY_INDEX_MAGIC_V2.len() + encoded.len());
+    payload.extend_from_slice(IDENTITY_INDEX_MAGIC_V2);
+    payload.extend_from_slice(&encoded);
+    Ok(payload)
+}
+
+fn write_identity_index_frame(
+    file: &mut File,
+    index: &CompactIdentityIndex,
+    limit: usize,
+) -> Result<()> {
+    let payload = encoded_identity_index(index)?;
+    if payload.len() > limit {
+        return Err(Error::Serialization(
+            "identity index chunk exceeds its frame limit".to_owned(),
+        ));
+    }
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| Error::Serialization("identity index exceeds u32 length".to_owned()))?;
+    let header = encode_frame_header(FRAME_KIND_IDENTITY_INDEX, 0, payload_len, hash(&payload));
+    file.write_all(&header)?;
+    file.write_all(&payload)?;
+    Ok(())
+}
+
+fn write_standalone_transaction(
+    file: &mut File,
+    transaction: &Transaction,
+    max_transaction_bytes: usize,
+) -> Result<()> {
+    let payload = encode_transaction(transaction)?;
+    if payload.len() > max_transaction_bytes {
+        return Err(Error::InvalidModel(format!(
+            "transaction has {} encoded bytes; maximum is {max_transaction_bytes}",
+            payload.len()
+        )));
+    }
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| Error::Serialization("transaction exceeds u32 length".to_owned()))?;
+    let record_count = u32::try_from(transaction.record_count())
+        .map_err(|_| Error::Serialization("too many transaction records".to_owned()))?;
+    let header = encode_frame_header(
+        FRAME_KIND_TRANSACTION,
+        record_count,
+        payload_len,
+        hash(&payload),
+    );
+    file.write_all(&header)?;
+    file.write_all(&payload)?;
+    Ok(())
+}
+
+fn apply_identity_index(
+    payload: &[u8],
+    offset: u64,
+    commit_ids: &mut HashSet<u128>,
+    identified_receipts: &mut HashMap<u128, StoredIdentifiedReceipt>,
+    ingress_receipts: &mut HashMap<IngressKey, StoredIngressReceipt>,
+    ingress_commit_ids: &mut HashMap<u128, IngressKey>,
+    ingress_last_sequences: &mut HashMap<u128, u64>,
+) -> Result<()> {
+    let index = decode_identity_index(payload, offset)?;
+    for receipt in index.identified {
+        if receipt.payload_len < (COMMIT_ID_BYTES + TRANSACTION_HEADER_BYTES) as u32 {
+            return corruption(offset, "identified receipt payload is too short");
+        }
+        let points = usize::try_from(receipt.points).map_err(|_| Error::Corruption {
+            offset,
+            reason: "identity index point count overflows usize".to_owned(),
+        })?;
+        let records = usize::try_from(receipt.records).map_err(|_| Error::Corruption {
+            offset,
+            reason: "identity index record count overflows usize".to_owned(),
+        })?;
+        let compact_payload = if receipt.payload.is_empty() {
+            None
+        } else {
+            if receipt.payload.len() != receipt.payload_len as usize
+                || hash(&receipt.payload) != receipt.payload_crc32
+                || receipt.payload.len() < COMMIT_ID_BYTES
+                || u128::from_le_bytes(receipt.payload[..COMMIT_ID_BYTES].try_into().unwrap())
+                    != receipt.commit_id
+            {
+                return corruption(offset, "identified receipt bytes do not match their index");
+            }
+            validate_compact_transaction(
+                &receipt.payload[COMMIT_ID_BYTES..],
+                records,
+                points,
+                offset,
+            )?;
+            Some(Arc::<[u8]>::from(receipt.payload))
+        };
+        if !commit_ids.insert(receipt.commit_id) {
+            return corruption(offset, "duplicate commit identifier");
+        }
+        identified_receipts.insert(
+            receipt.commit_id,
+            StoredIdentifiedReceipt {
+                payload_offset: 0,
+                payload_len: receipt.payload_len,
+                payload_crc32: receipt.payload_crc32,
+                compact_payload,
+                commit: Commit {
+                    frame_offset: offset,
+                    points,
+                    records,
+                    bytes_written: 0,
+                    durable: false,
+                    deduplicated: false,
+                },
+            },
+        );
+    }
+    for receipt in index.ingress {
+        if receipt.canonical_payload_len < TRANSACTION_HEADER_BYTES as u32 {
+            return corruption(offset, "ingress receipt payload is too short");
+        }
+        let points = usize::try_from(receipt.points).map_err(|_| Error::Corruption {
+            offset,
+            reason: "identity index point count overflows usize".to_owned(),
+        })?;
+        let records = usize::try_from(receipt.records).map_err(|_| Error::Corruption {
+            offset,
+            reason: "identity index record count overflows usize".to_owned(),
+        })?;
+        let compact_payload = if receipt.canonical_payload.is_empty() {
+            None
+        } else {
+            if receipt.canonical_payload.len() != receipt.canonical_payload_len as usize
+                || hash(&receipt.canonical_payload) != receipt.canonical_payload_crc32
+            {
+                return corruption(offset, "ingress receipt bytes do not match their index");
+            }
+            validate_compact_transaction(&receipt.canonical_payload, records, points, offset)?;
+            Some(Arc::<[u8]>::from(receipt.canonical_payload))
+        };
+        let identity = IngressIdentity {
+            source_id: receipt.source_id,
+            sequence: receipt.sequence,
+            commit_id: receipt.commit_id,
+        };
+        if identity.source_id == 0 {
+            return corruption(offset, "ingress source id zero is reserved");
+        }
+        let key = IngressKey::from(identity);
+        if ingress_receipts.contains_key(&key) {
+            return corruption(offset, "duplicate ingress source sequence");
+        }
+        if !commit_ids.insert(identity.commit_id) {
+            return corruption(offset, "duplicate commit identifier");
+        }
+        if let Some(last) = ingress_last_sequences.get(&identity.source_id).copied()
+            && identity.sequence <= last
+        {
+            return corruption(offset, "ingress source cursor is not strictly increasing");
+        }
+        ingress_receipts.insert(
+            key,
+            StoredIngressReceipt {
+                identity,
+                canonical_payload_offset: 0,
+                canonical_payload_len: receipt.canonical_payload_len,
+                canonical_payload_crc32: receipt.canonical_payload_crc32,
+                compact_payload,
+                commit: Commit {
+                    frame_offset: receipt.frame_offset,
+                    points,
+                    records,
+                    bytes_written: receipt.bytes_written,
+                    durable: false,
+                    deduplicated: false,
+                },
+            },
+        );
+        ingress_commit_ids.insert(identity.commit_id, key);
+        ingress_last_sequences.insert(identity.source_id, identity.sequence);
+    }
+    Ok(())
+}
+
+fn decode_identity_index(payload: &[u8], offset: u64) -> Result<CompactIdentityIndex> {
+    if let Some(encoded) = payload.strip_prefix(IDENTITY_INDEX_MAGIC_V2) {
+        return postcard::from_bytes(encoded).map_err(|error| Error::Corruption {
+            offset,
+            reason: format!("identity index v2 decode failed: {error}"),
+        });
+    }
+    postcard::from_bytes::<LegacyCompactIdentityIndex>(payload)
+        .map(Into::into)
+        .map_err(|error| Error::Corruption {
+            offset,
+            reason: format!("legacy identity index decode failed: {error}"),
+        })
+}
+
+fn validate_compact_transaction(
+    payload: &[u8],
+    expected_records: usize,
+    expected_points: usize,
+    offset: u64,
+) -> Result<()> {
+    let records = decode_transaction(payload, expected_records, offset)?;
+    let points = records
+        .iter()
+        .map(|record| match record {
+            Record::Points(points) => points.len(),
+            _ => 0,
+        })
+        .try_fold(0_usize, usize::checked_add)
+        .ok_or_else(|| Error::Corruption {
+            offset,
+            reason: "identity index point count overflows".to_owned(),
+        })?;
+    if points != expected_points {
+        return corruption(offset, "identity index point count does not match payload");
+    }
+    for record in &records {
+        if let Record::Points(points) = record
+            && crate::catalog::validate_point_intervals(points).is_err()
+        {
+            return corruption(offset, "identity index contains invalid point values");
+        }
     }
     Ok(())
 }
@@ -843,6 +2259,10 @@ struct Scan {
     index: HashMap<u64, Vec<Point>>,
     catalog: Catalog,
     commit_ids: HashSet<u128>,
+    identified_receipts: HashMap<u128, StoredIdentifiedReceipt>,
+    ingress_receipts: HashMap<IngressKey, StoredIngressReceipt>,
+    ingress_commit_ids: HashMap<u128, IngressKey>,
+    ingress_last_sequences: HashMap<u128, u64>,
     commits: u64,
     points: u64,
     catalog_records: u64,
@@ -850,6 +2270,7 @@ struct Scan {
     recovered_tail: RecoveredTail,
     validated_bytes: u64,
     salvage_stop_reason: Option<SalvageStopReason>,
+    pending_reclaim: bool,
 }
 
 enum ScanMode {
@@ -865,6 +2286,7 @@ fn scan_and_recover(
     max_batch_points: usize,
     max_transaction_bytes: usize,
     simulate_recovery: bool,
+    published_seals: &HashSet<u64>,
 ) -> Result<Scan> {
     scan_log(
         file,
@@ -873,6 +2295,7 @@ fn scan_and_recover(
         ScanMode::Recover {
             simulate: simulate_recovery,
         },
+        published_seals,
     )
 }
 
@@ -881,10 +2304,13 @@ fn scan_log(
     max_batch_points: usize,
     max_transaction_bytes: usize,
     mode: ScanMode,
+    published_seals: &HashSet<u64>,
 ) -> Result<Scan> {
-    let mut database_header = [0_u8; DATABASE_HEADER_BYTES];
+    let original_len = file.metadata()?.len();
     file.seek(SeekFrom::Start(0))?;
-    file.read_exact(&mut database_header)?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    let mut database_header = [0_u8; DATABASE_HEADER_BYTES];
+    reader.read_exact(&mut database_header)?;
     if &database_header[..8] != DATABASE_MAGIC {
         return Err(Error::InvalidHeader);
     }
@@ -893,21 +2319,26 @@ fn scan_log(
         return Err(Error::UnsupportedVersion(version));
     }
     let expected_checksum = u32::from_le_bytes(database_header[12..16].try_into().unwrap());
-    if hash(&database_header[..12]) != expected_checksum {
+    if hash(&database_header[..12]) != expected_checksum || database_header[10..12] != [0, 0] {
         return Err(Error::InvalidHeader);
     }
 
-    let original_len = file.metadata()?.len();
     let mut offset = DATABASE_HEADER_BYTES as u64;
     let mut index = HashMap::<u64, Vec<Point>>::new();
     let mut catalog = Catalog::default();
     let mut commit_ids = HashSet::<u128>::new();
+    let mut identified_receipts = HashMap::<u128, StoredIdentifiedReceipt>::new();
+    let mut ingress_receipts = HashMap::<IngressKey, StoredIngressReceipt>::new();
+    let mut ingress_commit_ids = HashMap::<u128, IngressKey>::new();
+    let mut ingress_last_sequences = HashMap::<u128, u64>::new();
     let mut commits = 0_u64;
     let mut points = 0_u64;
     let mut catalog_records = 0_u64;
     let mut recovered_tail_bytes = 0_u64;
     let mut recovered_tail = RecoveredTail::None;
     let mut salvage_stop_reason = None;
+    let mut pending_reclaim = false;
+    let mut payload = Vec::new();
 
     macro_rules! stop_or_corruption {
         ($reason:expr, $message:expr) => {
@@ -926,7 +2357,8 @@ fn scan_log(
                 recovered_tail_bytes = remaining;
                 recovered_tail = RecoveredTail::IncompleteHeader;
                 if !simulate {
-                    truncate_recovered_tail(file, offset)?;
+                    reader.seek(SeekFrom::Start(offset))?;
+                    truncate_recovered_tail(reader.get_mut(), offset)?;
                 }
             } else {
                 salvage_stop_reason = Some(SalvageStopReason::IncompleteFrameHeader);
@@ -935,8 +2367,7 @@ fn scan_log(
         }
 
         let mut frame_header = [0_u8; FRAME_HEADER_BYTES];
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(&mut frame_header)?;
+        reader.read_exact(&mut frame_header)?;
         if &frame_header[..4] != FRAME_MAGIC {
             stop_or_corruption!(SalvageStopReason::InvalidFrameMagic, "invalid frame magic");
         }
@@ -974,6 +2405,7 @@ fn scan_log(
             }
         } else if frame_kind == FRAME_KIND_TRANSACTION
             || frame_kind == FRAME_KIND_IDENTIFIED_TRANSACTION
+            || frame_kind == FRAME_KIND_INGRESS_TRANSACTION
         {
             if payload_len > max_transaction_bytes {
                 stop_or_corruption!(
@@ -987,6 +2419,33 @@ fn scan_log(
                     "identified transaction frame is too short"
                 );
             }
+            if frame_kind == FRAME_KIND_INGRESS_TRANSACTION && payload_len < INGRESS_IDENTITY_BYTES
+            {
+                stop_or_corruption!(
+                    SalvageStopReason::IngressTransactionTooShort,
+                    "ingress transaction frame is too short"
+                );
+            }
+        } else if frame_kind == FRAME_KIND_SEAL_CHECKPOINT {
+            if item_count != 0 || payload_len != SEAL_CHECKPOINT_BYTES {
+                stop_or_corruption!(
+                    SalvageStopReason::SealCheckpointInvalid,
+                    "seal checkpoint header has an item count or wrong payload length"
+                );
+            }
+        } else if frame_kind == FRAME_KIND_IDENTITY_INDEX {
+            if item_count != 0 {
+                stop_or_corruption!(
+                    SalvageStopReason::IdentityIndexInvalid,
+                    "identity index header has an item count"
+                );
+            }
+            if payload_len > identity_index_frame_limit(max_transaction_bytes) {
+                stop_or_corruption!(
+                    SalvageStopReason::TransactionFrameTooLarge,
+                    "identity index frame exceeds configured maximum"
+                );
+            }
         } else {
             stop_or_corruption!(SalvageStopReason::UnknownFrameKind, "unknown frame kind");
         }
@@ -997,7 +2456,8 @@ fn scan_log(
                 recovered_tail_bytes = remaining;
                 recovered_tail = RecoveredTail::IncompletePayload;
                 if !simulate {
-                    truncate_recovered_tail(file, offset)?;
+                    reader.seek(SeekFrom::Start(offset))?;
+                    truncate_recovered_tail(reader.get_mut(), offset)?;
                 }
             } else {
                 salvage_stop_reason = Some(SalvageStopReason::IncompleteFramePayload);
@@ -1005,8 +2465,9 @@ fn scan_log(
             break;
         }
 
-        let mut payload = vec![0_u8; payload_len];
-        file.read_exact(&mut payload)?;
+        payload.clear();
+        payload.resize(payload_len, 0);
+        reader.read_exact(&mut payload)?;
         if hash(&payload) != payload_checksum {
             let reason = if remaining == frame_len {
                 "payload checksum mismatch in complete final frame"
@@ -1017,12 +2478,55 @@ fn scan_log(
         }
 
         if frame_kind == FRAME_KIND_LEGACY_POINTS {
-            for raw in payload.chunks_exact(POINT_BYTES) {
-                let point = decode_point(raw);
+            let recovered: Vec<_> = payload
+                .chunks_exact(POINT_BYTES)
+                .map(decode_point)
+                .collect();
+            if crate::catalog::validate_point_intervals(&recovered).is_err() {
+                stop_or_corruption!(
+                    SalvageStopReason::InvalidLegacyPoint,
+                    "legacy point frame violates point invariants"
+                );
+            }
+            for point in recovered {
                 index.entry(point.series_id).or_default().push(point);
             }
             points += item_count as u64;
+        } else if frame_kind == FRAME_KIND_SEAL_CHECKPOINT {
+            let generation = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let sealed_points = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+            if generation == 0 || sealed_points != points {
+                stop_or_corruption!(
+                    SalvageStopReason::SealCheckpointInvalid,
+                    "seal checkpoint generation or point count is invalid"
+                );
+            }
+            if published_seals.contains(&generation) {
+                index.clear();
+                points = 0;
+                pending_reclaim = true;
+            }
+        } else if frame_kind == FRAME_KIND_IDENTITY_INDEX {
+            match apply_identity_index(
+                &payload,
+                offset,
+                &mut commit_ids,
+                &mut identified_receipts,
+                &mut ingress_receipts,
+                &mut ingress_commit_ids,
+                &mut ingress_last_sequences,
+            ) {
+                Ok(()) => {}
+                Err(error) if matches!(mode, ScanMode::Salvage) => {
+                    let _ = error;
+                    salvage_stop_reason = Some(SalvageStopReason::IdentityIndexInvalid);
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
         } else {
+            let mut ingress_identity = None;
+            let mut identified_commit_id = None;
             let transaction_payload = if frame_kind == FRAME_KIND_IDENTIFIED_TRANSACTION {
                 let commit_id = u128::from_le_bytes(payload[..COMMIT_ID_BYTES].try_into().unwrap());
                 // The writer refuses to append a frame whose identifier is
@@ -1035,7 +2539,43 @@ fn scan_log(
                         "duplicate commit identifier"
                     );
                 }
+                identified_commit_id = Some(commit_id);
                 &payload[COMMIT_ID_BYTES..]
+            } else if frame_kind == FRAME_KIND_INGRESS_TRANSACTION {
+                let identity = IngressIdentity {
+                    source_id: u128::from_le_bytes(payload[..16].try_into().unwrap()),
+                    sequence: u64::from_le_bytes(payload[16..24].try_into().unwrap()),
+                    commit_id: u128::from_le_bytes(payload[24..40].try_into().unwrap()),
+                };
+                if identity.source_id == 0 {
+                    stop_or_corruption!(
+                        SalvageStopReason::InvalidIngressSequence,
+                        "ingress source id zero is reserved"
+                    );
+                }
+                let key = IngressKey::from(identity);
+                if ingress_receipts.contains_key(&key) {
+                    stop_or_corruption!(
+                        SalvageStopReason::DuplicateIngressSequence,
+                        "duplicate ingress source sequence"
+                    );
+                }
+                if !commit_ids.insert(identity.commit_id) {
+                    stop_or_corruption!(
+                        SalvageStopReason::DuplicateCommitId,
+                        "duplicate commit identifier"
+                    );
+                }
+                if let Some(last) = ingress_last_sequences.get(&identity.source_id).copied()
+                    && identity.sequence <= last
+                {
+                    stop_or_corruption!(
+                        SalvageStopReason::InvalidIngressSequence,
+                        "ingress source cursor is not strictly increasing"
+                    );
+                }
+                ingress_identity = Some(identity);
+                &payload[INGRESS_IDENTITY_BYTES..]
             } else {
                 &payload[..]
             };
@@ -1080,6 +2620,53 @@ fn scan_log(
                     _ => catalog_records += 1,
                 }
             }
+            if let Some(commit_id) = identified_commit_id {
+                identified_receipts.insert(
+                    commit_id,
+                    StoredIdentifiedReceipt {
+                        payload_offset: offset + FRAME_HEADER_BYTES as u64,
+                        payload_len: u32::try_from(payload.len()).unwrap(),
+                        payload_crc32: payload_checksum,
+                        compact_payload: None,
+                        commit: Commit {
+                            frame_offset: offset,
+                            points: recovered_point_count,
+                            records: records.len(),
+                            bytes_written: frame_len,
+                            durable: false,
+                            deduplicated: false,
+                        },
+                    },
+                );
+            }
+            if let Some(identity) = ingress_identity {
+                let key = IngressKey::from(identity);
+                let receipt = StoredIngressReceipt {
+                    identity,
+                    canonical_payload_offset: offset
+                        + FRAME_HEADER_BYTES as u64
+                        + INGRESS_IDENTITY_BYTES as u64,
+                    canonical_payload_len: u32::try_from(transaction_payload.len()).unwrap(),
+                    canonical_payload_crc32: hash(transaction_payload),
+                    compact_payload: None,
+                    commit: Commit {
+                        frame_offset: offset,
+                        points: recovered_point_count,
+                        records: records.len(),
+                        bytes_written: frame_len,
+                        // A scan proves framing and checksums, not persistence
+                        // across power loss. A writable open syncs the full
+                        // recovered prefix and upgrades these receipts before
+                        // exposing the handle; a read-only open leaves them
+                        // conservative.
+                        durable: false,
+                        deduplicated: false,
+                    },
+                };
+                ingress_receipts.insert(key, receipt);
+                ingress_commit_ids.insert(identity.commit_id, key);
+                ingress_last_sequences.insert(identity.source_id, identity.sequence);
+            }
         }
         commits += 1;
         offset += frame_len;
@@ -1089,10 +2676,18 @@ fn scan_log(
         salvage_stop_reason = Some(SalvageStopReason::CleanEof);
     }
 
+    for series in index.values_mut() {
+        series.sort_by_key(|point| point.valid_time);
+    }
+
     Ok(Scan {
         index,
         catalog,
         commit_ids,
+        identified_receipts,
+        ingress_receipts,
+        ingress_commit_ids,
+        ingress_last_sequences,
         commits,
         points,
         catalog_records,
@@ -1100,6 +2695,7 @@ fn scan_log(
         recovered_tail,
         validated_bytes: offset,
         salvage_stop_reason,
+        pending_reclaim,
     })
 }
 
@@ -1158,7 +2754,11 @@ impl ReadOnlyFileIdentity {
 }
 
 impl SalvageSource {
-    pub(crate) fn open(root_path: &Path, file_name: &str) -> Result<Self> {
+    pub(crate) fn open(
+        root_path: &Path,
+        file_name: &str,
+        published_seals: &HashSet<u64>,
+    ) -> Result<Self> {
         use rustix::fs::{Mode, OFlags, open, openat};
 
         let root_descriptor = open(
@@ -1227,6 +2827,7 @@ impl SalvageSource {
             Config::default().max_batch_points,
             Config::default().max_transaction_bytes,
             ScanMode::Salvage,
+            published_seals,
         )?;
         Ok(Self {
             file,
@@ -1259,7 +2860,10 @@ impl SalvageSource {
         });
         #[cfg(test)]
         if mutate {
-            let mut writer = OpenOptions::new().read(true).write(true).open(&self.path)?;
+            let mut writer = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.path)?;
             writer.seek(SeekFrom::End(-1))?;
             let mut byte = [0_u8; 1];
             writer.read_exact(&mut byte)?;
@@ -1286,6 +2890,63 @@ impl SalvageSource {
             });
         }
         Ok(())
+    }
+}
+
+/// Opens or creates one regular file without following a final symlink or
+/// blocking on a FIFO or device. Existing paths use the same identity check
+/// as [`open_regular_file_read_only`]; a missing path is created as `0600`.
+fn open_regular_file_read_write(path: &Path) -> Result<File> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    match std::fs::symlink_metadata(path) {
+        Ok(path_metadata) => {
+            if !path_metadata.file_type().is_file() {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("writable path is not a regular file: {}", path.display()),
+                )));
+            }
+            let descriptor = open(
+                path,
+                OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+                Mode::empty(),
+            )
+            .map_err(|error| Error::Io(error.into()))?;
+            let file = File::from(descriptor);
+            let opened_metadata = file.metadata()?;
+            if !opened_metadata.file_type().is_file()
+                || opened_metadata.dev() != path_metadata.dev()
+                || opened_metadata.ino() != path_metadata.ino()
+            {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("writable path changed while opening: {}", path.display()),
+                )));
+            }
+            Ok(file)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let descriptor = open(
+                path,
+                OFlags::RDWR
+                    | OFlags::CLOEXEC
+                    | OFlags::NOFOLLOW
+                    | OFlags::CREATE
+                    | OFlags::NONBLOCK,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .map_err(|error| Error::Io(error.into()))?;
+            let file = File::from(descriptor);
+            if !file.metadata()?.file_type().is_file() {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("writable path is not a regular file: {}", path.display()),
+                )));
+            }
+            Ok(file)
+        }
+        Err(error) => Err(Error::Io(error)),
     }
 }
 
@@ -1378,8 +3039,6 @@ fn encode_frame_header(
 }
 
 fn encode_transaction(transaction: &Transaction) -> Result<Vec<u8>> {
-    let record_count = u32::try_from(transaction.record_count())
-        .map_err(|_| Error::Serialization("too many transaction records".to_owned()))?;
     let mut payload = Vec::new();
     // An identified transaction (frame kind 2) is the 16-byte little-endian
     // commit identifier followed by the unchanged kind-1 payload, keeping the
@@ -1387,6 +3046,19 @@ fn encode_transaction(transaction: &Transaction) -> Result<Vec<u8>> {
     if let Some(commit_id) = transaction.commit_id {
         payload.extend_from_slice(&commit_id.to_le_bytes());
     }
+    payload.extend_from_slice(&encode_canonical_transaction(transaction)?);
+    Ok(payload)
+}
+
+pub(crate) fn ingress_frame_bytes(transaction: &Transaction) -> Result<u64> {
+    let payload = encode_canonical_transaction(transaction)?;
+    Ok((FRAME_HEADER_BYTES + INGRESS_IDENTITY_BYTES + payload.len()) as u64)
+}
+
+fn encode_canonical_transaction(transaction: &Transaction) -> Result<Vec<u8>> {
+    let record_count = u32::try_from(transaction.record_count())
+        .map_err(|_| Error::Serialization("too many transaction records".to_owned()))?;
+    let mut payload = Vec::new();
     payload.extend_from_slice(TRANSACTION_MAGIC);
     payload.extend_from_slice(&TRANSACTION_VERSION.to_le_bytes());
     payload.extend_from_slice(&0_u16.to_le_bytes());
@@ -1436,6 +3108,9 @@ fn decode_transaction(payload: &[u8], expected_records: usize, offset: u64) -> R
     if version != TRANSACTION_VERSION {
         return corruption(offset, "unsupported transaction version");
     }
+    if payload[6..8] != [0, 0] {
+        return corruption(offset, "transaction reserved flags are non-zero");
+    }
     let record_count = u32::from_le_bytes(payload[8..12].try_into().unwrap()) as usize;
     if record_count != expected_records {
         return corruption(offset, "transaction record count mismatch");
@@ -1461,6 +3136,9 @@ fn decode_transaction(payload: &[u8], expected_records: usize, offset: u64) -> R
         let record_version = payload[cursor + 1];
         if record_version != 1 {
             return corruption(offset, "unsupported transaction record version");
+        }
+        if payload[cursor + 2..cursor + 4] != [0, 0] {
+            return corruption(offset, "transaction record reserved flags are non-zero");
         }
         let body_len =
             u32::from_le_bytes(payload[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
@@ -1567,13 +3245,15 @@ mod tests {
         SalvageSource, SalvageStopReason, ScanMode, encode_frame_header, encode_transaction,
         fail_next_sync, scan_log,
     };
+    use crate::transaction::IngressIdentity;
     use crate::{
         Entity, EntityId, Error, Plan, PlanStatus, RollupPolicy, Run, RunId, RunKind, RunStatus,
         SeriesDefinition, SeriesSemantics, Transaction,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
     fn point(valid_time: i64, knowledge_time: i64, change_time: i64, value: f64) -> Point {
@@ -1681,6 +3361,140 @@ mod tests {
         file.sync_all().unwrap();
     }
 
+    #[test]
+    fn newly_created_database_file_is_owner_only() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("private.ftwdb");
+        Database::open(&path).unwrap().close().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn rejects_non_zero_reserved_database_transaction_and_record_flags() {
+        let directory = tempdir().unwrap();
+
+        let database_path = directory.path().join("database-flags.ftwdb");
+        header_only(&database_path);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&database_path)
+            .unwrap();
+        let mut header = [0_u8; DATABASE_HEADER_BYTES];
+        file.read_exact(&mut header).unwrap();
+        header[10] = 1;
+        let checksum = crc32fast::hash(&header[..12]);
+        header[12..16].copy_from_slice(&checksum.to_le_bytes());
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&header).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        assert!(matches!(
+            Database::open(&database_path),
+            Err(Error::InvalidHeader)
+        ));
+
+        let transaction_path = directory.path().join("transaction-flags.ftwdb");
+        header_only(&transaction_path);
+        let mut payload = encode_transaction(&Transaction::new()).unwrap();
+        payload[6] = 1;
+        append_raw_frame(&transaction_path, FRAME_KIND_TRANSACTION, 0, &payload);
+        assert_eq!(
+            salvage_scan(&transaction_path, Config::default().max_batch_points).salvage_stop_reason,
+            Some(SalvageStopReason::InvalidTransaction)
+        );
+
+        let record_path = directory.path().join("record-flags.ftwdb");
+        header_only(&record_path);
+        let mut transaction = Transaction::new();
+        transaction.upsert_entity(home());
+        let mut payload = encode_transaction(&transaction).unwrap();
+        payload[super::TRANSACTION_HEADER_BYTES + 2] = 1;
+        append_raw_frame(&record_path, FRAME_KIND_TRANSACTION, 1, &payload);
+        assert_eq!(
+            salvage_scan(&record_path, Config::default().max_batch_points).salvage_stop_reason,
+            Some(SalvageStopReason::InvalidTransaction)
+        );
+    }
+
+    #[test]
+    fn salvage_rejects_invalid_legacy_points_and_control_frame_counts() {
+        let directory = tempdir().unwrap();
+
+        let legacy_path = directory.path().join("invalid-legacy-point.ftwdb");
+        header_only(&legacy_path);
+        let mut payload = Vec::new();
+        super::encode_point(Point::actual(1, 1, f64::INFINITY), &mut payload);
+        append_raw_frame(&legacy_path, super::FRAME_KIND_LEGACY_POINTS, 1, &payload);
+        assert_eq!(
+            salvage_scan(&legacy_path, Config::default().max_batch_points).salvage_stop_reason,
+            Some(SalvageStopReason::InvalidLegacyPoint)
+        );
+
+        let checkpoint_path = directory.path().join("invalid-checkpoint.ftwdb");
+        header_only(&checkpoint_path);
+        let mut checkpoint = [0_u8; super::SEAL_CHECKPOINT_BYTES];
+        checkpoint[..8].copy_from_slice(&1_u64.to_le_bytes());
+        append_raw_frame(
+            &checkpoint_path,
+            super::FRAME_KIND_SEAL_CHECKPOINT,
+            1,
+            &checkpoint,
+        );
+        assert_eq!(
+            salvage_scan(&checkpoint_path, Config::default().max_batch_points).salvage_stop_reason,
+            Some(SalvageStopReason::SealCheckpointInvalid)
+        );
+
+        let checkpoint_points_path = directory.path().join("invalid-checkpoint-points.ftwdb");
+        header_only(&checkpoint_points_path);
+        checkpoint[8..16].copy_from_slice(&1_u64.to_le_bytes());
+        append_raw_frame(
+            &checkpoint_points_path,
+            super::FRAME_KIND_SEAL_CHECKPOINT,
+            0,
+            &checkpoint,
+        );
+        assert_eq!(
+            salvage_scan(&checkpoint_points_path, Config::default().max_batch_points,)
+                .salvage_stop_reason,
+            Some(SalvageStopReason::SealCheckpointInvalid)
+        );
+
+        let index_path = directory.path().join("invalid-index-count.ftwdb");
+        header_only(&index_path);
+        let index = postcard::to_stdvec(&super::CompactIdentityIndex::default()).unwrap();
+        append_raw_frame(&index_path, super::FRAME_KIND_IDENTITY_INDEX, 1, &index);
+        assert_eq!(
+            salvage_scan(&index_path, Config::default().max_batch_points).salvage_stop_reason,
+            Some(SalvageStopReason::IdentityIndexInvalid)
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn config_rejects_limits_that_the_file_format_cannot_encode() {
+        let directory = tempdir().unwrap();
+        for config in [
+            Config {
+                max_batch_points: u32::MAX as usize + 1,
+                ..Config::default()
+            },
+            Config {
+                max_transaction_bytes: u32::MAX as usize + 1,
+                ..Config::default()
+            },
+        ] {
+            assert!(matches!(
+                Database::open_with(directory.path().join("limit.ftwdb"), config),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
+    }
+
     fn salvage_scan(path: &std::path::Path, max_batch_points: usize) -> super::Scan {
         let mut file = OpenOptions::new().read(true).open(path).unwrap();
         scan_log(
@@ -1688,6 +3502,7 @@ mod tests {
             max_batch_points,
             Config::default().max_transaction_bytes,
             ScanMode::Salvage,
+            &HashSet::new(),
         )
         .unwrap()
     }
@@ -1979,7 +3794,7 @@ mod tests {
         std::fs::create_dir(&source_root).unwrap();
         let active = source_root.join("active.wlog");
         legacy_log(&active, 1);
-        let source = SalvageSource::open(&source_root, "active.wlog").unwrap();
+        let source = SalvageSource::open(&source_root, "active.wlog", &HashSet::new()).unwrap();
 
         let mut writer = OpenOptions::new().write(true).open(&active).unwrap();
         writer.seek(SeekFrom::End(-1)).unwrap();
@@ -2042,10 +3857,33 @@ mod tests {
 
         let database = Database::open(&path).unwrap();
         assert_eq!(database.stats().unwrap().points, 3);
-        let latest = database.query_latest(7, 0, 1_000);
+        let latest = database.query_latest(7, 0, 1_000).unwrap();
         assert_eq!(latest.len(), 2);
         assert_eq!(latest[0].value, 3.0);
-        assert_eq!(database.query_as_of(7, 0, 1_000, 15)[0].value, 1.0);
+        assert_eq!(database.query_as_of(7, 0, 1_000, 15).unwrap()[0].value, 1.0);
+    }
+
+    #[test]
+    fn recovered_late_valid_times_remain_visible_to_range_queries() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("late-valid-time.ftwdb");
+        {
+            let mut database = Database::open(&path).unwrap();
+            database
+                .append(&[point(100, 10, 11, 1.0), point(200, 10, 11, 2.0)])
+                .unwrap();
+            database.append(&[point(50, 20, 21, 3.0)]).unwrap();
+            assert_eq!(database.query_history(7, 0, 75).unwrap().len(), 1);
+            database.close().unwrap();
+        }
+
+        let database = Database::open(&path).unwrap();
+        let early = database.query_history(7, 0, 75).unwrap();
+        assert_eq!(early.len(), 1);
+        assert_eq!(early[0].valid_time, 50);
+        assert_eq!(early[0].value, 3.0);
+        assert_eq!(database.query_history(7, 0, 150).unwrap().len(), 2);
+        assert_eq!(database.query_latest(7, 0, 1_000).unwrap().len(), 3);
     }
 
     #[test]
@@ -2085,6 +3923,46 @@ mod tests {
     }
 
     #[test]
+    fn append_and_commit_reject_non_finite_values_before_writing() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("non-finite.ftwdb");
+        let mut database = Database::open(&path).unwrap();
+        let before = database.stats().unwrap().file_bytes;
+
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut invalid = point(100, 10, 11, value);
+            invalid.valid_time_end = invalid.valid_time;
+            match database.append(&[invalid]) {
+                Err(Error::InvalidModel(reason)) => {
+                    assert_eq!(reason, "point value must be finite");
+                }
+                other => panic!("expected finite-value rejection, got {other:?}"),
+            }
+        }
+        assert_eq!(database.stats().unwrap().file_bytes, before);
+        assert_eq!(database.stats().unwrap().points, 0);
+
+        let mut catalog = Transaction::new();
+        catalog
+            .upsert_entity(home())
+            .define_series(power_series())
+            .upsert_run(optimization_run());
+        database.commit(catalog).unwrap();
+        let mut committed = Transaction::new();
+        let mut invalid = point(100, 10, 11, f64::NAN);
+        invalid.series_id = 7;
+        invalid.run_id = 9;
+        committed.append_points(vec![invalid]);
+        match database.commit(committed) {
+            Err(Error::InvalidModel(reason)) => {
+                assert_eq!(reason, "point value must be finite");
+            }
+            other => panic!("expected finite-value rejection, got {other:?}"),
+        }
+        assert!(database.append(&[point(1, 1, 1, 1.0)]).is_ok());
+    }
+
+    #[test]
     fn append_remains_a_catalog_less_fast_path() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("append-catalog-less.ftwdb");
@@ -2101,7 +3979,7 @@ mod tests {
         // The legacy frame recovers unchanged on reopen.
         let database = Database::open(&path).unwrap();
         assert_eq!(database.stats().unwrap().points, 1);
-        assert_eq!(database.query_latest(7, 0, 1_000).len(), 1);
+        assert_eq!(database.query_latest(7, 0, 1_000).unwrap().len(), 1);
     }
 
     #[test]
@@ -2219,7 +4097,7 @@ mod tests {
             super::RecoveredTail::IncompletePayload
         );
         assert_eq!(stats.file_bytes, first_length);
-        assert_eq!(database.query_latest(7, 0, 10).len(), 1);
+        assert_eq!(database.query_latest(7, 0, 10).unwrap().len(), 1);
         database.close().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
     }
@@ -2256,7 +4134,7 @@ mod tests {
             Err(Error::ReadOnly)
         ));
         assert!(matches!(database.flush(), Err(Error::ReadOnly)));
-        assert_eq!(database.query_latest(7, 0, 10).len(), 1);
+        assert_eq!(database.query_latest(7, 0, 10).unwrap().len(), 1);
         database.close().unwrap();
     }
 
@@ -2313,7 +4191,7 @@ mod tests {
         file.set_len(full_length - 10).unwrap();
 
         let database = Database::open(&path).unwrap();
-        assert_eq!(database.query_latest(7, 0, 10).len(), 1);
+        assert_eq!(database.query_latest(7, 0, 10).unwrap().len(), 1);
         let stats = database.stats().unwrap();
         assert_eq!(stats.file_bytes, first_length);
         assert!(stats.recovered_tail_bytes > 0);
@@ -2346,7 +4224,7 @@ mod tests {
         assert_eq!(stats.file_bytes, first_length);
         assert_eq!(stats.recovered_tail_bytes, 7);
         assert_eq!(stats.recovered_tail, super::RecoveredTail::IncompleteHeader);
-        assert_eq!(database.query_latest(7, 0, 10).len(), 1);
+        assert_eq!(database.query_latest(7, 0, 10).unwrap().len(), 1);
         database.close().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
 
@@ -2355,7 +4233,7 @@ mod tests {
         assert_eq!(stats.file_bytes, first_length);
         assert_eq!(stats.recovered_tail_bytes, 7);
         assert_eq!(stats.recovered_tail, super::RecoveredTail::IncompleteHeader);
-        assert_eq!(database.query_latest(7, 0, 10).len(), 1);
+        assert_eq!(database.query_latest(7, 0, 10).unwrap().len(), 1);
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
@@ -2548,8 +4426,8 @@ mod tests {
         assert_eq!(database.catalog().series(7), Some(&power_series()));
         assert_eq!(database.catalog().run(RunId(9)), Some(&optimization_run()));
         assert_eq!(database.catalog().plan(11), Some(&plan()));
-        assert_eq!(database.query_run(7, 9, 0, 1_000), vec![planned]);
-        let comparison = database.compare_plan_to_actual(7, 7, 9, 0, 1_000);
+        assert_eq!(database.query_run(7, 9, 0, 1_000).unwrap(), vec![planned]);
+        let comparison = database.compare_plan_to_actual(7, 7, 9, 0, 1_000).unwrap();
         assert_eq!(comparison.len(), 1);
         assert_eq!(comparison[0].difference, Some(-200.0));
         assert_eq!(database.stats().unwrap().catalog_records, 4);
@@ -2589,7 +4467,7 @@ mod tests {
         assert_eq!(commit.records, 0);
         assert_eq!(commit.bytes_written, 0);
         assert_eq!(database.stats().unwrap().points, 1);
-        assert_eq!(database.query_history(7, 0, 1_000).len(), 1);
+        assert_eq!(database.query_history(7, 0, 1_000).unwrap().len(), 1);
 
         // A different identifier is an independent commit; retrying it within
         // the same session is deduplicated without a reopen.
@@ -2600,8 +4478,721 @@ mod tests {
         assert!(!database.commit(second.clone()).unwrap().deduplicated);
         assert!(database.commit(second).unwrap().deduplicated);
         assert_eq!(database.stats().unwrap().points, 2);
-        assert_eq!(database.query_history(7, 0, 1_000).len(), 2);
+        assert_eq!(database.query_history(7, 0, 1_000).unwrap().len(), 2);
         database.close().unwrap();
+    }
+
+    #[test]
+    fn identified_commit_rejects_a_reused_id_with_different_bytes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("identified-conflict.ftwdb");
+        let mut first_point = point(100, 10, 10, 1.0);
+        first_point.run_id = 0;
+        let mut second_point = point(200, 20, 20, 2.0);
+        second_point.run_id = 0;
+        let mut database = Database::open(&path).unwrap();
+        let mut catalog = Transaction::new();
+        catalog.upsert_entity(home()).define_series(power_series());
+        database.commit(catalog).unwrap();
+
+        let mut first = Transaction::new();
+        first.append_points(vec![first_point]).with_commit_id(42);
+        assert!(!database.commit(first).unwrap().deduplicated);
+
+        let mut mutated = Transaction::new();
+        mutated.append_points(vec![second_point]).with_commit_id(42);
+        assert!(matches!(
+            database.commit(mutated),
+            Err(Error::IngressCommitIdConflict { commit_id: 42 })
+        ));
+        assert_eq!(database.stats().unwrap().points, 1);
+        assert_eq!(database.query_history(7, 0, 1_000).unwrap().len(), 1);
+
+        let mut exact = Transaction::new();
+        exact.append_points(vec![first_point]).with_commit_id(42);
+        assert!(database.commit(exact).unwrap().deduplicated);
+
+        database.close().unwrap();
+        let mut reopened = Database::open(&path).unwrap();
+        let mut mutated_after_reopen = Transaction::new();
+        mutated_after_reopen
+            .append_points(vec![second_point])
+            .with_commit_id(42);
+        assert!(matches!(
+            reopened.commit(mutated_after_reopen),
+            Err(Error::IngressCommitIdConflict { commit_id: 42 })
+        ));
+        let mut exact_after_reopen = Transaction::new();
+        exact_after_reopen
+            .append_points(vec![first_point])
+            .with_commit_id(42);
+        assert!(reopened.commit(exact_after_reopen).unwrap().deduplicated);
+        assert_eq!(reopened.stats().unwrap().points, 1);
+    }
+
+    #[test]
+    fn compact_receipts_compare_exact_bytes_even_when_crc32_collides() {
+        let directory = tempdir().unwrap();
+        let database = Database::open(directory.path().join("collision.ftwdb")).unwrap();
+        let original = b"plumless";
+        let collision = b"buckeroo";
+        assert_eq!(original.len(), collision.len());
+        assert_eq!(crc32fast::hash(original), crc32fast::hash(collision));
+
+        let receipt = super::StoredIdentifiedReceipt {
+            payload_offset: 0,
+            payload_len: original.len() as u32,
+            payload_crc32: crc32fast::hash(original),
+            compact_payload: Some(std::sync::Arc::from(original.as_slice())),
+            commit: super::Commit {
+                frame_offset: 0,
+                points: 0,
+                records: 0,
+                bytes_written: 0,
+                durable: true,
+                deduplicated: false,
+            },
+        };
+
+        assert!(
+            !database
+                .identified_payload_matches_at(receipt, collision)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn reclaim_sorts_ingress_receipts_and_preserves_exact_replay_receipts() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("ordered-compact-index.ftwdb");
+        let mut database = Database::open(&path).unwrap();
+        let identities = [
+            IngressIdentity::new(2, 4, 204),
+            IngressIdentity::new(1, 10, 110),
+            IngressIdentity::new(1, 12, 112),
+            IngressIdentity::new(2, 9, 209),
+            IngressIdentity::new(1, 20, 120),
+        ];
+        let mut originals = Vec::new();
+        for identity in identities {
+            originals.push((
+                identity,
+                database
+                    .commit_ingress(identity, Transaction::new())
+                    .unwrap(),
+            ));
+        }
+
+        database.reclaim_live_log().unwrap();
+        for (identity, original) in &originals {
+            let replay = database
+                .commit_ingress(*identity, Transaction::new())
+                .unwrap();
+            assert!(replay.deduplicated);
+            assert_eq!(replay.frame_offset, original.frame_offset);
+            assert_eq!(replay.bytes_written, original.bytes_written);
+        }
+        database.close().unwrap();
+
+        let mut reopened = Database::open(&path).unwrap();
+        for (identity, original) in originals {
+            let replay = reopened
+                .commit_ingress(identity, Transaction::new())
+                .unwrap();
+            assert!(replay.deduplicated);
+            assert_eq!(replay.frame_offset, original.frame_offset);
+            assert_eq!(replay.bytes_written, original.bytes_written);
+        }
+    }
+
+    #[test]
+    fn reclaim_splits_large_exact_identity_indexes_into_bounded_frames() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("chunked-compact-index.ftwdb");
+        let config = Config {
+            max_transaction_bytes: 64,
+            ..Config::default()
+        };
+        let mut database = Database::open_with(&path, config).unwrap();
+        let identities: Vec<_> = (0_u64..80)
+            .map(|sequence| {
+                IngressIdentity::new(9, sequence, u128::from(sequence).saturating_add(1_000))
+            })
+            .collect();
+        for identity in &identities {
+            database
+                .commit_ingress(*identity, Transaction::new())
+                .unwrap();
+        }
+        database.reclaim_live_log().unwrap();
+        database.close().unwrap();
+
+        let mut reopened = Database::open_with(&path, config).unwrap();
+        for identity in identities {
+            assert!(
+                reopened
+                    .commit_ingress(identity, Transaction::new())
+                    .unwrap()
+                    .deduplicated
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_compact_identity_index_decodes_without_exact_payloads() {
+        #[derive(serde::Serialize)]
+        struct LegacyIdentified {
+            commit_id: u128,
+            payload_len: u32,
+            payload_crc32: u32,
+            points: u64,
+            records: u64,
+        }
+        #[derive(serde::Serialize)]
+        struct LegacyIngress {
+            source_id: u128,
+            sequence: u64,
+            commit_id: u128,
+            canonical_payload_len: u32,
+            canonical_payload_crc32: u32,
+            points: u64,
+            records: u64,
+        }
+        #[derive(serde::Serialize)]
+        struct LegacyIndex {
+            identified: Vec<LegacyIdentified>,
+            ingress: Vec<LegacyIngress>,
+        }
+
+        let encoded = postcard::to_stdvec(&LegacyIndex {
+            identified: vec![LegacyIdentified {
+                commit_id: 1,
+                payload_len: 28,
+                payload_crc32: 2,
+                points: 3,
+                records: 4,
+            }],
+            ingress: vec![LegacyIngress {
+                source_id: 5,
+                sequence: 6,
+                commit_id: 7,
+                canonical_payload_len: 12,
+                canonical_payload_crc32: 8,
+                points: 9,
+                records: 0,
+            }],
+        })
+        .unwrap();
+        let decoded = super::decode_identity_index(&encoded, 0).unwrap();
+        assert!(decoded.identified[0].payload.is_empty());
+        assert!(decoded.ingress[0].canonical_payload.is_empty());
+        assert_eq!(decoded.ingress[0].frame_offset, 0);
+        assert_eq!(decoded.ingress[0].bytes_written, 0);
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("legacy-index.ftwdb");
+        header_only(&path);
+        let mut transaction = Transaction::new();
+        transaction.with_commit_id(77);
+        let payload = encode_transaction(&transaction).unwrap();
+        let legacy = postcard::to_stdvec(&LegacyIndex {
+            identified: vec![LegacyIdentified {
+                commit_id: 77,
+                payload_len: payload.len() as u32,
+                payload_crc32: crc32fast::hash(&payload),
+                points: 0,
+                records: 0,
+            }],
+            ingress: Vec::new(),
+        })
+        .unwrap();
+        append_raw_frame(&path, super::FRAME_KIND_IDENTITY_INDEX, 0, &legacy);
+
+        let mut database = Database::open(&path).unwrap();
+        assert!(database.contains_commit_id(77));
+        assert!(matches!(
+            database.commit(transaction),
+            Err(Error::IngressCommitIdConflict { commit_id: 77 })
+        ));
+    }
+
+    #[test]
+    fn writable_open_rejects_symlink_fifo_and_directory_without_blocking() {
+        for kind in ["symlink", "fifo", "directory"] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("not-a-regular-file.ftwdb");
+            match kind {
+                "symlink" => std::os::unix::fs::symlink("outside", &path).unwrap(),
+                "fifo" => create_fifo(&path),
+                "directory" => std::fs::create_dir(&path).unwrap(),
+                _ => unreachable!(),
+            }
+            match Database::open(&path) {
+                Ok(_) => panic!("{kind}: writable open must reject a non-file"),
+                Err(Error::Io(io_error)) => {
+                    assert!(
+                        io_error.to_string().contains("not a regular file"),
+                        "{kind}: {io_error}"
+                    );
+                }
+                Err(other) => panic!("{kind}: expected I/O rejection, got {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn writable_open_creates_a_private_regular_file() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("created.ftwdb");
+        let database = Database::open(&path).unwrap();
+        drop(database);
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_fifo(path: &std::path::Path) {
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn create_fifo(path: &std::path::Path) {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path` is a live NUL-terminated string and mode has no
+        // platform-dependent bits beyond user read/write permissions.
+        let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        if result != 0 {
+            panic!("mkfifo failed: {}", std::io::Error::last_os_error());
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn create_fifo(_path: &std::path::Path) {
+        panic!("FIFO open tests require Linux or macOS");
+    }
+
+    #[test]
+    fn ingress_replay_after_reopen_returns_the_original_receipt() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("ingress-replay.ftwdb");
+        let identity = IngressIdentity::new(11, 400, 9001);
+        let mut telemetry = point(100, 10, 10, 1.0);
+        telemetry.run_id = 0;
+        let build = || {
+            let mut transaction = Transaction::new();
+            transaction.append_points(vec![telemetry]);
+            transaction
+        };
+
+        let original = {
+            let mut database = Database::open(&path).unwrap();
+            let mut catalog = Transaction::new();
+            catalog.upsert_entity(home()).define_series(power_series());
+            database.commit(catalog).unwrap();
+            let receipt = database.commit_ingress(identity, build()).unwrap();
+            assert!(!receipt.deduplicated);
+            database.close().unwrap();
+            receipt
+        };
+
+        let mut database = Database::open(&path).unwrap();
+        let replay = database.commit_ingress(identity, build()).unwrap();
+        assert!(replay.deduplicated);
+        assert_eq!(replay.frame_offset, original.frame_offset);
+        assert_eq!(replay.points, original.points);
+        assert_eq!(replay.records, original.records);
+        assert_eq!(replay.bytes_written, original.bytes_written);
+        assert!(replay.durable);
+        assert_eq!(database.stats().unwrap().points, 1);
+        assert_eq!(database.query_history(7, 0, 1_000).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ingress_identity_conflicts_are_exact_and_nonfatal() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("ingress-conflict.ftwdb");
+        let mut database = Database::open(&path).unwrap();
+        let mut catalog = Transaction::new();
+        catalog.upsert_entity(home()).define_series(power_series());
+        database.commit(catalog).unwrap();
+
+        let mut first = Transaction::new();
+        first.append_points(vec![Point::actual(7, 100, 1.0)]);
+        database
+            .commit_ingress(IngressIdentity::new(1, 8, 80), first)
+            .unwrap();
+
+        let mut changed = Transaction::new();
+        changed.append_points(vec![Point::actual(7, 100, 2.0)]);
+        assert!(matches!(
+            database.commit_ingress(IngressIdentity::new(1, 8, 80), changed),
+            Err(Error::IngressSourceSequenceConflict {
+                source_id: 1,
+                sequence: 8
+            })
+        ));
+
+        let mut reused_commit_id = Transaction::new();
+        reused_commit_id.append_points(vec![Point::actual(7, 200, 3.0)]);
+        assert!(matches!(
+            database.commit_ingress(IngressIdentity::new(2, 1, 80), reused_commit_id),
+            Err(Error::IngressCommitIdConflict { commit_id: 80 })
+        ));
+
+        let mut next = Transaction::new();
+        next.append_points(vec![Point::actual(7, 200, 3.0)]);
+        assert!(
+            !database
+                .commit_ingress(IngressIdentity::new(1, 9, 81), next)
+                .unwrap()
+                .deduplicated
+        );
+        assert_eq!(database.stats().unwrap().points, 2);
+    }
+
+    #[test]
+    fn ingress_replay_detects_storage_changes_and_poisons_later_writes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("ingress-mutated-after-open.ftwdb");
+        let identity = IngressIdentity::new(6, 20, 200);
+        let mut database = Database::open(&path).unwrap();
+        database
+            .commit_ingress(identity, Transaction::new())
+            .unwrap();
+
+        let receipt = database
+            .ingress_receipts
+            .get(&super::IngressKey::from(identity))
+            .unwrap();
+        let offset = receipt.canonical_payload_offset;
+        let frame_offset = receipt.commit.frame_offset;
+        let mut mutator = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        mutator.seek(SeekFrom::Start(offset)).unwrap();
+        let mut byte = [0_u8; 1];
+        mutator.read_exact(&mut byte).unwrap();
+        mutator.seek(SeekFrom::Start(offset)).unwrap();
+        mutator.write_all(&[byte[0] ^ 0xff]).unwrap();
+        mutator.sync_data().unwrap();
+
+        assert!(matches!(
+            database.commit_ingress(identity, Transaction::new()),
+            Err(Error::Corruption { offset, .. }) if offset == frame_offset
+        ));
+        assert!(matches!(
+            database.commit_ingress(IngressIdentity::new(6, 21, 201), Transaction::new()),
+            Err(Error::Poisoned)
+        ));
+    }
+
+    #[test]
+    fn ingress_replay_detects_identity_changes_after_open() {
+        let directory = tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("ingress-identity-mutated-after-open.ftwdb");
+        let identity = IngressIdentity::new(7, 30, 300);
+        let mut database = Database::open(&path).unwrap();
+        let commit = database
+            .commit_ingress(identity, Transaction::new())
+            .unwrap();
+
+        let identity_offset = commit.frame_offset + super::FRAME_HEADER_BYTES as u64;
+        let mut mutator = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        mutator.seek(SeekFrom::Start(identity_offset)).unwrap();
+        let mut byte = [0_u8; 1];
+        mutator.read_exact(&mut byte).unwrap();
+        mutator.seek(SeekFrom::Start(identity_offset)).unwrap();
+        mutator.write_all(&[byte[0] ^ 0xff]).unwrap();
+        mutator.sync_data().unwrap();
+
+        assert!(matches!(
+            database.commit_ingress(identity, Transaction::new()),
+            Err(Error::Corruption { offset, .. }) if offset == commit.frame_offset
+        ));
+        assert!(matches!(
+            database.commit_ingress(IngressIdentity::new(7, 31, 301), Transaction::new()),
+            Err(Error::Poisoned)
+        ));
+    }
+
+    #[test]
+    fn ingress_cursor_allows_gaps_and_rejects_regression_after_reopen() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("ingress-sequence.ftwdb");
+        {
+            let mut database = Database::open(&path).unwrap();
+            database
+                .commit_ingress(IngressIdentity::new(7, 50, 500), Transaction::new())
+                .unwrap();
+            database.close().unwrap();
+        }
+
+        let mut database = Database::open(&path).unwrap();
+        assert!(
+            !database
+                .commit_ingress(IngressIdentity::new(7, 52, 502), Transaction::new())
+                .unwrap()
+                .deduplicated
+        );
+        database.close().unwrap();
+
+        let mut database = Database::open(&path).unwrap();
+        assert!(
+            database
+                .commit_ingress(IngressIdentity::new(7, 52, 502), Transaction::new())
+                .unwrap()
+                .deduplicated
+        );
+        assert!(matches!(
+            database.commit_ingress(IngressIdentity::new(7, 51, 501), Transaction::new()),
+            Err(Error::IngressSequenceNotIncreasing {
+                source_id: 7,
+                previous: 52,
+                actual: 51
+            })
+        ));
+        assert_eq!(database.stats().unwrap().commits, 2);
+    }
+
+    #[test]
+    fn ingress_watermarks_are_per_source_and_advance_on_flush() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("ingress-watermarks.ftwdb");
+        let mut database = Database::open_with(
+            &path,
+            Config {
+                durability: Durability::Manual,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+
+        database
+            .commit_ingress(IngressIdentity::new(1, 10, 100), Transaction::new())
+            .unwrap();
+        database
+            .commit_ingress(IngressIdentity::new(2, 50, 200), Transaction::new())
+            .unwrap();
+        assert_eq!(
+            database.ingress_watermarks(1),
+            super::IngressWatermarks {
+                accepted_through: Some(10),
+                durable_through: None,
+            }
+        );
+        assert_eq!(
+            database.ingress_watermarks(2),
+            super::IngressWatermarks {
+                accepted_through: Some(50),
+                durable_through: None,
+            }
+        );
+
+        database.flush().unwrap();
+        assert_eq!(database.ingress_watermarks(1).durable_through, Some(10));
+        assert_eq!(database.ingress_watermarks(2).durable_through, Some(50));
+
+        database
+            .commit_ingress(IngressIdentity::new(1, 11, 101), Transaction::new())
+            .unwrap();
+        assert_eq!(
+            database.ingress_watermarks(1),
+            super::IngressWatermarks {
+                accepted_through: Some(11),
+                durable_through: Some(10),
+            }
+        );
+        database.close().unwrap();
+
+        let database = Database::open_read_only(&path).unwrap();
+        assert_eq!(
+            database.ingress_watermarks(1),
+            super::IngressWatermarks {
+                accepted_through: Some(11),
+                durable_through: None,
+            }
+        );
+        assert_eq!(
+            database.ingress_watermarks(2),
+            super::IngressWatermarks {
+                accepted_through: Some(50),
+                durable_through: None,
+            }
+        );
+    }
+
+    #[test]
+    fn append_sync_advances_ingress_durable_watermarks() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("append-sync-watermarks.ftwdb");
+        let mut database = Database::open_with(
+            &path,
+            Config {
+                durability: Durability::EveryBytes(2_048),
+                ..Config::default()
+            },
+        )
+        .unwrap();
+
+        database
+            .commit_ingress(IngressIdentity::new(3, 7, 70), Transaction::new())
+            .unwrap();
+        assert_eq!(
+            database.ingress_watermarks(3),
+            super::IngressWatermarks {
+                accepted_through: Some(7),
+                durable_through: None,
+            }
+        );
+
+        let points: Vec<_> = (0..64)
+            .map(|index| point(index, 1, 1, index as f64))
+            .collect();
+        let commit = database.append(&points).unwrap();
+        assert!(commit.durable);
+        assert_eq!(database.ingress_watermarks(3).durable_through, Some(7));
+    }
+
+    #[test]
+    fn writable_reopen_syncs_recovered_ingress_before_claiming_durability() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("ingress-reopen-durability.ftwdb");
+        let identity = IngressIdentity::new(4, 70, 700);
+
+        {
+            let mut database = Database::open_with(
+                &path,
+                Config {
+                    durability: Durability::Manual,
+                    ..Config::default()
+                },
+            )
+            .unwrap();
+            let commit = database
+                .commit_ingress(identity, Transaction::new())
+                .unwrap();
+            assert!(!commit.durable);
+            assert_eq!(database.ingress_watermarks(4).durable_through, None);
+            // Dropping models a process exit that did not call flush.
+        }
+
+        let mut database = Database::open_with(
+            &path,
+            Config {
+                durability: Durability::Manual,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(database.ingress_watermarks(4).durable_through, Some(70));
+        let replay = database
+            .commit_ingress(identity, Transaction::new())
+            .unwrap();
+        assert!(replay.durable);
+        assert!(replay.deduplicated);
+    }
+
+    #[test]
+    fn writable_reopen_does_not_publish_durability_when_startup_sync_fails() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("ingress-reopen-sync-failure.ftwdb");
+        {
+            let mut database = Database::open_with(
+                &path,
+                Config {
+                    durability: Durability::Manual,
+                    ..Config::default()
+                },
+            )
+            .unwrap();
+            database
+                .commit_ingress(IngressIdentity::new(5, 80, 800), Transaction::new())
+                .unwrap();
+        }
+
+        fail_next_sync(std::io::ErrorKind::Other);
+        assert!(matches!(
+            Database::open_with(
+                &path,
+                Config {
+                    durability: Durability::Manual,
+                    ..Config::default()
+                }
+            ),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::Other
+        ));
+    }
+
+    #[test]
+    fn ingress_rejects_zero_source_without_poisoning_the_writer() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("ingress-zero-source.ftwdb");
+        let mut database = Database::open(&path).unwrap();
+        assert!(matches!(
+            database.commit_ingress(IngressIdentity::new(0, 1, 1), Transaction::new()),
+            Err(Error::InvalidArgument("ingress source id zero is reserved"))
+        ));
+        assert!(
+            !database
+                .commit_ingress(IngressIdentity::new(1, 1, 1), Transaction::new())
+                .unwrap()
+                .deduplicated
+        );
+    }
+
+    #[test]
+    fn torn_ingress_frame_forgets_identity_sequence_and_data_together() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("torn-ingress.ftwdb");
+        let identity = IngressIdentity::new(3, 90, 900);
+        {
+            let mut database = Database::open(&path).unwrap();
+            let mut catalog = Transaction::new();
+            catalog.upsert_entity(home()).define_series(power_series());
+            database.commit(catalog).unwrap();
+            let mut transaction = Transaction::new();
+            transaction.append_points(vec![Point::actual(7, 100, 1.0)]);
+            database.commit_ingress(identity, transaction).unwrap();
+            database.close().unwrap();
+        }
+        let full_length = std::fs::metadata(&path).unwrap().len();
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(full_length - 7).unwrap();
+        drop(file);
+
+        let mut database = Database::open(&path).unwrap();
+        assert_eq!(database.stats().unwrap().points, 0);
+        let mut retry = Transaction::new();
+        retry.append_points(vec![Point::actual(7, 100, 1.0)]);
+        assert!(
+            !database
+                .commit_ingress(identity, retry.clone())
+                .unwrap()
+                .deduplicated
+        );
+        assert!(
+            database
+                .commit_ingress(identity, retry)
+                .unwrap()
+                .deduplicated
+        );
+        assert_eq!(database.stats().unwrap().points, 1);
     }
 
     #[test]
@@ -2626,7 +5217,7 @@ mod tests {
         assert!(!commit.deduplicated);
         assert_eq!(commit.points, 1);
         assert_eq!(database.stats().unwrap().points, 2);
-        assert_eq!(database.query_history(7, 0, 1_000).len(), 2);
+        assert_eq!(database.query_history(7, 0, 1_000).unwrap().len(), 2);
     }
 
     #[test]
@@ -2660,7 +5251,7 @@ mod tests {
         retry.append_points(vec![telemetry]).with_commit_id(77);
         assert!(!database.commit(retry).unwrap().deduplicated);
         assert_eq!(database.stats().unwrap().points, 1);
-        assert_eq!(database.query_history(7, 0, 1_000).len(), 1);
+        assert_eq!(database.query_history(7, 0, 1_000).unwrap().len(), 1);
     }
 
     #[test]
@@ -2749,6 +5340,6 @@ mod tests {
         let recovered = Database::open(&path).unwrap();
         assert_eq!(recovered.stats().unwrap().file_bytes, before);
         assert_eq!(recovered.catalog().stats().entities, 0);
-        assert!(recovered.query_latest(7, 0, 1_000).is_empty());
+        assert!(recovered.query_latest(7, 0, 1_000).unwrap().is_empty());
     }
 }

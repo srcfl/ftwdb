@@ -15,9 +15,11 @@ concurrency:
 jobs:
   verify:
     name: verify release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: 1.97.1
@@ -27,6 +29,7 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
+          git merge-base --is-ancestor "${GITHUB_SHA}" origin/main
           if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]]; then
             echo "invalid release tag: ${tag}" >&2
             exit 1
@@ -57,42 +60,8 @@ jobs:
       - run: cargo package --locked --offline
 
   build:
-    name: build (${{ matrix.os }})
     needs: verify
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-        with:
-          toolchain: 1.97.1
-      - run: cargo build --release --locked
-      - name: Build archive
-        id: archive
-        shell: bash
-        run: |
-          set -euo pipefail
-          host="$(rustc -vV | sed -n 's/^host: //p')"
-          name="ftw-${GITHUB_REF_NAME}-${host}"
-          mkdir -p "dist/${name}"
-          cp target/release/ftw README.md CHANGELOG.md LICENSE "dist/${name}/"
-          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
-          (
-            cd dist
-            shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
-          )
-          echo "name=${name}" >> "${GITHUB_OUTPUT}"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: release-${{ steps.archive.outputs.name }}
-          path: |
-            dist/${{ steps.archive.outputs.name }}.tar.gz
-            dist/${{ steps.archive.outputs.name }}.tar.gz.sha256
-          if-no-files-found: error
-          retention-days: 14
+    uses: ./.github/workflows/packages.yml
 
   publish:
     name: publish GitHub release
@@ -116,6 +85,7 @@ jobs:
         run: |
           set -euo pipefail
           sort -k2 dist/*.sha256 > dist/SHA256SUMS
+          (cd dist && sha256sum -c SHA256SUMS)
           git for-each-ref --format='%(contents)' \
             "refs/tags/${GITHUB_REF_NAME}" > dist/RELEASE_NOTES.md
           if [[ ! -s dist/RELEASE_NOTES.md ]]; then

@@ -1,0 +1,45 @@
+name: Packages
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: package (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: 1.97.1
+      - name: Build Linux binaries on the supported Debian baseline
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          docker build -t ftwdb-package .
+          bash packaging/check-container.sh ftwdb-package
+          container=$(docker create ftwdb-package)
+          trap 'docker rm -f "$container" >/dev/null' EXIT
+          mkdir -p target/release
+          docker cp "$container":/usr/local/bin/. target/release/
+      - name: Build macOS binaries
+        if: runner.os == 'macOS'
+        run: cargo build --release --locked --bins
+      - name: Pack and run all three archived binaries
+        run: python3 packaging/build-archive.py --require-clean
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.os }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14

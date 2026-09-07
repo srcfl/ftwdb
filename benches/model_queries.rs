@@ -36,51 +36,71 @@ fn model_query_benchmarks(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("model_queries");
     group.bench_function("latest", |bencher| {
         bencher.iter(|| {
-            black_box(database.query_latest(
-                FORECAST_SERIES,
-                fixture.forecast_start,
-                fixture.forecast_end,
-            ))
+            black_box(
+                database
+                    .query_latest(
+                        FORECAST_SERIES,
+                        fixture.forecast_start,
+                        fixture.forecast_end,
+                    )
+                    .unwrap(),
+            )
         })
     });
     group.bench_function("history", |bencher| {
         bencher.iter(|| {
-            black_box(database.query_history(
-                FORECAST_SERIES,
-                fixture.forecast_start,
-                fixture.forecast_end,
-            ))
+            black_box(
+                database
+                    .query_history(
+                        FORECAST_SERIES,
+                        fixture.forecast_start,
+                        fixture.forecast_end,
+                    )
+                    .unwrap(),
+            )
         })
     });
     group.bench_function("as_of", |bencher| {
         bencher.iter(|| {
-            black_box(database.query_as_of(
-                FORECAST_SERIES,
-                fixture.forecast_start,
-                fixture.forecast_end,
-                15,
-            ))
+            black_box(
+                database
+                    .query_as_of(
+                        FORECAST_SERIES,
+                        fixture.forecast_start,
+                        fixture.forecast_end,
+                        15,
+                    )
+                    .unwrap(),
+            )
         })
     });
     group.bench_function("run", |bencher| {
         bencher.iter(|| {
-            black_box(database.query_run(
-                FORECAST_SERIES,
-                ORIGINAL_FORECAST_RUN,
-                fixture.forecast_start,
-                fixture.forecast_end,
-            ))
+            black_box(
+                database
+                    .query_run(
+                        FORECAST_SERIES,
+                        ORIGINAL_FORECAST_RUN,
+                        fixture.forecast_start,
+                        fixture.forecast_end,
+                    )
+                    .unwrap(),
+            )
         })
     });
     group.bench_function("plan_outcome", |bencher| {
         bencher.iter(|| {
-            black_box(database.compare_plan_to_actual(
-                PLANNED_SERIES,
-                ACTUAL_SERIES,
-                OPTIMIZATION_RUN,
-                0,
-                fixture.actual_end,
-            ))
+            black_box(
+                database
+                    .compare_plan_to_actual(
+                        PLANNED_SERIES,
+                        ACTUAL_SERIES,
+                        OPTIMIZATION_RUN,
+                        0,
+                        fixture.actual_end,
+                    )
+                    .unwrap(),
+            )
         })
     });
     group.bench_function("gauge_rollup_5m", |bencher| {
@@ -274,55 +294,65 @@ fn forecast_point(valid_time: i64, revision_time: i64, run_id: u128, value: f64)
 
 fn verify_answers(fixture: &Fixture) {
     let database = fixture.store.database();
-    let history = database.query_history(
-        FORECAST_SERIES,
-        fixture.forecast_start,
-        fixture.forecast_end,
-    );
+    let history = database
+        .query_history(
+            FORECAST_SERIES,
+            fixture.forecast_start,
+            fixture.forecast_end,
+        )
+        .unwrap();
     assert_eq!(history.len(), FORECAST_TIMES * 3);
     for (index, revisions) in history.chunks_exact(3).enumerate() {
         assert_eq!(revisions, &forecast_points_for(index));
     }
 
-    let latest = database.query_latest(
-        FORECAST_SERIES,
-        fixture.forecast_start,
-        fixture.forecast_end,
-    );
+    let latest = database
+        .query_latest(
+            FORECAST_SERIES,
+            fixture.forecast_start,
+            fixture.forecast_end,
+        )
+        .unwrap();
     assert_eq!(latest.len(), FORECAST_TIMES);
     for (index, point) in latest.iter().enumerate() {
         assert_eq!(*point, forecast_points_for(index)[2]);
     }
 
-    let as_of = database.query_as_of(
-        FORECAST_SERIES,
-        fixture.forecast_start,
-        fixture.forecast_end,
-        15,
-    );
+    let as_of = database
+        .query_as_of(
+            FORECAST_SERIES,
+            fixture.forecast_start,
+            fixture.forecast_end,
+            15,
+        )
+        .unwrap();
     assert_eq!(as_of.len(), FORECAST_TIMES);
     for (index, point) in as_of.iter().enumerate() {
         assert_eq!(*point, forecast_points_for(index)[0]);
     }
 
-    let run = database.query_run(
-        FORECAST_SERIES,
-        ORIGINAL_FORECAST_RUN,
-        fixture.forecast_start,
-        fixture.forecast_end,
-    );
+    let run = database
+        .query_run(
+            FORECAST_SERIES,
+            ORIGINAL_FORECAST_RUN,
+            fixture.forecast_start,
+            fixture.forecast_end,
+        )
+        .unwrap();
     assert_eq!(run.len(), FORECAST_TIMES);
     for (index, point) in run.iter().enumerate() {
         assert_eq!(*point, forecast_points_for(index)[1]);
     }
 
-    let outcomes = database.compare_plan_to_actual(
-        PLANNED_SERIES,
-        ACTUAL_SERIES,
-        OPTIMIZATION_RUN,
-        0,
-        fixture.actual_end,
-    );
+    let outcomes = database
+        .compare_plan_to_actual(
+            PLANNED_SERIES,
+            ACTUAL_SERIES,
+            OPTIMIZATION_RUN,
+            0,
+            fixture.actual_end,
+        )
+        .unwrap();
     assert_eq!(outcomes.len(), ACTUAL_POINTS);
     for (index, outcome) in outcomes.iter().enumerate() {
         assert_eq!(*outcome, expected_outcome(index));

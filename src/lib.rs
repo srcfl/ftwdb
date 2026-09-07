@@ -17,6 +17,10 @@ mod real_fixture;
 mod rollup;
 mod rollup_segment;
 mod segment;
+pub mod shadow_protocol;
+pub mod shadow_reconcile;
+pub mod shadow_runtime;
+pub mod shadow_server;
 mod snapshot;
 mod storage;
 mod store;
@@ -27,25 +31,27 @@ mod workload;
 pub use aggregate::{CounterAggregate, GaugeAggregate, Sample};
 pub use catalog::{Catalog, CatalogStats};
 pub use error::{Error, Result};
-pub use manifest::RollupDescriptor;
+pub use manifest::{RawSegmentDescriptor, RollupDescriptor};
 pub use model::{
     CalendarUnit, Entity, EntityId, Plan, PlanStatus, Properties, PropertyValue, Relation,
     RelationId, RollupPolicy, RollupResolution, RollupTier, Run, RunId, RunKind, RunStatus,
     SeriesDefinition, SeriesSemantics,
 };
-pub use real_fixture::{RealFixtureLoadReport, load_real_fixture};
+pub use real_fixture::{
+    FixtureAck, RealFixtureLoadReport, load_real_fixture, load_real_fixture_with_ack,
+};
 pub use rollup::{CalendarGaugeRollup, FixedGaugeRollup, GaugeBucket};
 pub use rollup_segment::{RollupSegment, RollupSegmentStats};
 pub use segment::{Segment, SegmentStats};
 pub use storage::{
-    Commit, Config, Database, Durability, PlanOutcome, Point, RecoveredTail, SalvageStopReason,
-    Stats,
+    Commit, Config, Database, Durability, IngressReceipt, IngressWatermarks, PlanOutcome, Point,
+    RecoveredTail, SalvageStopReason, Stats,
 };
 pub use store::{
     BackupReport, IntegrityReport, MaintenanceReport, RestoreReport, RetentionGate, RollupQuery,
-    RollupSource, SalvageReport, SalvageStatus, Store,
+    RollupSource, SalvageOptions, SalvageReport, SalvageStatus, SealReport, Store,
 };
-pub use transaction::Transaction;
+pub use transaction::{IngressIdentity, Transaction};
 pub use tsbs::{TsbsIotLoadReport, load_tsbs_iot};
 pub use workload::{
     EnergyWorkload, MAX_WORKLOAD_BUNDLE_BYTES, MAX_WORKLOAD_DAYS, MAX_WORKLOAD_POINTS,

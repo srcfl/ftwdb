@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sourceful.ftwdb-shadow</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/libexec/ftwdb-shadow</string>
+        <string>/var/db/ftwdb-shadow</string>
+        <string>/var/run/ftwdb-shadow/ftwdb-shadow.sock</string>
+    </array>
+
+    <!-- The FTW client must use this same account for the peer UID check. -->
+    <key>UserName</key>
+    <string>ftw</string>
+    <key>GroupName</key>
+    <string>ftw</string>
+
+    <key>WorkingDirectory</key>
+    <string>/var/db/ftwdb-shadow</string>
+    <key>Umask</key>
+    <integer>63</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>1024</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>1024</integer>
+    </dict>
+</dict>
+</plist>

@@ -45,7 +45,7 @@ proptest! {
 
         let reopened = Database::open(&path).unwrap();
         prop_assert_eq!(
-            reopened.query_history(series_id, i64::MIN, i64::MAX),
+            reopened.query_history(series_id, i64::MIN, i64::MAX).unwrap(),
             expected,
         );
     }
@@ -75,8 +75,8 @@ proptest! {
         file.set_len(full_length - bytes_removed as u64).unwrap();
 
         let recovered = Database::open(&path).unwrap();
-        prop_assert_eq!(recovered.query_latest(1, i64::MIN, i64::MAX), vec![first]);
-        prop_assert!(recovered.query_latest(2, i64::MIN, i64::MAX).is_empty());
+        prop_assert_eq!(recovered.query_latest(1, i64::MIN, i64::MAX).unwrap(), vec![first]);
+        prop_assert!(recovered.query_latest(2, i64::MIN, i64::MAX).unwrap().is_empty());
         prop_assert_eq!(recovered.stats().unwrap().file_bytes, first_length);
     }
 
@@ -97,7 +97,7 @@ proptest! {
             .map(|(index, value)| point(3, index, *value))
             .collect();
         Segment::create(&path, &expected, block_points).unwrap();
-        let mut segment = Segment::open(&path).unwrap();
+        let segment = Segment::open(&path).unwrap();
         prop_assert_eq!(
             segment.query(3, i64::MIN, i64::MAX).unwrap(),
             expected,

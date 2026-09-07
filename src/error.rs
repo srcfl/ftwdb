@@ -19,6 +19,8 @@ pub enum Error {
         maximum: usize,
     },
     InvalidConfig(&'static str),
+    /// A shadow write would exceed its storage budget. No write took place.
+    ResourceLimit(&'static str),
     /// A caller-supplied argument violates a documented API precondition,
     /// such as a non-positive rollup resolution or out-of-order aggregate
     /// samples. Unlike `InvalidConfig`, which rejects a durable handle or
@@ -40,6 +42,24 @@ pub enum Error {
     SourceChanged {
         path: PathBuf,
     },
+    /// A producer reused one source sequence with a different transaction or
+    /// commit identifier. The writer remains usable.
+    IngressSourceSequenceConflict {
+        source_id: u128,
+        sequence: u64,
+    },
+    /// A producer reused one commit identifier for another source, sequence,
+    /// or transaction payload. The writer remains usable.
+    IngressCommitIdConflict {
+        commit_id: u128,
+    },
+    /// A producer supplied a new cursor that did not advance. Gaps are valid:
+    /// the sequence is an opaque source cursor, not a dense counter.
+    IngressSequenceNotIncreasing {
+        source_id: u128,
+        previous: u64,
+        actual: u64,
+    },
 }
 
 impl fmt::Display for Error {
@@ -57,6 +77,7 @@ impl fmt::Display for Error {
                 write!(f, "batch has {points} points; maximum is {maximum}")
             }
             Self::InvalidConfig(reason) => write!(f, "invalid configuration: {reason}"),
+            Self::ResourceLimit(reason) => write!(f, "shadow storage limit: {reason}"),
             Self::InvalidArgument(reason) => write!(f, "invalid argument: {reason}"),
             Self::InvalidModel(reason) => write!(f, "invalid energy model: {reason}"),
             Self::Serialization(reason) => write!(f, "serialization error: {reason}"),
@@ -82,6 +103,25 @@ impl fmt::Display for Error {
                 f,
                 "source file {} changed while it was being checked",
                 path.display()
+            ),
+            Self::IngressSourceSequenceConflict {
+                source_id,
+                sequence,
+            } => write!(
+                f,
+                "ingress source {source_id:032x} sequence {sequence} conflicts with its stored transaction"
+            ),
+            Self::IngressCommitIdConflict { commit_id } => write!(
+                f,
+                "commit identifier {commit_id:032x} conflicts with its stored transaction"
+            ),
+            Self::IngressSequenceNotIncreasing {
+                source_id,
+                previous,
+                actual,
+            } => write!(
+                f,
+                "ingress source {source_id:032x} requires a cursor above {previous}, got {actual}"
             ),
         }
     }

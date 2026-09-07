@@ -46,7 +46,7 @@ fn segment_benchmarks(criterion: &mut Criterion) {
         stats.stored_bytes,
         stats.logical_point_bytes as f64 / stats.stored_bytes as f64
     );
-    let mut segment = Segment::open(path).unwrap();
+    let segment = Segment::open(path).unwrap();
     let mut group = criterion.benchmark_group("segment_query_100k");
     group.throughput(Throughput::Elements(POINT_COUNT as u64));
     group.bench_function("full_series", |bencher| {

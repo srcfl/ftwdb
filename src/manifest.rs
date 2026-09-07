@@ -4,11 +4,14 @@ use crc32fast::hash;
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAGIC: &[u8; 8] = b"WMAN0001";
-const VERSION: u16 = 1;
+const VERSION_V1: u16 = 1;
+const VERSION_V2: u16 = 2;
+const VERSION: u16 = 3;
 const HEADER_BYTES: usize = 24;
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 const PREFIX: &str = "MANIFEST.";
@@ -32,10 +35,57 @@ pub struct RollupDescriptor {
     pub active: bool,
 }
 
+/// One immutable raw-point segment published through a manifest generation.
+///
+/// `generation` matches the seal checkpoint written to `active.wlog` before
+/// this descriptor becomes visible, so a reopen can drop already-sealed
+/// frames from the live index even when reclaim has not yet rewritten the
+/// log.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RawSegmentDescriptor {
+    pub file: String,
+    pub generation: u64,
+    pub points: u64,
+    pub source_commit: u64,
+    pub source_points: u64,
+    pub min_valid_time: i64,
+    pub max_valid_time: i64,
+    pub content_crc32: u32,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct Manifest {
     pub generation: u64,
     pub rollups: Vec<RollupDescriptor>,
+    #[serde(default)]
+    pub segments: Vec<RawSegmentDescriptor>,
+}
+
+#[derive(Deserialize)]
+struct ManifestV1 {
+    generation: u64,
+    rollups: Vec<RollupDescriptor>,
+}
+
+// Version 2 was an unpublished development format. Its raw descriptors did
+// not bind file contents. Accept its empty segment list, but do not silently
+// accept old sealed files by computing a checksum from whatever is there now.
+#[derive(Deserialize)]
+struct ManifestV2 {
+    generation: u64,
+    rollups: Vec<RollupDescriptor>,
+    segments: Vec<RawSegmentDescriptorV2>,
+}
+
+#[derive(Deserialize)]
+struct RawSegmentDescriptorV2 {
+    _file: String,
+    _generation: u64,
+    _points: u64,
+    _source_commit: u64,
+    _source_points: u64,
+    _min_valid_time: i64,
+    _max_valid_time: i64,
 }
 
 impl Manifest {
@@ -49,6 +99,7 @@ impl Manifest {
         for (generation, path) in candidates {
             match read_manifest(&path, generation) {
                 Ok(manifest) => return Ok(manifest),
+                Err(error @ Error::InvalidConfig(_)) => return Err(error),
                 Err(error) => last_error = Some(error),
             }
         }
@@ -87,6 +138,7 @@ impl Manifest {
             let mut file = OpenOptions::new()
                 .create_new(true)
                 .write(true)
+                .mode(0o600)
                 .open(&temporary)?;
             file.write_all(&header)?;
             file.write_all(&payload)?;
@@ -177,6 +229,20 @@ pub(crate) fn referenced_rollup_files(
     Ok(referenced)
 }
 
+/// Every raw-segment filename referenced by the given retained generations.
+pub(crate) fn referenced_segment_files(
+    retained: &[(u64, PathBuf)],
+) -> Result<std::collections::HashSet<String>> {
+    let mut referenced = std::collections::HashSet::new();
+    for (generation, path) in retained {
+        let manifest = read_manifest(path, *generation)?;
+        for segment in manifest.segments {
+            referenced.insert(segment.file);
+        }
+    }
+    Ok(referenced)
+}
+
 fn read_manifest(path: &Path, expected_generation: u64) -> Result<Manifest> {
     let mut file = open_regular_file_read_only(path)?;
     let file_len = file.metadata()?.len();
@@ -189,11 +255,14 @@ fn read_manifest(path: &Path, expected_generation: u64) -> Result<Manifest> {
         return corruption("invalid manifest magic");
     }
     let version = u16::from_le_bytes(header[8..10].try_into().unwrap());
-    if version != VERSION {
+    if version != VERSION && version != VERSION_V1 && version != VERSION_V2 {
         return corruption("unsupported manifest version");
     }
     if hash(&header[..20]) != u32::from_le_bytes(header[20..24].try_into().unwrap()) {
         return corruption("manifest header checksum mismatch");
+    }
+    if header[10..12] != [0, 0] {
+        return corruption("manifest reserved flags are non-zero");
     }
     let payload_len = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
     if payload_len > MAX_PAYLOAD_BYTES || file_len != (HEADER_BYTES + payload_len) as u64 {
@@ -204,30 +273,103 @@ fn read_manifest(path: &Path, expected_generation: u64) -> Result<Manifest> {
     if hash(&payload) != u32::from_le_bytes(header[16..20].try_into().unwrap()) {
         return corruption("manifest payload checksum mismatch");
     }
-    let manifest: Manifest = postcard::from_bytes(&payload)
-        .map_err(|error| Error::Serialization(format!("manifest decode failed: {error}")))?;
+    let manifest = decode_manifest_payload(&payload, version).map_err(|error| match error {
+        Error::InvalidConfig(_) => error,
+        _ => Error::Corruption {
+            offset: 0,
+            reason: format!("manifest payload is invalid: {error}"),
+        },
+    })?;
     if manifest.generation != expected_generation {
         return corruption("manifest generation does not match its filename");
     }
-    validate_manifest(&manifest)?;
+    validate_manifest(&manifest).map_err(|error| Error::Corruption {
+        offset: 0,
+        reason: format!("manifest descriptors are invalid: {error}"),
+    })?;
     Ok(manifest)
 }
 
+fn decode_manifest_payload(payload: &[u8], version: u16) -> Result<Manifest> {
+    if version == VERSION_V1 {
+        let parsed: ManifestV1 = postcard::from_bytes(payload)
+            .map_err(|error| Error::Serialization(format!("manifest decode failed: {error}")))?;
+        return Ok(Manifest {
+            generation: parsed.generation,
+            rollups: parsed.rollups,
+            segments: Vec::new(),
+        });
+    }
+    if version == VERSION_V2 {
+        let parsed: ManifestV2 = postcard::from_bytes(payload)
+            .map_err(|error| Error::Serialization(format!("manifest decode failed: {error}")))?;
+        if !parsed.segments.is_empty() {
+            return Err(Error::InvalidConfig(
+                "development v2 raw segments lack a content checksum; restore a pre-seal snapshot or use a fresh shadow store",
+            ));
+        }
+        return Ok(Manifest {
+            generation: parsed.generation,
+            rollups: parsed.rollups,
+            segments: Vec::new(),
+        });
+    }
+    postcard::from_bytes(payload)
+        .map_err(|error| Error::Serialization(format!("manifest decode failed: {error}")))
+}
+
 fn validate_manifest(manifest: &Manifest) -> Result<()> {
+    let mut rollup_files = std::collections::HashSet::new();
     for rollup in &manifest.rollups {
-        let path = Path::new(&rollup.file);
-        if path.components().count() != 1
-            || !matches!(path.components().next(), Some(Component::Normal(_)))
+        validate_safe_filename(&rollup.file, "manifest rollup filename")?;
+        if !rollup_files.insert(rollup.file.as_str())
+            || rollup.series_id == 0
+            || rollup.end <= rollup.start
         {
             return Err(Error::InvalidModel(
-                "manifest rollup filename must be a single safe path component".to_owned(),
+                "manifest rollup descriptor has a duplicate file, invalid identity, or invalid bounds"
+                    .to_owned(),
             ));
         }
-        if rollup.series_id == 0 || rollup.end <= rollup.start {
+    }
+    let mut segment_files = std::collections::HashSet::new();
+    let mut segment_generations = std::collections::HashSet::new();
+    let mut previous_generation = 0_u64;
+    let mut cumulative_points = 0_u64;
+    for segment in &manifest.segments {
+        validate_safe_filename(&segment.file, "manifest raw segment filename")?;
+        cumulative_points = cumulative_points
+            .checked_add(segment.points)
+            .ok_or_else(|| {
+                Error::InvalidModel("manifest raw segment point count overflows".to_owned())
+            })?;
+        if !segment_files.insert(segment.file.as_str())
+            || !segment_generations.insert(segment.generation)
+            || segment.generation == 0
+            || segment.generation <= previous_generation
+            || segment.generation > manifest.generation
+            || segment.points == 0
+            || segment.source_points != cumulative_points
+            || segment.max_valid_time < segment.min_valid_time
+        {
             return Err(Error::InvalidModel(
-                "manifest rollup descriptor has invalid identity or bounds".to_owned(),
+                "manifest raw segment descriptor has invalid order, identity, or coverage"
+                    .to_owned(),
             ));
         }
+        previous_generation = segment.generation;
+    }
+    Ok(())
+}
+
+fn validate_safe_filename(file: &str, label: &str) -> Result<()> {
+    let path = Path::new(file);
+    if path.components().count() != 1
+        || !matches!(path.components().next(), Some(Component::Normal(_)))
+    {
+        return Err(Error::InvalidModel(format!(
+            "{label} must be a single safe path component"
+        )));
     }
     Ok(())
 }
@@ -256,9 +398,9 @@ fn corruption<T>(reason: &str) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Manifest, RollupDescriptor};
+    use super::{Manifest, RawSegmentDescriptor, RollupDescriptor, validate_manifest};
     use crate::RollupResolution;
-    use std::io::{Seek, SeekFrom, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use tempfile::tempdir;
 
     fn manifest(generation: u64) -> Manifest {
@@ -274,7 +416,98 @@ mod tests {
                 source_points: 10,
                 active: true,
             }],
+            segments: Vec::new(),
         }
+    }
+
+    fn raw_segment(
+        file: &str,
+        generation: u64,
+        points: u64,
+        source_points: u64,
+    ) -> RawSegmentDescriptor {
+        RawSegmentDescriptor {
+            file: file.to_owned(),
+            generation,
+            points,
+            source_commit: generation,
+            source_points,
+            min_valid_time: 0,
+            max_valid_time: 1,
+            content_crc32: 0,
+        }
+    }
+
+    #[test]
+    fn raw_segments_must_keep_unique_seal_order_and_cumulative_coverage() {
+        let mut value = manifest(3);
+        value.segments = vec![
+            raw_segment("one.wseg", 1, 2, 2),
+            raw_segment("two.wseg", 3, 3, 5),
+        ];
+        assert!(validate_manifest(&value).is_ok());
+
+        let mut reversed = value.clone();
+        reversed.segments.reverse();
+        assert!(validate_manifest(&reversed).is_err());
+
+        let mut duplicate = value.clone();
+        duplicate.segments[1].file = duplicate.segments[0].file.clone();
+        assert!(validate_manifest(&duplicate).is_err());
+
+        let mut wrong_total = value;
+        wrong_total.segments[1].source_points = 4;
+        assert!(validate_manifest(&wrong_total).is_err());
+    }
+
+    #[test]
+    fn legacy_rollup_manifests_load_but_unbound_development_segments_do_not_fall_back() {
+        fn write_legacy(directory: &std::path::Path, version: u16, payload: &[u8]) {
+            let mut header = [0_u8; super::HEADER_BYTES];
+            header[..8].copy_from_slice(super::MAGIC);
+            header[8..10].copy_from_slice(&version.to_le_bytes());
+            header[12..16].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+            header[16..20].copy_from_slice(&crc32fast::hash(payload).to_le_bytes());
+            let crc = crc32fast::hash(&header[..20]);
+            header[20..24].copy_from_slice(&crc.to_le_bytes());
+            std::fs::write(
+                directory.join("MANIFEST.00000000000000000002"),
+                [header.as_slice(), payload].concat(),
+            )
+            .unwrap();
+        }
+        let directory = tempdir().unwrap();
+        manifest(1).publish(directory.path()).unwrap();
+        let expected = manifest(2);
+        let v1 = postcard::to_stdvec(&(expected.generation, &expected.rollups)).unwrap();
+        write_legacy(directory.path(), super::VERSION_V1, &v1);
+        assert_eq!(Manifest::load(directory.path()).unwrap(), expected);
+        let v2 = postcard::to_stdvec(&(expected.generation, &expected.rollups, Vec::<u8>::new()))
+            .unwrap();
+        write_legacy(directory.path(), super::VERSION_V2, &v2);
+        assert_eq!(Manifest::load(directory.path()).unwrap(), expected);
+        let unbound = postcard::to_stdvec(&(
+            expected.generation,
+            &expected.rollups,
+            vec![("old.wseg", 2_u64, 1_u64, 1_u64, 1_u64, 0_i64, 0_i64)],
+        ))
+        .unwrap();
+        write_legacy(directory.path(), super::VERSION_V2, &unbound);
+        assert!(
+            matches!(Manifest::load(directory.path()), Err(crate::Error::InvalidConfig(reason))
+            if reason.contains("lack a content checksum"))
+        );
+    }
+
+    #[test]
+    fn raw_content_checksum_survives_manifest_publication() {
+        let directory = tempdir().unwrap();
+        let mut expected = manifest(2);
+        let mut segment = raw_segment("bound.wseg", 2, 5, 5);
+        segment.content_crc32 = 0x5ce0_1357;
+        expected.segments.push(segment);
+        expected.publish(directory.path()).unwrap();
+        assert_eq!(Manifest::load(directory.path()).unwrap(), expected);
     }
 
     #[test]
@@ -297,6 +530,28 @@ mod tests {
         file.sync_all().unwrap();
 
         assert_eq!(Manifest::load(directory.path()).unwrap().generation, 1);
+    }
+
+    #[test]
+    fn rejects_non_zero_reserved_manifest_flags() {
+        let directory = tempdir().unwrap();
+        manifest(1).publish(directory.path()).unwrap();
+        let path = directory.path().join("MANIFEST.00000000000000000001");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let mut header = [0_u8; super::HEADER_BYTES];
+        file.read_exact(&mut header).unwrap();
+        header[10] = 1;
+        let checksum = crc32fast::hash(&header[..20]);
+        header[20..24].copy_from_slice(&checksum.to_le_bytes());
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&header).unwrap();
+        file.sync_all().unwrap();
+
+        assert!(Manifest::load(directory.path()).is_err());
     }
 
     #[test]

@@ -1,9 +1,10 @@
-use crate::storage::sync_parent_directory;
+use crate::storage::{open_regular_file_read_only, sync_parent_directory};
 use crate::{Error, Point, Result};
 use crc32fast::hash;
 use lz4_flex::block::{compress_prepend_size, decompress};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -74,6 +75,7 @@ impl Segment {
                 "segment block_points must be in 1..=262144",
             ));
         }
+        crate::catalog::validate_point_intervals(points)?;
         let path = path.as_ref();
         if path.exists() {
             return Err(Error::Io(std::io::Error::new(
@@ -105,7 +107,7 @@ impl Segment {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let mut file = OpenOptions::new().read(true).open(path)?;
+        let mut file = open_regular_file_read_only(path.as_ref())?;
         let file_len = file.metadata()?.len();
         if file_len < (SEGMENT_HEADER_BYTES + INDEX_HEADER_BYTES) as u64 {
             return corruption(0, "segment is too small");
@@ -117,7 +119,7 @@ impl Segment {
             return corruption(0, "invalid segment magic");
         }
         let version = u16::from_le_bytes(header[8..10].try_into().unwrap());
-        if version != SEGMENT_VERSION {
+        if version != SEGMENT_VERSION || header[10..12] != [0, 0] {
             return corruption(0, "unsupported segment version");
         }
         let expected_header_crc = u32::from_le_bytes(header[36..40].try_into().unwrap());
@@ -185,8 +187,49 @@ impl Segment {
         self.stats
     }
 
+    /// Checks the exact open file with a fixed-size buffer. This detects a
+    /// valid but unrelated segment copied over a manifest's named file.
+    pub(crate) fn content_crc32(&self) -> Result<u32> {
+        let mut hasher = crc32fast::Hasher::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut offset = 0;
+        while offset < self.stats.stored_bytes {
+            let read = (self.stats.stored_bytes - offset).min(buffer.len() as u64) as usize;
+            self.file.read_exact_at(&mut buffer[..read], offset)?;
+            hasher.update(&buffer[..read]);
+            offset += read as u64;
+        }
+        if self.file.metadata()?.len() != self.stats.stored_bytes {
+            return corruption(0, "segment length changed after open");
+        }
+        Ok(hasher.finalize())
+    }
+
+    pub(crate) fn valid_bounds(&self) -> Option<(i64, i64)> {
+        Some((
+            self.index.iter().map(|entry| entry.min_time).min()?,
+            self.index.iter().map(|entry| entry.max_time).max()?,
+        ))
+    }
+
+    /// Reads and checksums every indexed block. Used by integrity checks and
+    /// salvage so a corrupt payload cannot pass as healthy coverage.
+    pub fn verify_blocks(&self) -> Result<()> {
+        for entry in &self.index {
+            read_block(&self.file, *entry)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn first_block_payload_offset(&self) -> Option<u64> {
+        self.index
+            .first()
+            .map(|entry| entry.offset + BLOCK_HEADER_BYTES as u64 + 1)
+    }
+
     /// Reads one series/time range, touching only overlapping indexed blocks.
-    pub fn query(&mut self, series_id: u64, start: i64, end: i64) -> Result<Vec<Point>> {
+    pub fn query(&self, series_id: u64, start: i64, end: i64) -> Result<Vec<Point>> {
         let entries: Vec<_> = self
             .index
             .iter()
@@ -197,7 +240,7 @@ impl Segment {
             .collect();
         let mut result = Vec::new();
         for entry in entries {
-            let points = read_block(&mut self.file, entry)?;
+            let points = read_block(&self.file, entry)?;
             result.extend(
                 points
                     .into_iter()
@@ -205,6 +248,75 @@ impl Segment {
             );
         }
         Ok(result)
+    }
+
+    /// Reserve the full decoded block count before reading it, then visit
+    /// matches one at a time. Callers can bound both decoding and output.
+    pub(crate) fn visit_query<E: From<Error>>(
+        &self,
+        series_id: u64,
+        start: i64,
+        end: i64,
+        reserve: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+        visit: &mut impl FnMut(Point) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        let first = self.index.partition_point(|entry| {
+            entry.series_id < series_id || (entry.series_id == series_id && entry.max_time < start)
+        });
+        for entry in self.index[first..]
+            .iter()
+            .take_while(|entry| entry.series_id == series_id && entry.min_time < end)
+        {
+            reserve(entry.points as usize)?;
+            for point in read_block(&self.file, *entry)? {
+                if point.valid_time >= start && point.valid_time < end {
+                    visit(point)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Inclusive valid-time bounds for one series, from the sparse index.
+    #[must_use]
+    pub fn series_bounds(&self, series_id: u64) -> Option<(i64, i64)> {
+        let mut min_time = i64::MAX;
+        let mut max_time = i64::MIN;
+        for entry in &self.index {
+            if entry.series_id == series_id {
+                min_time = min_time.min(entry.min_time);
+                max_time = max_time.max(entry.max_time);
+            }
+        }
+        (min_time <= max_time).then_some((min_time, max_time))
+    }
+
+    #[must_use]
+    pub fn series_ids(&self) -> Vec<u64> {
+        let mut ids = Vec::new();
+        for entry in &self.index {
+            if ids.last() != Some(&entry.series_id) {
+                ids.push(entry.series_id);
+            }
+        }
+        ids
+    }
+
+    #[must_use]
+    pub fn series_point_count(&self, series_id: u64) -> u64 {
+        self.index
+            .iter()
+            .filter(|entry| entry.series_id == series_id)
+            .map(|entry| u64::from(entry.points))
+            .sum()
+    }
+
+    /// True when this segment's sparse index overlaps the requested range.
+    #[must_use]
+    pub fn overlaps(&self, series_id: u64, start: i64, end: i64) -> bool {
+        self.index.iter().any(|entry| {
+            entry.series_id == series_id && entry.max_time >= start && entry.min_time < end
+        })
     }
 }
 
@@ -226,6 +338,7 @@ fn write_temporary_segment(
         .create_new(true)
         .read(true)
         .write(true)
+        .mode(0o600)
         .open(path)?;
     file.write_all(&[0_u8; SEGMENT_HEADER_BYTES])?;
 
@@ -494,16 +607,18 @@ fn split_columns(encoded: &[u8], offset: u64) -> Result<Vec<&[u8]>> {
     Ok(columns)
 }
 
-fn read_block(file: &mut File, entry: IndexEntry) -> Result<Vec<Point>> {
-    file.seek(SeekFrom::Start(entry.offset))?;
+fn read_block(file: &File, entry: IndexEntry) -> Result<Vec<Point>> {
     let mut header = [0_u8; BLOCK_HEADER_BYTES];
-    file.read_exact(&mut header)?;
+    file.read_exact_at(&mut header, entry.offset)?;
     if &header[..4] != BLOCK_MAGIC {
         return corruption(entry.offset, "invalid block magic");
     }
     let version = u16::from_le_bytes(header[4..6].try_into().unwrap());
     if version != BLOCK_VERSION || header[7] != BLOCK_ENCODING_COLUMN_V1 {
         return corruption(entry.offset, "unsupported block encoding");
+    }
+    if header[52..56] != [0, 0, 0, 0] {
+        return corruption(entry.offset, "non-zero reserved block header bytes");
     }
     let expected_header_crc = u32::from_le_bytes(header[48..52].try_into().unwrap());
     if hash(&header[..48]) != expected_header_crc {
@@ -534,7 +649,7 @@ fn read_block(file: &mut File, entry: IndexEntry) -> Result<Vec<Point>> {
         return corruption(entry.offset, "block uncompressed length is out of bounds");
     }
     let mut payload = vec![0_u8; payload_len];
-    file.read_exact(&mut payload)?;
+    file.read_exact_at(&mut payload, entry.offset + BLOCK_HEADER_BYTES as u64)?;
     if hash(&payload) != expected_payload_crc {
         return corruption(entry.offset, "block payload checksum mismatch");
     }
@@ -578,7 +693,26 @@ fn read_block(file: &mut File, entry: IndexEntry) -> Result<Vec<Point>> {
     if decoded.len() != uncompressed_len {
         return corruption(entry.offset, "block uncompressed length mismatch");
     }
-    decode_columns(&decoded, series_id, points as usize, entry.offset)
+    let points = decode_columns(&decoded, series_id, points as usize, entry.offset)?;
+    if points
+        .first()
+        .is_none_or(|point| point.valid_time != min_time)
+        || points
+            .last()
+            .is_none_or(|point| point.valid_time != max_time)
+        || points
+            .windows(2)
+            .any(|pair| pair[0].valid_time > pair[1].valid_time)
+        || points
+            .iter()
+            .any(|point| point.valid_time_end < point.valid_time || !point.value.is_finite())
+    {
+        return corruption(
+            entry.offset,
+            "decoded block violates point or index invariants",
+        );
+    }
+    Ok(points)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -658,9 +792,13 @@ fn validate_index(index: &[IndexEntry], index_offset: u64, point_count: u64) -> 
             );
         }
         if let Some(previous) = previous
-            && (entry.series_id, entry.min_time) < (previous.series_id, previous.min_time)
+            && ((entry.series_id, entry.min_time) < (previous.series_id, previous.min_time)
+                || (entry.series_id == previous.series_id && entry.min_time < previous.max_time))
         {
-            return corruption(index_offset, "segment index is not sorted");
+            return corruption(
+                index_offset,
+                "segment index is not sorted or has overlapping blocks",
+            );
         }
         indexed_points += u64::from(entry.points);
         expected_offset = entry.offset + u64::from(entry.length);
@@ -870,7 +1008,7 @@ mod tests {
         assert!(stats.blocks > 2);
         assert!(stats.stored_bytes < stats.logical_point_bytes / 2);
 
-        let mut segment = Segment::open(&path).unwrap();
+        let segment = Segment::open(&path).unwrap();
         assert_eq!(segment.stats(), stats);
         let selected = segment.query(2, 123_000_000, 140_000_000).unwrap();
         let expected: Vec<_> = input
@@ -898,7 +1036,7 @@ mod tests {
         file.write_all(&[0xAA]).unwrap();
         file.sync_all().unwrap();
 
-        let mut segment = Segment::open(&path).unwrap();
+        let segment = Segment::open(&path).unwrap();
         assert!(matches!(
             segment.query(1, i64::MIN, i64::MAX),
             Err(Error::Corruption { .. })
@@ -947,7 +1085,7 @@ mod tests {
         // under the index's compression-ratio bound, so the block is only
         // rejected when its columns are decoded.
         claim_first_block_points(&path, 1_000);
-        let mut segment = Segment::open(&path).unwrap();
+        let segment = Segment::open(&path).unwrap();
         assert!(matches!(
             segment.query(1, i64::MIN, i64::MAX),
             Err(Error::Corruption { .. })
@@ -985,7 +1123,7 @@ mod tests {
         // structural bound on the header length must reject the block before
         // any decompression buffer is sized.
         tamper_first_block_lz4(&path, Some(u32::MAX), u32::MAX);
-        let mut segment = Segment::open(&path).unwrap();
+        let segment = Segment::open(&path).unwrap();
         assert!(matches!(
             segment.query(1, i64::MIN, i64::MAX),
             Err(Error::Corruption { .. })
@@ -1011,7 +1149,7 @@ mod tests {
         tamper_first_block_lz4(&path, Some(claimed_length), claimed_length);
         claim_first_block_points(&path, claimed_points);
 
-        let mut segment = Segment::open(&path).unwrap();
+        let segment = Segment::open(&path).unwrap();
         assert!(matches!(
             segment.query(1, i64::MIN, i64::MAX),
             Err(Error::Corruption { reason, .. }) if reason.contains("exceeds LZ4 capacity")
@@ -1027,7 +1165,7 @@ mod tests {
         // Only the in-payload size prefix claims ~4 GiB; it must be rejected
         // against the validated header length instead of sizing an allocation.
         tamper_first_block_lz4(&path, None, u32::MAX);
-        let mut segment = Segment::open(&path).unwrap();
+        let segment = Segment::open(&path).unwrap();
         assert!(matches!(
             segment.query(1, i64::MIN, i64::MAX),
             Err(Error::Corruption { .. })
@@ -1045,5 +1183,26 @@ mod tests {
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists
         ));
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn create_rejects_invalid_points_before_publishing_a_file() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("invalid.seg");
+        let mut invalid = points(1);
+        invalid[0].value = f64::NAN;
+        assert!(Segment::create(&path, &invalid, 1).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn open_rejects_a_symlink_to_a_valid_segment() {
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("target.seg");
+        let link = directory.path().join("linked.seg");
+        Segment::create(&target, &points(10), 10).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(matches!(Segment::open(&link), Err(Error::Io(_))));
     }
 }

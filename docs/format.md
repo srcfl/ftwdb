@@ -12,13 +12,16 @@ uncompressed; it is a durability test vehicle, not the final segment format.
 | 10 | 2 | reserved flags |
 | 12 | 4 | CRC32 of bytes 0..12 |
 
+Reserved database, transaction, and transaction-record fields must be zero.
+Readers reject non-zero values even when the checksum is valid.
+
 ## Batch frame header (24 bytes)
 
 | Offset | Bytes | Field |
 |---:|---:|---|
 | 0 | 4 | ASCII `WBAT` |
 | 4 | 2 | frame version (`1`) |
-| 6 | 2 | frame kind: `0` legacy points, `1` mixed transaction, `2` identified mixed transaction |
+| 6 | 2 | frame kind: `0` legacy points, `1` mixed transaction, `2` identified mixed transaction, `3` ordered ingress transaction, `4` seal checkpoint, `5` identity index |
 | 8 | 4 | item count: points or transaction records |
 | 12 | 4 | payload bytes |
 | 16 | 4 | CRC32 of payload |
@@ -73,6 +76,70 @@ Recovery collects every identifier seen during the log scan, and a commit
 whose identifier is already present writes nothing and reports deduplication.
 A duplicate identifier encountered in the log itself is reported as
 corruption, since the writer never appends one.
+
+## Ordered ingress transaction payload
+
+A frame of kind `3` starts with this fixed 40-byte identity:
+
+| Offset | Bytes | Field |
+|---:|---:|---|
+| 0 | 16 | `source_id` as little-endian `u128` |
+| 16 | 8 | `sequence` as little-endian `u64` |
+| 24 | 16 | `commit_id` as little-endian `u128` |
+
+The identity is followed by the canonical kind `1` transaction payload. The
+frame checksum covers both parts.
+
+FTWDB accepts any first sequence for a new non-zero source ID. It then accepts
+only a strictly greater cursor; gaps are valid. An exact retry of a stored source and sequence reads
+the original transaction bytes from the log and compares every byte. It
+returns the original frame offset, record count, point count, and byte count
+without writing. A matching CRC is only a fast check and never replaces the
+byte comparison. Reusing a source sequence or commit ID for other data fails
+without poisoning the writer.
+
+Recovery rebuilds the source watermarks and receipt indexes from complete
+kind `3` frames. A torn last frame exposes neither its identity nor its data.
+Duplicate keys or a source cursor that does not increase inside a complete log
+are corruption. Kinds
+`0` through `2` remain byte-compatible.
+
+## Seal checkpoint payload
+
+A frame of kind `4` carries a fixed 16-byte payload:
+
+| Offset | Bytes | Field |
+|---:|---:|---|
+| 0 | 8 | sealed manifest generation as little-endian `u64` |
+| 8 | 8 | sealed point count as little-endian `u64` |
+
+The checkpoint is appended before the live log is reclaimed. Recovery treats an
+item count other than zero, invalid payload length, generation zero, or a sealed
+point count that differs from the live prefix as corruption.
+
+## Identity index payload
+
+A frame of kind `5` stores an index of identified and ordered-ingress receipts
+written during log reclamation. The current payload starts with ASCII
+`WIDX0002`, followed by the Postcard-encoded index. Each receipt keeps its exact
+transaction payload as well as its length and CRC32. Receipts are sorted by
+commit ID or `(source_id, sequence)`. The writer splits large indexes across
+bounded kind-5 frames and sets their item count to zero. Recovery validates
+each frame checksum, order, counts, payload metadata, and exact embedded
+transaction before it accepts the compact log. An invalid or truncated index
+causes a corruption error.
+
+After reclaim, identity replay verification compares the retained receipt
+bytes in the compact log. Recovery uses those durable bytes to reject a
+duplicate or cursor regression; it does not rely on a frame CRC alone.
+
+The reader still accepts the first kind-5 payload shape, which lacks retained
+bytes. It keeps those IDs known but rejects any retry because length plus CRC32
+cannot prove byte equality. A later reclaim keeps that behavior.
+
+This compatibility is one-way. A reader that predates `WIDX0002` cannot open a
+log after the new writer has reclaimed identified receipts. Take a verified
+backup before the upgrade; a binary rollback also needs a pre-upgrade store.
 
 The immutable segment format will be separately versioned and use per-column
 encoding, block checksums, sparse indexes, and footer redundancy.

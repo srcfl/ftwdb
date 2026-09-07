@@ -45,12 +45,14 @@ linux_nbd_cleanup() {
 linux_nbd_start() {
   local profile=$1
   local seed=$2
+  shift 2
 
   "$emulator" serve \
     --config "$profile" \
     --backing "$out/card.img" \
     --seed "$seed" \
     --metrics "$out/emulator.jsonl" \
+    "$@" \
     >"$out/server.json" 2>"$out/server.log" &
   emulator_pid=$!
 

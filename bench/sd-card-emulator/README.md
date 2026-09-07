@@ -4,6 +4,12 @@ This standalone Rust crate exposes a sparse file as an NBD block device. Put a
 real Linux filesystem on `/dev/nbd0`, then run FTWDB on that filesystem. This
 keeps the filesystem, page cache, block layer, and database in the test path.
 
+CI uses the full workload and the healthy card's cache and power-loss settings,
+with fast read/write timing from the full-disk profile. It checks filesystem
+faults and recovery, not SD latency. The generated profile travels with the CI
+evidence. Local scripts keep the slow healthy profile unless `FTW_NBD_PROFILE`
+selects another profile; use those runs for the separate timing experiment.
+
 The model can inject:
 
 - read and write bandwidth and IOPS limits;
@@ -141,6 +147,53 @@ The script exits nonzero if the writer does not return `ENOSPC`, returns a
 different exit code, or either store check fails. This privileged script stays
 outside normal CI. The quick emulator result covers the #17 disk-full gate;
 physical SD-card power cuts remain a separate M4 release gate.
+
+## Linux mid-commit power-cut
+
+The smoke test cuts after `sync`. `linux-mid-commit.sh` cuts **during** a live
+`Durability::Always` ingest. The writer fsyncs one JSONL watermark line after
+each durable commit (`--ack-log`). After `ctl power-loss` (or a seeded
+`--power-loss-after-ops` cut), the script runs e2fsck, reopens the store, and
+verifies recovered counts against the last complete ACK: every acked batch is
+present, at most one in-flight batch is missing, and a torn tail is only an
+incomplete header or payload.
+
+Run it from the repository root on Linux, or in the same privileged container:
+
+```sh
+docker run --rm --privileged \
+  -e FTW_SD_EMULATOR_COMMIT="$(git rev-parse --short=12 HEAD)" \
+  -e FTW_NBD_MID_OUTPUT=/work/bench-results/linux-nbd-mid-commit \
+  -v "$PWD":/work -w /work rust:1.97-slim-bookworm \
+  bash bench/sd-card-emulator/linux-mid-commit.sh
+```
+
+`FTW_NBD_PROFILE` selects the emulator profile (`healthy.json` by default).
+Set it to `bench/sd-card-emulator/profiles/cheap-consumer.json` to include
+false flushes. `FTW_NBD_CUT_AFTER_ACKS` (default 3) is how many durable ACK
+lines must land before `ctl power-loss`. For a seeded cut, set
+`FTW_NBD_POWER_LOSS_AFTER_OPS` and use `profiles/sudden-power-loss.json`.
+`FTW_NBD_MID_OUTPUT` must be absent or empty.
+
+Host software tests cover the ACK parser and prefix verifier without NBD.
+This privileged script stays outside normal CI.
+
+## Write amplification
+
+`ctl status` and `--metrics FILE.jsonl` report `write_bytes`, `persisted_bytes`,
+and `write_amplification` (`persisted_bytes / write_bytes` when any writes
+landed). Those are emulator-model ratios for that run, not a claim about a
+named SD card. Read them from the JSONL after a Linux NBD job. Do not invent
+or copy numbers from another profile.
+
+## Nearly-worn EIO
+
+`profiles/nearly-worn.json` raises fault rates and can return `EIO` during
+reads and writes. Format the filesystem on `healthy.json` first: the same
+profile's EIO probability can fail `mkfs`. Then reopen the backing image with
+`nearly-worn.json` and ingest until the writer sees `EIO`. Keep the durable
+prefix with `check-store`. This path is probabilistic; pin a seed and keep the
+JSONL. Physical wear-out remains an M4 hardware gate.
 
 ## Power-loss run
 

@@ -1,13 +1,13 @@
 use flate2::read::GzDecoder;
 use ftwdb::{
-    BackupReport, Config, Database, Durability, EnergyWorkload, Error, RestoreReport,
-    RollupResolution, SalvageReport, Store, Transaction, WorkloadConfig, gauge_bucket_checksum,
-    load_real_fixture, load_tsbs_iot,
+    BackupReport, Config, Database, Durability, EnergyWorkload, Error, MaintenanceReport,
+    RestoreReport, RollupResolution, SalvageOptions, SalvageReport, SealReport, Store, Transaction,
+    WorkloadConfig, gauge_bucket_checksum, load_real_fixture_with_ack, load_tsbs_iot,
 };
 use std::env;
 use std::fs::File;
-use std::io::{BufReader, stdin};
-use std::path::Path;
+use std::io::{BufReader, Write, stdin};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -37,9 +37,15 @@ impl From<std::io::Error> for CliError {
 
 fn main() -> ExitCode {
     let arguments: Vec<_> = env::args().collect();
+    if arguments.len() == 2 && arguments[1] == "--version" {
+        println!("ftw {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     let result = match arguments.get(1).map(String::as_str) {
         Some("inspect") => inspect(&arguments[2..]),
         Some("check-store") => check_store(&arguments[2..]),
+        Some("seal") => seal(&arguments[2..]),
+        Some("maintain") => maintain(&arguments[2..]),
         Some("backup") => backup(&arguments[2..]),
         Some("restore") => restore(&arguments[2..]),
         Some("salvage") => salvage(&arguments[2..]),
@@ -78,6 +84,7 @@ fn bench_real_fixture(arguments: &[String]) -> CliResult<()> {
     let mut durability = Durability::Always;
     let mut durability_name = "always".to_owned();
     let mut batch_points = 10_000_usize;
+    let mut ack_log = None::<PathBuf>;
     let mut index = 2;
     while index < arguments.len() {
         let option = &arguments[index];
@@ -86,6 +93,7 @@ fn bench_real_fixture(arguments: &[String]) -> CliResult<()> {
             .ok_or_else(|| usage_error(format!("missing value for {option}")))?;
         match option.as_str() {
             "--batch-points" => batch_points = parse(value, option)?,
+            "--ack-log" => ack_log = Some(PathBuf::from(value)),
             "--durability" if value == "always" => {
                 durability = Durability::Always;
                 durability_name = value.clone();
@@ -128,10 +136,21 @@ fn bench_real_fixture(arguments: &[String]) -> CliResult<()> {
     )?;
     let file = File::open(input)?;
     let reader = BufReader::new(GzDecoder::new(file));
+    let mut ack_file = ack_log.as_ref().map(File::create).transpose()?;
     let started = Instant::now();
-    let report = load_real_fixture(reader, &mut store, batch_points)?;
+    let report = load_real_fixture_with_ack(reader, &mut store, batch_points, |ack| {
+        if let Some(file) = ack_file.as_mut() {
+            writeln!(
+                file,
+                "{{\"format\":\"ftwdb-ack-watermark-v1\",\"commits\":{},\"points\":{},\"durable\":{}}}",
+                ack.commits, ack.points, ack.durable
+            )?;
+            file.sync_data()?;
+        }
+        Ok(())
+    })?;
     let ingest_seconds = started.elapsed().as_secs_f64();
-    let stored_bytes = directory_bytes(database_directory)?;
+    let stored_bytes = store.stored_bytes()?;
     let points_per_second = report.points as f64 / ingest_seconds;
     let bytes_per_point = if report.points == 0 {
         0.0
@@ -229,7 +248,7 @@ fn bench_tsbs_iot(arguments: &[String]) -> CliResult<()> {
         load_tsbs_iot(BufReader::new(File::open(input)?), &mut store, batch_rows)?
     };
     let ingest_seconds = started.elapsed().as_secs_f64();
-    let stored_bytes = directory_bytes(database_directory)?;
+    let stored_bytes = store.stored_bytes()?;
     let points_per_second = report.points as f64 / ingest_seconds;
     let rows_per_second = report.rows as f64 / ingest_seconds;
     let bytes_per_point = if report.points == 0 {
@@ -282,6 +301,86 @@ fn check_store(arguments: &[String]) -> CliResult<()> {
     Ok(())
 }
 
+fn seal(arguments: &[String]) -> CliResult<()> {
+    if arguments.len() != 1 {
+        return Err(usage_error("seal requires one store directory"));
+    }
+    let mut store = Store::open(&arguments[0])?;
+    let report = store.seal_and_reclaim()?;
+    println!("{}", seal_report_json(&report));
+    Ok(())
+}
+
+fn maintain(arguments: &[String]) -> CliResult<()> {
+    let mut store_path = None;
+    let mut now_micros = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--now-micros" => {
+                let value = arguments
+                    .get(index + 1)
+                    .ok_or_else(|| usage_error("maintain --now-micros requires a value"))?;
+                now_micros = Some(parse(value, "--now-micros")?);
+                index += 2;
+            }
+            option if option.starts_with("--") => {
+                return Err(usage_error(format!("maintain does not support {option}")));
+            }
+            path => {
+                if store_path.is_some() {
+                    return Err(usage_error("maintain accepts one store directory"));
+                }
+                store_path = Some(path.to_owned());
+                index += 1;
+            }
+        }
+    }
+    let Some(store_path) = store_path else {
+        return Err(usage_error("maintain requires one store directory"));
+    };
+    let mut store = Store::open(&store_path)?;
+    let now_micros = now_micros.unwrap_or_else(current_time_micros);
+    let report = store.maintain(now_micros)?;
+    println!("{}", maintain_report_json(&report));
+    Ok(())
+}
+
+fn current_time_micros() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
+fn seal_report_json(report: &SealReport) -> String {
+    format!(
+        "{{\"format\":\"ftwdb-seal-v1\",\"manifest_generation\":{},\"segment_file\":\"{}\",\"sealed_points\":{},\"live_points\":{},\"segment_bytes\":{},\"log_bytes\":{}}}",
+        report.manifest_generation,
+        report.segment_file,
+        report.sealed_points,
+        report.live_points,
+        report.segment_bytes,
+        report.log_bytes
+    )
+}
+
+fn maintain_report_json(report: &MaintenanceReport) -> String {
+    format!(
+        "{{\"format\":\"ftwdb-maintain-v1\",\"manifest_generation\":{},\"rollup_files_written\":{},\"rollup_buckets_written\":{},\"rollup_bytes_written\":{},\"retention_gates\":{}}}",
+        report.manifest_generation,
+        report.rollup_files_written,
+        report.rollup_buckets_written,
+        report.rollup_bytes_written,
+        report.retention_gates.len()
+    )
+}
+
 fn backup(arguments: &[String]) -> CliResult<()> {
     if arguments.len() != 2 {
         return Err(usage_error(
@@ -320,12 +419,36 @@ fn restore_report_json(report: &RestoreReport) -> String {
 }
 
 fn salvage(arguments: &[String]) -> CliResult<()> {
-    if arguments.len() != 2 {
+    let mut drop_orphan_segments = false;
+    let mut positional = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--drop-orphan-segments" => {
+                drop_orphan_segments = true;
+                index += 1;
+            }
+            option if option.starts_with("--") => {
+                return Err(usage_error(format!("salvage does not support {option}")));
+            }
+            value => {
+                positional.push(value.to_owned());
+                index += 1;
+            }
+        }
+    }
+    if positional.len() != 2 {
         return Err(usage_error(
             "salvage requires a damaged store and absent target directory",
         ));
     }
-    let report = Store::salvage_from(&arguments[0], &arguments[1])?;
+    let report = Store::salvage_from_with_options(
+        &positional[0],
+        &positional[1],
+        SalvageOptions {
+            drop_orphan_segments,
+        },
+    )?;
     println!("{}", salvage_report_json(&report));
     Ok(())
 }
@@ -525,7 +648,7 @@ fn bench_ftwdb(arguments: &[String]) -> CliResult<()> {
     if gauge_bucket_checksum(&warm_query.buckets) != result_crc {
         return Err(runtime_invalid("cold and warm rollup query results differ"));
     }
-    let stored_bytes = directory_bytes(database_directory)?;
+    let stored_bytes = store.stored_bytes()?;
     let points_per_second = summary.points as f64 / ingest_seconds;
 
     println!(
@@ -545,20 +668,6 @@ fn bench_ftwdb(arguments: &[String]) -> CliResult<()> {
         stored_bytes
     );
     Ok(())
-}
-
-fn directory_bytes(path: &Path) -> CliResult<u64> {
-    let mut total = 0_u64;
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            total = total.saturating_add(directory_bytes(&entry.path())?);
-        } else {
-            total = total.saturating_add(metadata.len());
-        }
-    }
-    Ok(total)
 }
 
 fn parse<T>(value: &str, option: &str) -> CliResult<T>
@@ -602,7 +711,7 @@ fn runtime_invalid(reason: impl Into<String>) -> CliError {
 
 fn usage(program: &str) {
     eprintln!(
-        "usage:\n  {program} inspect <database-file>\n  {program} check-store <store-directory>\n  {program} backup <store-directory> <absent-destination>\n  {program} restore <backup-directory> <absent-target>\n  {program} salvage <damaged-store> <absent-target>\n  {program} generate <output-directory> [--seed N] [--sites N] [--days N] [--cadence-seconds N] [--start-micros N]\n  {program} bench-ftwdb <workload-directory> <empty-database-directory> [--durability always|manual] [--batch-points N]\n  {program} bench-real-fixture <points.csv.gz> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-points N]\n  {program} bench-tsbs-iot <influx-line-file|-> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-rows N]"
+        "usage:\n  {program} inspect <database-file>\n  {program} check-store <store-directory>\n  {program} seal <store-directory>\n  {program} maintain <store-directory> [--now-micros N]\n  {program} backup <store-directory> <absent-destination>\n  {program} restore <backup-directory> <absent-target>\n  {program} salvage <damaged-store> <absent-target> [--drop-orphan-segments]\n  {program} generate <output-directory> [--seed N] [--sites N] [--days N] [--cadence-seconds N] [--start-micros N]\n  {program} bench-ftwdb <workload-directory> <empty-database-directory> [--durability always|manual] [--batch-points N]\n  {program} bench-real-fixture <points.csv.gz> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-points N] [--ack-log FILE]\n  {program} bench-tsbs-iot <influx-line-file|-> <empty-database-directory> [--durability always|manual|every-bytes:N] [--batch-rows N]"
     );
 }
 

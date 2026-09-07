@@ -4,6 +4,7 @@ use crc32fast::hash;
 use lz4_flex::block::{compress_prepend_size, decompress};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -87,6 +88,9 @@ impl RollupSegment {
         if hash(&header[..44]) != u32::from_le_bytes(header[44..48].try_into().unwrap()) {
             return corruption(0, "rollup segment header checksum mismatch");
         }
+        if header[11] != 0 {
+            return corruption(0, "rollup segment reserved header byte is non-zero");
+        }
         let compression = header[10];
         let bucket_count = u32::from_le_bytes(header[12..16].try_into().unwrap());
         let uncompressed_len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
@@ -148,8 +152,17 @@ impl RollupSegment {
         }
         let buckets: Vec<_> = decoded
             .chunks_exact(BUCKET_BYTES)
-            .map(decode_bucket)
-            .collect();
+            .enumerate()
+            .map(|(index, raw)| {
+                if raw[96] & !0x0f != 0 || raw[97..104] != [0_u8; 7] {
+                    return corruption(
+                        HEADER_BYTES as u64 + index as u64 * BUCKET_BYTES as u64,
+                        "rollup bucket reserved bits are non-zero",
+                    );
+                }
+                Ok(decode_bucket(raw))
+            })
+            .collect::<Result<_>>()?;
         validate_buckets(&buckets, HEADER_BYTES as u64)?;
         if buckets
             .first()
@@ -183,11 +196,9 @@ impl RollupSegment {
 
     #[must_use]
     pub fn query(&self, start: i64, end: i64) -> Vec<GaugeBucket> {
-        self.buckets
-            .iter()
-            .filter(|bucket| bucket.end > start && bucket.start < end)
-            .copied()
-            .collect()
+        let lo = self.buckets.partition_point(|bucket| bucket.end <= start);
+        let hi = lo + self.buckets[lo..].partition_point(|bucket| bucket.start < end);
+        self.buckets[lo..hi].to_vec()
     }
 }
 
@@ -223,7 +234,11 @@ fn write_temporary(path: &Path, buckets: &[GaugeBucket]) -> Result<RollupSegment
     let header_crc = hash(&header[..44]);
     header[44..48].copy_from_slice(&header_crc.to_le_bytes());
 
-    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
     file.write_all(&header)?;
     file.write_all(&payload)?;
     file.sync_all()?;
@@ -311,32 +326,63 @@ fn decode_bucket(raw: &[u8]) -> GaugeBucket {
 
 fn validate_buckets(buckets: &[GaugeBucket], offset: u64) -> Result<()> {
     for (index, bucket) in buckets.iter().enumerate() {
+        let bucket_offset = offset + index as u64 * BUCKET_BYTES as u64;
         if bucket.end <= bucket.start || bucket.covered_micros < 0 {
-            return corruption(
-                offset + index as u64 * BUCKET_BYTES as u64,
-                "invalid bucket bounds",
-            );
+            return corruption(bucket_offset, "invalid bucket bounds");
         }
         if index > 0 && buckets[index - 1].end > bucket.start {
-            return corruption(
-                offset + index as u64 * BUCKET_BYTES as u64,
-                "rollup buckets overlap or are unsorted",
-            );
+            return corruption(bucket_offset, "rollup buckets overlap or are unsorted");
         }
-        if (bucket.count == 0) != (bucket.first.is_none() && bucket.last.is_none())
+        let duration = bucket
+            .end
+            .checked_sub(bucket.start)
+            .ok_or_else(|| Error::Corruption {
+                offset: bucket_offset,
+                reason: "rollup bucket duration overflows".to_owned(),
+            })?;
+        let has_samples = bucket.count > 0;
+        let has_values = has_samples || bucket.covered_micros > 0;
+        if has_samples != (bucket.first.is_some() && bucket.last.is_some())
+            || has_values != (bucket.min.is_some() && bucket.max.is_some())
             || bucket.min.is_some() != bucket.max.is_some()
             || bucket.first.is_some() != bucket.last.is_some()
         {
+            return corruption(bucket_offset, "inconsistent rollup aggregate presence");
+        }
+        if bucket.covered_micros > duration {
+            return corruption(bucket_offset, "rollup coverage exceeds bucket duration");
+        }
+        if !bucket.sum.is_finite()
+            || !bucket.integral_value_micros.is_finite()
+            || bucket.min.is_some_and(|value| !value.is_finite())
+            || bucket.max.is_some_and(|value| !value.is_finite())
+            || bucket.first.is_some_and(|sample| !sample.value.is_finite())
+            || bucket.last.is_some_and(|sample| !sample.value.is_finite())
+        {
             return corruption(
-                offset + index as u64 * BUCKET_BYTES as u64,
-                "inconsistent rollup aggregate presence",
+                bucket_offset,
+                "rollup aggregate contains a non-finite value",
             );
         }
-        if bucket.covered_micros > bucket.end - bucket.start {
-            return corruption(
-                offset + index as u64 * BUCKET_BYTES as u64,
-                "rollup coverage exceeds bucket duration",
-            );
+        if let (Some(min), Some(max)) = (bucket.min, bucket.max)
+            && min > max
+        {
+            return corruption(bucket_offset, "rollup aggregate minimum exceeds maximum");
+        }
+        if let (Some(first), Some(last), Some(min), Some(max)) =
+            (bucket.first, bucket.last, bucket.min, bucket.max)
+            && (first.timestamp < bucket.start
+                || first.timestamp >= bucket.end
+                || last.timestamp < bucket.start
+                || last.timestamp >= bucket.end
+                || first.timestamp > last.timestamp
+                || first.value < min
+                || first.value > max
+                || last.value < min
+                || last.value > max
+                || (bucket.count == 1 && first != last))
+        {
+            return corruption(bucket_offset, "rollup samples violate aggregate bounds");
         }
     }
     Ok(())
@@ -372,7 +418,7 @@ mod tests {
     };
     use crate::{Error, FixedGaugeRollup, Point};
     use crc32fast::hash;
-    use std::io::{Seek, SeekFrom, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use tempfile::tempdir;
 
     fn buckets() -> Vec<crate::GaugeBucket> {
@@ -407,6 +453,48 @@ mod tests {
         let path = directory.path().join("rollup.rseg");
         RollupSegment::create(&path, &buckets()).unwrap();
         assert!(RollupSegment::create(&path, &buckets()).is_err());
+    }
+
+    #[test]
+    fn rejects_overflowing_bounds_and_non_finite_aggregates_without_panicking() {
+        let directory = tempdir().unwrap();
+        let extreme = crate::GaugeBucket::empty(i64::MIN, i64::MAX);
+        assert!(matches!(
+            RollupSegment::create(directory.path().join("extreme.rseg"), &[extreme]),
+            Err(Error::Corruption { .. })
+        ));
+
+        let mut invalid = buckets();
+        invalid[0].sum = f64::INFINITY;
+        assert!(matches!(
+            RollupSegment::create(directory.path().join("infinite.rseg"), &invalid),
+            Err(Error::Corruption { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_non_zero_reserved_header_byte() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("reserved.rseg");
+        RollupSegment::create(&path, &buckets()).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut header = [0_u8; HEADER_BYTES];
+        file.read_exact(&mut header).unwrap();
+        header[11] = 1;
+        let header_crc = hash(&header[..44]);
+        header[44..48].copy_from_slice(&header_crc.to_le_bytes());
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&header).unwrap();
+        file.sync_all().unwrap();
+
+        assert!(matches!(
+            RollupSegment::open(&path),
+            Err(Error::Corruption { .. })
+        ));
     }
 
     /// Builds a rollup segment file with a consistent header around an

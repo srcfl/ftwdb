@@ -380,6 +380,7 @@ mod tests {
             store
                 .database()
                 .query_latest(latitude.id, i64::MIN, i64::MAX)
+                .unwrap()
                 .len(),
             2
         );
