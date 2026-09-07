@@ -14,7 +14,7 @@ use crate::{
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -202,20 +202,24 @@ impl Store {
 
     pub fn open_with(path: impl AsRef<Path>, config: Config) -> Result<Self> {
         let root = path.as_ref().to_path_buf();
-        let root_created = matches!(
-            std::fs::symlink_metadata(&root),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound
-        );
-        std::fs::create_dir_all(&root)?;
+        let root_created = match std::fs::symlink_metadata(&root) {
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(&root)?;
+                true
+            }
+            Err(error) => return Err(Error::Io(error)),
+        };
+        require_real_directory(&root)?;
         if root_created {
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
         }
         let manifest_directory = root.join(MANIFEST_DIRECTORY);
         let rollup_directory = root.join(ROLLUP_DIRECTORY);
         let segment_directory = root.join(SEGMENT_DIRECTORY);
-        std::fs::create_dir_all(&manifest_directory)?;
-        std::fs::create_dir_all(&rollup_directory)?;
-        std::fs::create_dir_all(&segment_directory)?;
+        create_or_require_real_directory(&manifest_directory)?;
+        create_or_require_real_directory(&rollup_directory)?;
+        create_or_require_real_directory(&segment_directory)?;
         // Make the manifests/ and rollups/ entries durable in the root, then
         // make the root's own entry durable in its parent — the same order
         // segment publication uses: contents first, then the directory entry
@@ -2317,16 +2321,44 @@ fn hard_link_or_copy(source: &Path, destination: &Path) -> std::io::Result<LinkO
 
 fn directory_bytes(path: &Path) -> Result<u64> {
     let mut total = 0_u64;
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        total = total.saturating_add(if metadata.is_dir() {
-            directory_bytes(&entry.path())?
-        } else {
-            metadata.len()
-        });
+    let mut directories = vec![path.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        require_real_directory(&directory)?;
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            let metadata = std::fs::symlink_metadata(&entry_path)?;
+            if metadata.file_type().is_dir() {
+                directories.push(entry_path);
+            } else if metadata.file_type().is_file() {
+                total = total.checked_add(metadata.len()).ok_or_else(|| {
+                    Error::Serialization("stored byte count exceeds u64".to_owned())
+                })?;
+            } else {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "stored path is not a regular file or directory: {}",
+                        entry_path.display()
+                    ),
+                )));
+            }
+        }
     }
     Ok(total)
+}
+
+fn create_or_require_real_directory(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => require_real_directory(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700).create(path)?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+            require_real_directory(path)
+        }
+        Err(error) => Err(Error::Io(error)),
+    }
 }
 
 fn require_real_directory(path: &Path) -> Result<()> {
@@ -2795,6 +2827,55 @@ mod tests {
                 & 0o777,
             0o600
         );
+        for directory in ["manifests", "rollups", "segments"] {
+            assert_eq!(
+                std::fs::symlink_metadata(root.join(directory))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
+    fn writable_open_rejects_symlinked_store_directories() {
+        let directory = tempdir().unwrap();
+        let outside = directory.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+
+        let linked_root = directory.path().join("linked-root");
+        std::os::unix::fs::symlink(&outside, &linked_root).unwrap();
+        assert!(Store::open(&linked_root).is_err());
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+
+        for child in ["manifests", "rollups", "segments"] {
+            let root = directory.path().join(format!("store-{child}"));
+            let child_outside = directory.path().join(format!("outside-{child}"));
+            std::fs::create_dir(&root).unwrap();
+            std::fs::create_dir(&child_outside).unwrap();
+            std::os::unix::fs::symlink(&child_outside, root.join(child)).unwrap();
+
+            assert!(Store::open(&root).is_err(), "accepted symlinked {child}");
+            assert!(
+                std::fs::read_dir(&child_outside).unwrap().next().is_none(),
+                "wrote through symlinked {child}"
+            );
+        }
+    }
+
+    #[test]
+    fn stored_bytes_rejects_symlinks_instead_of_following_them() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("store");
+        let outside = directory.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("large"), vec![0_u8; 4096]).unwrap();
+        let store = Store::open(&root).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("linked-outside")).unwrap();
+
+        assert!(store.stored_bytes().is_err());
     }
 
     #[test]
@@ -4545,6 +4626,50 @@ mod tests {
         assert_eq!(
             store.database().query_latest(1, 0, 20 * SECOND).unwrap(),
             vec![historical, tail]
+        );
+    }
+
+    #[test]
+    fn live_tail_wins_an_equal_bitemporal_tie_after_seal() {
+        let directory = tempdir().unwrap();
+        let first = Point::actual(1, 5 * SECOND, 1.0);
+        let correction = Point::actual(1, 5 * SECOND, 2.0);
+
+        {
+            let mut store = Store::open(directory.path()).unwrap();
+            initialize(&mut store, Vec::new(), None);
+            let mut transaction = Transaction::new();
+            transaction.append_points(vec![first]);
+            store.commit(transaction).unwrap();
+            store.seal_and_reclaim().unwrap();
+
+            let mut transaction = Transaction::new();
+            transaction.append_points(vec![correction]);
+            store.commit(transaction).unwrap();
+            assert_eq!(
+                store.database().query_history(1, 0, 10 * SECOND).unwrap(),
+                vec![first, correction]
+            );
+            assert_eq!(
+                store.database().query_latest(1, 0, 10 * SECOND).unwrap(),
+                vec![correction]
+            );
+            store.seal_and_reclaim().unwrap();
+            assert_eq!(
+                store.database().query_latest(1, 0, 10 * SECOND).unwrap(),
+                vec![correction]
+            );
+            store.close().unwrap();
+        }
+
+        let store = Store::open_read_only(directory.path()).unwrap();
+        assert_eq!(
+            store.database().query_history(1, 0, 10 * SECOND).unwrap(),
+            vec![first, correction]
+        );
+        assert_eq!(
+            store.database().query_latest(1, 0, 10 * SECOND).unwrap(),
+            vec![correction]
         );
     }
 

@@ -71,32 +71,65 @@ pub struct FaultRunReport {
 
 pub fn last_durable_ack(path: &Path) -> Result<AckWatermark, VerifyError> {
     let contents = fs::read_to_string(path)?;
-    let mut last = None;
-    for line in contents.lines() {
+    let lines: Vec<_> = contents.split('\n').collect();
+    let has_unterminated_final_line = !contents.ends_with('\n');
+    let mut previous = None::<AckWatermark>;
+    let mut last_durable = None;
+    for (index, line) in lines.iter().enumerate() {
+        // A JSONL record is complete only after its newline lands. A power
+        // cut can leave a valid JSON prefix as the final unterminated line,
+        // so never use that line as durability evidence.
+        if has_unterminated_final_line && index + 1 == lines.len() {
+            break;
+        }
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
+        let value = match serde_json::from_str::<Value>(line) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(VerifyError::Invalid(format!(
+                    "ack log line {} is not valid JSON: {error}",
+                    index + 1
+                )));
+            }
         };
-        if string(&value, "format").ok() != Some("ftwdb-ack-watermark-v1") {
-            continue;
+        if string(&value, "format")? != "ftwdb-ack-watermark-v1" {
+            return Err(VerifyError::Invalid(format!(
+                "ack log line {} has the wrong format",
+                index + 1
+            )));
         }
         let durable = value
             .get("durable")
             .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if !durable {
-            continue;
-        }
-        last = Some(AckWatermark {
+            .ok_or_else(|| {
+                VerifyError::Invalid(format!(
+                    "ack log line {} lacks a boolean durable field",
+                    index + 1
+                ))
+            })?;
+        let watermark = AckWatermark {
             commits: unsigned(&value, "commits")?,
             points: unsigned(&value, "points")?,
             durable,
-        });
+        };
+        if let Some(previous) = previous
+            && (watermark.commits <= previous.commits || watermark.points < previous.points)
+        {
+            return Err(VerifyError::Invalid(format!(
+                "ack log line {} regresses its cumulative watermark",
+                index + 1
+            )));
+        }
+        previous = Some(watermark);
+        if !durable {
+            continue;
+        }
+        last_durable = Some(watermark);
     }
-    last.ok_or_else(|| {
+    last_durable.ok_or_else(|| {
         VerifyError::Invalid("ack log has no complete durable watermark line".to_owned())
     })
 }
@@ -118,8 +151,8 @@ pub fn verify(input: &VerifyInput<'_>) -> Result<FaultRunReport, VerifyError> {
     let recovered_points = unsigned(&check, "raw_points")?;
     let recovered_commits = unsigned(&check, "raw_commits")?;
     let recovered_tail_bytes = parse_recovered_tail(&fs::read_to_string(input.inspect)?)?;
-    let check_tail_bytes = unsigned(&check, "raw_recovered_tail_bytes").unwrap_or(0);
-    let recovered_tail_kind = string(&check, "raw_recovered_tail").unwrap_or("none");
+    let check_tail_bytes = unsigned(&check, "raw_recovered_tail_bytes")?;
+    let recovered_tail_kind = string(&check, "raw_recovered_tail")?;
     let injected_torn_operations = unsigned(stats, "injected_torn_operations")?;
     let injected_torn_bytes = unsigned(stats, "injected_torn_bytes")?;
     let power_torn_operations = unsigned(stats, "torn_operations")?;
@@ -344,7 +377,7 @@ mod tests {
         .unwrap();
         fs::write(
             &check,
-            b"{\"format\":\"ftwdb-integrity-v1\",\"raw_points\":100,\"raw_commits\":10}\n",
+            b"{\"format\":\"ftwdb-integrity-v1\",\"raw_points\":100,\"raw_commits\":10,\"raw_recovered_tail_bytes\":39,\"raw_recovered_tail\":\"incomplete-header\"}\n",
         )
         .unwrap();
         fs::write(&inspect, b"recovered_tail_bytes: 39\n").unwrap();
@@ -393,6 +426,49 @@ mod tests {
         let ack = last_durable_ack(&path).unwrap();
         assert_eq!(ack.commits, 2);
         assert_eq!(ack.points, 20);
+
+        fs::write(
+            &path,
+            concat!(
+                "{\"format\":\"ftwdb-ack-watermark-v1\",\"commits\":1,\"points\":10,\"durable\":true}\n",
+                "{\"format\":\"ftwdb-ack-watermark-v1\",\"commits\":2,\"points\":20,\"durable\":true}"
+            ),
+        )
+        .unwrap();
+        let ack = last_durable_ack(&path).unwrap();
+        assert_eq!(ack.commits, 1);
+        assert_eq!(ack.points, 10);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn last_durable_ack_rejects_malformed_complete_and_regressing_lines() {
+        let directory =
+            std::env::temp_dir().join(format!("ftw-sd-bad-ack-log-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("ack.jsonl");
+        let first = "{\"format\":\"ftwdb-ack-watermark-v1\",\"commits\":2,\"points\":20,\"durable\":true}\n";
+
+        fs::write(&path, format!("{first}not-json\n")).unwrap();
+        assert!(last_durable_ack(&path).is_err());
+
+        fs::write(
+            &path,
+            format!(
+                "{first}{{\"format\":\"ftwdb-ack-watermark-v1\",\"commits\":1,\"points\":10,\"durable\":true}}\n"
+            ),
+        )
+        .unwrap();
+        assert!(last_durable_ack(&path).is_err());
+
+        fs::write(
+            &path,
+            format!(
+                "{first}{{\"format\":\"wrong\",\"commits\":3,\"points\":30,\"durable\":true}}\n"
+            ),
+        )
+        .unwrap();
+        assert!(last_durable_ack(&path).is_err());
         fs::remove_dir_all(directory).unwrap();
     }
 

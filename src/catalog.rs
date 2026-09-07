@@ -1,6 +1,6 @@
 use crate::model::{
-    Entity, EntityId, Plan, PlanStatus, Relation, RelationId, Run, RunId, RunKind, RunStatus,
-    SeriesDefinition,
+    Entity, EntityId, Plan, PlanStatus, Properties, PropertyValue, Relation, RelationId, Run,
+    RunId, RunKind, RunStatus, SeriesDefinition,
 };
 use crate::transaction::Record;
 use crate::{Error, Point, Result};
@@ -83,7 +83,12 @@ impl Catalog {
 
     /// Catalog records in an apply-safe order so a compact log can rebuild
     /// the current identity set without replaying historical frames.
-    pub(crate) fn snapshot_records(&self) -> Vec<Record> {
+    pub(crate) fn snapshot_records(&self) -> Result<Vec<Record>> {
+        // Reclaim must never turn an invalid dependency graph into a partial
+        // catalog. Normal commits keep this invariant true; checking it again
+        // here makes compaction fail closed if a later code change regresses
+        // validation or an in-memory catalog is otherwise inconsistent.
+        self.validate_references()?;
         let mut records = Vec::with_capacity(
             self.entities.len()
                 + self.relations.len()
@@ -103,7 +108,7 @@ impl Catalog {
                 })
                 .collect();
             if ready.is_empty() {
-                break;
+                return invalid("entity dependency graph cannot be snapshotted".to_owned());
             }
             for id in ready {
                 remaining_entities.remove(&id);
@@ -131,7 +136,7 @@ impl Catalog {
                 })
                 .collect();
             if ready.is_empty() {
-                break;
+                return invalid("run dependency graph cannot be snapshotted".to_owned());
             }
             for id in ready {
                 remaining_runs.remove(&id);
@@ -150,14 +155,14 @@ impl Catalog {
                 })
                 .collect();
             if ready.is_empty() {
-                break;
+                return invalid("plan dependency graph cannot be snapshotted".to_owned());
             }
             for id in ready {
                 remaining_plans.remove(&id);
                 records.push(Record::Plan(self.plans[&id].clone()));
             }
         }
-        records
+        Ok(records)
     }
 
     pub(crate) fn validate_and_apply(&self, records: &[Record]) -> Result<Self> {
@@ -231,6 +236,7 @@ impl Catalog {
             Record::Plan(plan) => {
                 plan.validate()
                     .map_err(|reason| Error::InvalidModel(reason.to_owned()))?;
+                validate_properties("plan", &plan.attributes)?;
                 if let Some(previous) = self.plans.get(&plan.id) {
                     validate_plan_transition(previous, plan)?;
                 }
@@ -282,6 +288,7 @@ impl Catalog {
                 return invalid(format!("run {} has missing provenance", run.id.0));
             }
         }
+        validate_no_run_cycles(&self.runs)?;
         for plan in self.plans.values() {
             let Some(run) = self.runs.get(&plan.run_id) else {
                 return invalid(format!("plan {} refers to a missing run", plan.id));
@@ -299,6 +306,7 @@ impl Catalog {
                 return invalid(format!("plan {} supersedes a missing plan", plan.id));
             }
         }
+        validate_no_plan_cycles(&self.plans)?;
         Ok(())
     }
 
@@ -348,6 +356,7 @@ pub(crate) fn validate_entity(entity: &Entity) -> Result<()> {
     if entity.valid_to.is_some_and(|end| end <= entity.valid_from) {
         return invalid("entity validity interval must be positive".to_owned());
     }
+    validate_properties("entity", &entity.properties)?;
     Ok(())
 }
 
@@ -361,6 +370,7 @@ fn validate_relation(relation: &Relation) -> Result<()> {
     {
         return invalid("relation validity interval must be positive".to_owned());
     }
+    validate_properties("relation", &relation.properties)?;
     Ok(())
 }
 
@@ -370,6 +380,19 @@ pub(crate) fn validate_run(run: &Run) -> Result<()> {
     }
     if run.parent_run == Some(run.id) || run.input_snapshot == Some(run.id) {
         return invalid("run cannot refer to itself".to_owned());
+    }
+    validate_properties("run", &run.attributes)?;
+    Ok(())
+}
+
+fn validate_properties(label: &str, properties: &Properties) -> Result<()> {
+    if properties.iter().any(|(name, value)| {
+        name.trim().is_empty()
+            || matches!(value, PropertyValue::Float(number) if !number.is_finite())
+    }) {
+        return invalid(format!(
+            "{label} properties require names and finite float values"
+        ));
     }
     Ok(())
 }
@@ -431,6 +454,156 @@ fn validate_no_parent_cycle(id: EntityId, entities: &BTreeMap<EntityId, Entity>)
     Ok(())
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum VisitState {
+    Active,
+    Complete,
+}
+
+fn validate_no_run_cycles(runs: &BTreeMap<RunId, Run>) -> Result<()> {
+    let mut states = BTreeMap::<RunId, VisitState>::new();
+    for root in runs.keys().copied() {
+        if states.get(&root) == Some(&VisitState::Complete) {
+            continue;
+        }
+        let mut stack = vec![(root, false)];
+        while let Some((id, finish)) = stack.pop() {
+            if finish {
+                states.insert(id, VisitState::Complete);
+                continue;
+            }
+            match states.get(&id) {
+                Some(VisitState::Complete) => continue,
+                Some(VisitState::Active) => {
+                    return invalid(format!("run provenance cycle contains {}", id.0));
+                }
+                None => {}
+            }
+            states.insert(id, VisitState::Active);
+            stack.push((id, true));
+            let run = &runs[&id];
+            if let Some(input) = run.input_snapshot {
+                stack.push((input, false));
+            }
+            if let Some(parent) = run.parent_run {
+                stack.push((parent, false));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_no_plan_cycles(plans: &BTreeMap<u128, Plan>) -> Result<()> {
+    let mut states = BTreeMap::<u128, VisitState>::new();
+    for root in plans.keys().copied() {
+        if states.get(&root) == Some(&VisitState::Complete) {
+            continue;
+        }
+        let mut stack = vec![(root, false)];
+        while let Some((id, finish)) = stack.pop() {
+            if finish {
+                states.insert(id, VisitState::Complete);
+                continue;
+            }
+            match states.get(&id) {
+                Some(VisitState::Complete) => continue,
+                Some(VisitState::Active) => {
+                    return invalid(format!("plan supersession cycle contains {id}"));
+                }
+                None => {}
+            }
+            states.insert(id, VisitState::Active);
+            stack.push((id, true));
+            if let Some(previous) = plans[&id].supersedes {
+                stack.push((previous, false));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn invalid<T>(reason: String) -> Result<T> {
     Err(Error::InvalidModel(reason))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Catalog, validate_entity};
+    use crate::transaction::Record;
+    use crate::{
+        Entity, EntityId, Plan, PlanStatus, PropertyValue, Run, RunId, RunKind, RunStatus,
+    };
+    use std::collections::BTreeMap;
+
+    fn run(id: u128, parent_run: Option<u128>, input_snapshot: Option<u128>) -> Run {
+        Run {
+            id: RunId(id),
+            kind: RunKind::Forecast,
+            status: RunStatus::Pending,
+            created_at: 1,
+            knowledge_time: 1,
+            workflow: "test".to_owned(),
+            model: String::new(),
+            model_version: String::new(),
+            parent_run: parent_run.map(RunId),
+            input_snapshot: input_snapshot.map(RunId),
+            attributes: BTreeMap::new(),
+        }
+    }
+
+    fn plan(id: u128, supersedes: Option<u128>) -> Plan {
+        Plan {
+            id,
+            run_id: RunId(1),
+            status: PlanStatus::Candidate,
+            horizon_start: 0,
+            horizon_end: 10,
+            resolution_micros: 1,
+            scenario: "test".to_owned(),
+            objective_terms: BTreeMap::new(),
+            objective_value: None,
+            supersedes,
+            attributes: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn rejects_multi_node_run_provenance_cycles() {
+        let records = vec![
+            Record::Run(run(1, Some(2), None)),
+            Record::Run(run(2, None, Some(1))),
+        ];
+        let error = Catalog::default().validate_and_apply(&records).unwrap_err();
+        assert!(error.to_string().contains("run provenance cycle"));
+    }
+
+    #[test]
+    fn rejects_multi_node_plan_supersession_cycles() {
+        let mut optimization = run(1, None, None);
+        optimization.kind = RunKind::Optimization;
+        let records = vec![
+            Record::Run(optimization),
+            Record::Plan(plan(10, Some(11))),
+            Record::Plan(plan(11, Some(10))),
+        ];
+        let error = Catalog::default().validate_and_apply(&records).unwrap_err();
+        assert!(error.to_string().contains("plan supersession cycle"));
+    }
+
+    #[test]
+    fn rejects_non_finite_property_values() {
+        let mut entity = Entity {
+            id: EntityId(1),
+            kind: "site".to_owned(),
+            name: "Site".to_owned(),
+            parent: None,
+            valid_from: 0,
+            valid_to: None,
+            properties: BTreeMap::new(),
+        };
+        entity
+            .properties
+            .insert("rating".to_owned(), PropertyValue::Float(f64::INFINITY));
+        assert!(validate_entity(&entity).is_err());
+    }
 }

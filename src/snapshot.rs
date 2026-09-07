@@ -3,7 +3,7 @@ use crate::{Error, Result};
 use crc32fast::Hasher;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -321,8 +321,11 @@ impl StagedDirectory {
                 ".{name}.{operation}-{}-{timestamp}-{counter}-{attempt}",
                 std::process::id()
             ));
-            match std::fs::create_dir(&path) {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&path) {
                 Ok(()) => {
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
                     return Ok(Self {
                         path,
                         published: false,
@@ -560,8 +563,28 @@ pub(crate) fn inject_checksum_mismatch(digest: SnapshotDigest) -> SnapshotDigest
 #[cfg(test)]
 mod tests {
     use super::{StagedDirectory, snapshot_digest};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::sync::{Arc, Barrier};
     use tempfile::tempdir;
+
+    #[test]
+    fn staged_snapshot_directory_is_owner_only() {
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("target");
+        let stage = StagedDirectory::create(&destination, "test").unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(stage.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(stage.path()).unwrap().uid(),
+            rustix::process::geteuid().as_raw()
+        );
+    }
 
     #[test]
     fn digest_ignores_unselected_files_and_changes_with_paths_lengths_or_bytes() {

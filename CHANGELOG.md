@@ -38,6 +38,16 @@ steps in [docs/releases.md](docs/releases.md).
 
 - Release publication now reads notes from the annotated tag through a file,
   which works with an explicit GitHub repository target.
+- A live or later-sealed correction now wins when all three time keys match an
+  older sealed point.
+- Log reclaim sorts ingress receipts and retains their exact bytes. CRC32
+  equality alone can no longer accept a changed retry.
+- This version still reads the old exact-receipt index, but older binaries
+  cannot read a store after the new writer reclaims it.
+- Catalog compaction rejects run and plan cycles instead of writing a partial
+  catalog.
+- Store paths, segment links, manifest order, reserved fields, rollup values,
+  and SD-card ACK evidence now fail on invalid input.
 
 ## [0.1.0-alpha.1] - 2026-07-21
 

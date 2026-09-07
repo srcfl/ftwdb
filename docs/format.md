@@ -12,6 +12,9 @@ uncompressed; it is a durability test vehicle, not the final segment format.
 | 10 | 2 | reserved flags |
 | 12 | 4 | CRC32 of bytes 0..12 |
 
+Reserved database, transaction, and transaction-record fields must be zero.
+Readers reject non-zero values even when the checksum is valid.
+
 ## Batch frame header (24 bytes)
 
 | Offset | Bytes | Field |
@@ -111,19 +114,32 @@ A frame of kind `4` carries a fixed 16-byte payload:
 | 8 | 8 | sealed point count as little-endian `u64` |
 
 The checkpoint is appended before the live log is reclaimed. Recovery treats an
-invalid payload length or generation mismatch as corruption.
+item count other than zero, invalid payload length, generation zero, or a sealed
+point count that differs from the live prefix as corruption.
 
 ## Identity index payload
 
-A frame of kind `5` stores a compact Postcard-encoded index of ingress receipts
-written during log reclamation. Recovery validates the payload checksum and
-decodes the index before accepting the compact log. An invalid or truncated
-index fails closed as corruption.
+A frame of kind `5` stores an index of identified and ordered-ingress receipts
+written during log reclamation. The current payload starts with ASCII
+`WIDX0002`, followed by the Postcard-encoded index. Each receipt keeps its exact
+transaction payload as well as its length and CRC32. Receipts are sorted by
+commit ID or `(source_id, sequence)`. The writer splits large indexes across
+bounded kind-5 frames and sets their item count to zero. Recovery validates
+each frame checksum, order, counts, payload metadata, and exact embedded
+transaction before it accepts the compact log. An invalid or truncated index
+causes a corruption error.
 
-After reclaim, identity replay verification uses the identity-index frame and
-the retained receipt bytes in the compact log. A post-reclaim duplicate or
-cursor regression is reported as corruption from those durable bytes, not from
-recomputing a standalone frame CRC in isolation.
+After reclaim, identity replay verification compares the retained receipt
+bytes in the compact log. Recovery uses those durable bytes to reject a
+duplicate or cursor regression; it does not rely on a frame CRC alone.
+
+The reader still accepts the first kind-5 payload shape, which lacks retained
+bytes. It keeps those IDs known but rejects any retry because length plus CRC32
+cannot prove byte equality. A later reclaim keeps that behavior.
+
+This compatibility is one-way. A reader that predates `WIDX0002` cannot open a
+log after the new writer has reclaimed identified receipts. Take a verified
+backup before the upgrade; a binary rollback also needs a pre-upgrade store.
 
 The immutable segment format will be separately versioned and use per-column
 encoding, block checksums, sparse indexes, and footer redundancy.

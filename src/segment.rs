@@ -1,4 +1,4 @@
-use crate::storage::sync_parent_directory;
+use crate::storage::{open_regular_file_read_only, sync_parent_directory};
 use crate::{Error, Point, Result};
 use crc32fast::hash;
 use lz4_flex::block::{compress_prepend_size, decompress};
@@ -75,6 +75,7 @@ impl Segment {
                 "segment block_points must be in 1..=262144",
             ));
         }
+        crate::catalog::validate_point_intervals(points)?;
         let path = path.as_ref();
         if path.exists() {
             return Err(Error::Io(std::io::Error::new(
@@ -106,7 +107,7 @@ impl Segment {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let mut file = OpenOptions::new().read(true).open(path)?;
+        let mut file = open_regular_file_read_only(path.as_ref())?;
         let file_len = file.metadata()?.len();
         if file_len < (SEGMENT_HEADER_BYTES + INDEX_HEADER_BYTES) as u64 {
             return corruption(0, "segment is too small");
@@ -118,7 +119,7 @@ impl Segment {
             return corruption(0, "invalid segment magic");
         }
         let version = u16::from_le_bytes(header[8..10].try_into().unwrap());
-        if version != SEGMENT_VERSION {
+        if version != SEGMENT_VERSION || header[10..12] != [0, 0] {
             return corruption(0, "unsupported segment version");
         }
         let expected_header_crc = u32::from_le_bytes(header[36..40].try_into().unwrap());
@@ -564,6 +565,9 @@ fn read_block(file: &File, entry: IndexEntry) -> Result<Vec<Point>> {
     if version != BLOCK_VERSION || header[7] != BLOCK_ENCODING_COLUMN_V1 {
         return corruption(entry.offset, "unsupported block encoding");
     }
+    if header[52..56] != [0, 0, 0, 0] {
+        return corruption(entry.offset, "non-zero reserved block header bytes");
+    }
     let expected_header_crc = u32::from_le_bytes(header[48..52].try_into().unwrap());
     if hash(&header[..48]) != expected_header_crc {
         return corruption(entry.offset, "block header checksum mismatch");
@@ -637,7 +641,26 @@ fn read_block(file: &File, entry: IndexEntry) -> Result<Vec<Point>> {
     if decoded.len() != uncompressed_len {
         return corruption(entry.offset, "block uncompressed length mismatch");
     }
-    decode_columns(&decoded, series_id, points as usize, entry.offset)
+    let points = decode_columns(&decoded, series_id, points as usize, entry.offset)?;
+    if points
+        .first()
+        .is_none_or(|point| point.valid_time != min_time)
+        || points
+            .last()
+            .is_none_or(|point| point.valid_time != max_time)
+        || points
+            .windows(2)
+            .any(|pair| pair[0].valid_time > pair[1].valid_time)
+        || points
+            .iter()
+            .any(|point| point.valid_time_end < point.valid_time || !point.value.is_finite())
+    {
+        return corruption(
+            entry.offset,
+            "decoded block violates point or index invariants",
+        );
+    }
+    Ok(points)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1104,5 +1127,26 @@ mod tests {
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists
         ));
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn create_rejects_invalid_points_before_publishing_a_file() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("invalid.seg");
+        let mut invalid = points(1);
+        invalid[0].value = f64::NAN;
+        assert!(Segment::create(&path, &invalid, 1).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn open_rejects_a_symlink_to_a_valid_segment() {
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("target.seg");
+        let link = directory.path().join("linked.seg");
+        Segment::create(&target, &points(10), 10).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(matches!(Segment::open(&link), Err(Error::Io(_))));
     }
 }
