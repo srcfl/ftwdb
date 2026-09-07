@@ -16,6 +16,11 @@ changelog heading, and the tag without its leading `v` must match exactly.
 - **Stable** requires the relevant roadmap exit, a stated compatibility and
   support window, and no open release-blocking defect.
 
+An alpha FTWDB candidate may be included as an opt-in, disposable shadow
+collector in an FTW beta while SQLite/Parquet remain authoritative. That does
+not satisfy the standalone FTWDB beta gate above. Release notes must state the
+copy's coverage, loss conditions, resource limits, and rollback steps.
+
 Pre-release versions may break APIs and formats between releases. Stable
 versions follow the compatibility promise published with that release.
 
@@ -49,13 +54,18 @@ Pushing a matching tag starts `.github/workflows/release.yml`. The workflow:
 1. checks that the tag is annotated and matches the exact Cargo/changelog
    version;
 2. repeats the release test and package checks;
-3. builds native `ftw` archives on GitHub's Linux and macOS runners;
+3. builds and tests all three tools for Linux AMD64, Linux ARM64, and macOS;
 4. creates `SHA256SUMS` for the archives; and
 5. creates a GitHub prerelease when the tag contains a pre-release suffix.
 
 The archive name includes the tag and Rust host target. Each archive contains
-the `ftw` binary, README, changelog, and license. GitHub Actions records the
-source commit and workflow run. Alpha releases stay on GitHub; publishing the
+`ftw`, `ftwdb-shadow`, `ftwdb-shadow-reconcile`, README, changelog, license,
+recovery and protocol docs, and private service examples. `SOURCE.json` names
+the exact source commit, version, target, and binary SHA-256 checksums.
+`packaging/build-archive.py` unpacks the archive and runs all three versions
+before upload. Linux binaries build in the pinned Debian 12 container so they
+do not depend on the runner's newer glibc. CI runs the same packaging workflow
+before a tag exists. GitHub Actions records the workflow run. Alpha releases stay on GitHub; publishing the
 crate to crates.io needs a separate decision and an explicit publish step.
 
 ## Maintainer steps
@@ -67,7 +77,7 @@ crate to crates.io needs a separate decision and an explicit publish step.
 5. Create an annotated tag on the exact merge commit with concise release
    notes and known limits.
 6. Push only that tag and watch the Release workflow to completion.
-7. Check the GitHub release, both archives, `SHA256SUMS`, and the source commit.
+7. Check the GitHub release, all three archives, `SHA256SUMS`, and the source commit.
 
 Do not create a release from a feature branch, a dirty tree, or a commit whose
 CI result is unknown.

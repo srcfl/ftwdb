@@ -35,6 +35,39 @@ pub struct ShadowRuntimeConfig {
     /// When set on a store backend, seal and reclaim once the active log
     /// exceeds this many bytes after a maintenance tick.
     pub seal_log_bytes_threshold: Option<u64>,
+    /// Limit a raw shadow store. Requires maintenance to be disabled and no
+    /// active rollups, so a write cannot publish extra files after this check.
+    pub storage_limits: Option<ShadowStorageLimits>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShadowStorageLimits {
+    pub max_store_bytes: u64,
+    pub minimum_free_bytes: u64,
+}
+
+impl ShadowStorageLimits {
+    fn check(&self, store: &Store, transaction: &Transaction) -> crate::Result<()> {
+        let additional = crate::storage::ingress_frame_bytes(transaction)?;
+        if store
+            .stored_bytes()?
+            .checked_add(additional)
+            .is_none_or(|bytes| bytes > self.max_store_bytes)
+        {
+            return Err(Error::ResourceLimit("store byte limit reached"));
+        }
+        let space = rustix::fs::statvfs(store.root()).map_err(std::io::Error::from)?;
+        let fragment = u128::from(space.f_frsize);
+        if fragment == 0 {
+            return Err(std::io::Error::other("filesystem reported a zero allocation size").into());
+        }
+        let available = u128::from(space.f_bavail) * fragment;
+        let allocated = u128::from(additional).div_ceil(fragment) * fragment;
+        if available < u128::from(self.minimum_free_bytes) + allocated {
+            return Err(Error::ResourceLimit("free disk reserve reached"));
+        }
+        Ok(())
+    }
 }
 
 impl Default for ShadowRuntimeConfig {
@@ -44,6 +77,7 @@ impl Default for ShadowRuntimeConfig {
             max_queued_points: 1_048_576,
             maintenance_interval: None,
             seal_log_bytes_threshold: None,
+            storage_limits: None,
         }
     }
 }
@@ -399,6 +433,8 @@ pub struct ShadowHealth {
     /// Latest fatal writer or close error. Rejected client input increments
     /// `failed` but does not mark a healthy writer as degraded.
     pub last_error: Option<String>,
+    /// A rejected write hit a storage budget. Existing receipts remain usable.
+    pub resource_limit: Option<String>,
     pub database_bytes: u64,
     pub database_points: u64,
     pub database_commits: u64,
@@ -424,6 +460,7 @@ struct HealthState {
     failed: u64,
     source_watermarks: BTreeMap<u128, IngressWatermarks>,
     last_error: Option<String>,
+    resource_limit: Option<String>,
     store: StoreOpsSnapshot,
 }
 
@@ -671,7 +708,20 @@ impl ShadowRuntime {
         if store.is_read_only() {
             return Err(ShadowStartError::ReadOnlyBackend);
         }
-        Self::start_backend(Box::new(store), config)
+        if config.storage_limits.is_some()
+            && (store.active_rollups().next().is_some()
+                || config.maintenance_interval.is_some()
+                || config.seal_log_bytes_threshold.is_some())
+        {
+            return Err(ShadowStartError::InvalidStorageLimits);
+        }
+        Self::start_backend(
+            Box::new(StoreWriter {
+                store,
+                limits: config.storage_limits,
+            }),
+            config,
+        )
     }
 
     pub fn start_database(
@@ -680,6 +730,9 @@ impl ShadowRuntime {
     ) -> Result<Self, ShadowStartError> {
         if database.is_read_only() {
             return Err(ShadowStartError::ReadOnlyBackend);
+        }
+        if config.storage_limits.is_some() {
+            return Err(ShadowStartError::InvalidStorageLimits);
         }
         Self::start_backend(Box::new(database), config)
     }
@@ -703,6 +756,7 @@ impl ShadowRuntime {
                 failed: 0,
                 source_watermarks,
                 last_error: None,
+                resource_limit: None,
                 store,
             }),
             send_gate: Mutex::new(()),
@@ -790,6 +844,7 @@ impl Drop for ShadowRuntime {
 pub enum ShadowStartError {
     ZeroQueueCapacity,
     ReadOnlyBackend,
+    InvalidStorageLimits,
     Spawn(std::io::Error),
 }
 
@@ -800,6 +855,9 @@ impl fmt::Display for ShadowStartError {
                 formatter.write_str("shadow queue capacity must be positive")
             }
             Self::ReadOnlyBackend => formatter.write_str("shadow writer requires writable storage"),
+            Self::InvalidStorageLimits => formatter.write_str(
+                "storage limits require a raw Store with no active rollups or background maintenance",
+            ),
             Self::Spawn(error) => write!(formatter, "could not start shadow writer: {error}"),
         }
     }
@@ -921,30 +979,45 @@ trait WriterBackend: Send + 'static {
     }
 }
 
-impl WriterBackend for Store {
+struct StoreWriter {
+    store: Store,
+    limits: Option<ShadowStorageLimits>,
+}
+
+impl WriterBackend for StoreWriter {
     fn commit_ingress(
         &mut self,
         identity: IngressIdentity,
         transaction: Transaction,
     ) -> crate::Result<Commit> {
-        Store::commit_ingress(self, identity, transaction)
+        // Let storage verify exact retry bytes even when no new data fits.
+        // A known key can only return its receipt or a conflict, never append.
+        if self
+            .store
+            .ingress_receipt(identity.source_id, identity.sequence)
+            .is_none()
+            && let Some(limits) = self.limits
+        {
+            limits.check(&self.store, &transaction)?;
+        }
+        self.store.commit_ingress(identity, transaction)
     }
 
     fn ingress_watermarks(&self, source_id: u128) -> IngressWatermarks {
-        Store::ingress_watermarks(self, source_id)
+        self.store.ingress_watermarks(source_id)
     }
 
     fn all_ingress_watermarks(&self) -> BTreeMap<u128, IngressWatermarks> {
-        Store::all_ingress_watermarks(self)
+        self.store.all_ingress_watermarks()
     }
 
     fn flush(&mut self) -> crate::Result<()> {
-        Store::flush(self)
+        self.store.flush()
     }
 
     fn close(mut self: Box<Self>) -> crate::Result<BTreeMap<u128, IngressWatermarks>> {
-        Store::flush(&mut self)?;
-        Ok(Store::all_ingress_watermarks(&self))
+        self.store.flush()?;
+        Ok(self.store.all_ingress_watermarks())
     }
 
     fn background_maintenance(
@@ -952,23 +1025,23 @@ impl WriterBackend for Store {
         now_micros: i64,
         config: &ShadowRuntimeConfig,
     ) -> crate::Result<()> {
-        Store::maintain(self, now_micros)?;
+        self.store.maintain(now_micros)?;
         if let Some(threshold) = config.seal_log_bytes_threshold
-            && self.database().stats()?.file_bytes > threshold
+            && self.store.database().stats()?.file_bytes > threshold
         {
-            Store::seal_and_reclaim(self)?;
+            self.store.seal_and_reclaim()?;
         }
         Ok(())
     }
 
     fn store_snapshot(&self) -> crate::Result<StoreOpsSnapshot> {
-        let stats = self.database().stats()?;
+        let stats = self.store.database().stats()?;
         Ok(StoreOpsSnapshot {
-            bytes: self.stored_bytes()?,
+            bytes: self.store.stored_bytes()?,
             points: stats.points,
             commits: stats.commits,
             recovered_tail_bytes: stats.recovered_tail_bytes,
-            durability: self.database().durability(),
+            durability: self.store.database().durability(),
             last_ack_durable: false,
         })
     }
@@ -1163,6 +1236,9 @@ fn process_write(
             refresh_store_snapshot(&**backend, shared, commit.durable);
             let mut health = lock(&shared.health);
             health.acknowledged += 1;
+            if !commit.deduplicated {
+                health.resource_limit = None;
+            }
             Ok(ShadowAck {
                 identity,
                 accepted_through: watermarks.accepted_through,
@@ -1175,6 +1251,9 @@ fn process_write(
             if !writer_error_requires_poison(&error) {
                 let mut health = lock(&shared.health);
                 health.failed += 1;
+                if let Error::ResourceLimit(reason) = &error {
+                    health.resource_limit = Some((*reason).to_owned());
+                }
                 return Err(ShadowWriteFailure::Rejected(error));
             }
             let cause = error.to_string();
@@ -1370,6 +1449,7 @@ fn health_snapshot(shared: &Shared) -> ShadowHealth {
         failed: health.failed,
         source_watermarks: health.source_watermarks.clone(),
         last_error: health.last_error.clone(),
+        resource_limit: health.resource_limit.clone(),
         database_bytes: health.store.bytes,
         database_points: health.store.points,
         database_commits: health.store.commits,

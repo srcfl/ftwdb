@@ -1,6 +1,6 @@
 [package]
 name = "ftwdb"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 edition = "2024"
 rust-version = "1.97"
 description = "Forecasts, Telemetry & Watts: an SD-card-conscious embedded energy database"
@@ -19,7 +19,7 @@ flate2 = "1.1.5"
 jiff = "0.2.34"
 libc = "0.2.187"
 lz4_flex = "0.14.0"
-postcard = { version = "1.1.3", features = ["use-std"] }
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 

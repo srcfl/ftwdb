@@ -54,3 +54,31 @@ Run the local regression check with:
 ```sh
 cargo test --test service_examples
 ```
+
+## Container
+
+Build with `docker build -t ftwdb-shadow .`. The image contains all three tools
+and runs as UID `100`, GID `101`. It uses `/var/lib/ftwdb-shadow` for data and
+`/run/ftwdb-shadow/shadow.sock` for its only listener. Prepare mounted directories
+with this owner and mode `0700`; a root-owned bind mount is not writable by the
+service. The FTW client must share UID `100` and the socket directory.
+
+The Core repository owns the opt-in Compose overlay. Run the sidecar with
+`network_mode: none`, a read-only root, separate writable data and socket
+mounts, no extra capabilities, and explicit CPU/memory limits. Keep its store
+separate from SQLite's data directory. Set the disk budget for that volume;
+a filesystem with less than the default free-space reserve will reject writes.
+
+Run `bash packaging/check-container.sh ftwdb-shadow` for a bounded start/stop
+check with no network and private temporary mounts. The script verifies the
+user, directory and socket modes, all three tools, and the clean exit code.
+It does not replace a test on the physical box.
+
+## Native archive
+
+Run `cargo build --release --locked --bins`, then
+`python3 packaging/build-archive.py --require-clean`. The script creates an
+archive under `dist/`, checks its extracted binaries, and writes a SHA-256
+file. The archive includes `SOURCE.json`, operational docs, and both service
+examples. CI builds Linux ARM64 and AMD64 from the same Debian 12 image and
+also builds a native macOS archive.

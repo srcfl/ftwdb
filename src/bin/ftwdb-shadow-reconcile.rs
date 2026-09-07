@@ -11,6 +11,10 @@ const MAX_HEX_FILE_BYTES: usize = shadow_protocol::MAX_FRAME_BYTES * 2 + 2;
 const MAX_TOTAL_FRAME_BYTES: usize = 256 * 1024 * 1024;
 
 fn main() -> ExitCode {
+    if env::args_os().len() == 2 && env::args_os().nth(1).as_deref() == Some("--version".as_ref()) {
+        println!("ftwdb-shadow-reconcile {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     match run(env::args().skip(1)) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::from(3),

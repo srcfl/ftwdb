@@ -47,6 +47,10 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 TasksMax=64
 LimitNOFILE=1024
+MemoryMax=512M
+CPUQuota=50%
+Nice=10
+IOSchedulingClass=idle
 
 [Install]
 WantedBy=multi-user.target

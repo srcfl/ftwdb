@@ -520,6 +520,7 @@ fn handle_health(
         .copied()
         .unwrap_or_default();
     let status = match health.state {
+        ShadowRuntimeState::Running if health.resource_limit.is_some() => HealthStatus::Degraded,
         ShadowRuntimeState::Running => HealthStatus::Healthy,
         ShadowRuntimeState::Closing => HealthStatus::Degraded,
         ShadowRuntimeState::Poisoned | ShadowRuntimeState::Closed => HealthStatus::Unavailable,
@@ -574,6 +575,11 @@ fn map_write_failure(error: ShadowWriteFailure) -> WireMessage {
 
 fn map_store_error(error: &Error) -> WireMessage {
     match error {
+        Error::ResourceLimit(reason) => WireMessage::Response(Response::Error(ErrorResponse {
+            code: ErrorCode::Overloaded,
+            retryable: true,
+            message: (*reason).to_owned(),
+        })),
         Error::IngressSourceSequenceConflict { .. } | Error::IngressCommitIdConflict { .. } => {
             stable_error(ErrorCode::IdempotencyConflict, false)
         }

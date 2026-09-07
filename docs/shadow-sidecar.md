@@ -105,6 +105,45 @@ Measure these values on the target box for each policy:
 Do not enable raw deletion until immutable raw segments, rollups, manifests,
 and restore tests prove that all required data remains available.
 
+## Bounded collection in the FTW beta
+
+The current candidate copies live history alongside SQLite/Parquet. It is an
+opt-in experiment, not complete replication: client restart, a full queue, or
+a long sidecar outage can leave gaps. The client must report those gaps. It
+must not claim that historical corrections, deletes, forecasts, or config are
+covered merely because the sidecar accepts those record types.
+
+The command has two positive byte-count settings:
+
+| Setting | Default | Effect |
+|---|---:|---|
+| `FTWDB_SHADOW_MAX_STORE_BYTES` | 536870912 (512 MiB) | Reject a new frame if it would exceed the store limit. |
+| `FTWDB_SHADOW_MIN_FREE_BYTES` | 536870912 (512 MiB) | Keep this much free space, measured with the service user's available blocks, after the frame. |
+
+Invalid settings stop startup. A write that reaches either limit gets the
+existing retryable `Overloaded` response with a fixed reason. Health becomes
+`Degraded`; accepted and durable watermarks do not advance. Exact retries of
+already stored data still receive their durable receipt, including after
+restart. A changed retry still conflicts. After freeing disk space or raising the budget, restart the sidecar to
+resume new writes.
+
+The bounded writer requires a store with no active rollups and runs without
+background maintenance, sealing, or retention. That keeps the size check on
+the only append path. `FTWDB_SHADOW_MAINTAIN_SECS` is no longer accepted by the
+command. Use a fresh dedicated shadow store. Keep offline maintenance work on
+a copy until its peak disk use has a tested budget.
+
+This check does not reserve filesystem blocks against other processes. Keep
+SQLite's own disk alerts, monitor memory and CPU, and set service/container
+limits. Do not treat a shared filesystem as full isolation. The systemd
+example caps memory at 512 MiB and CPU at half a core. Those are evaluation
+limits, not measured target-box requirements.
+
+On rollback, stop the sidecar and source copy, retain the current store, and
+use a verified snapshot from before the upgrade or a new empty shadow store.
+Do not open the upgraded store with the old alpha binary. Do not change the
+SQLite/Parquet paths during this drill.
+
 ## Local access
 
 The service creates or checks a store root owned by its effective user with
@@ -162,7 +201,7 @@ content but cannot claim that a prior writer synced a receipt.
 check offline against exact v1 commit frames and writes one stable JSON summary.
 Stop the sidecar first: the read-only opener takes the store's shared lock and
 will not bypass its active writer.
-means the command completed and found a content mismatch; a read or input error
+Exit code `3` means the command completed and found a content mismatch; a read or input error
 uses exit code `2`. The JSON states that a read-only run has no durability
 proof, so pair it with the sidecar's live durable watermark.
 Each input must be a regular hex file no larger than one encoded protocol

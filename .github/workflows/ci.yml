@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -27,8 +27,63 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features --locked --offline -- -D warnings
       - run: cargo test --all-targets --all-features --locked --offline
+      - run: cargo test --doc --all-features --locked --offline
+      - name: Process crash recovery
+        env:
+          FTWDB_POWER_CUT_ITERATIONS: 32
+          FTWDB_POWER_CUT_SEED: 20260907
+        run: cargo test --test power_cut --locked --offline always_recovers_every_acknowledged_batch_after_sigkill -- --ignored
       # The privileged Linux NBD smoke script stays outside this portable job.
       - run: cargo build --manifest-path bench/sd-card-emulator/Cargo.toml --all-targets --locked --offline
       - run: cargo fmt --manifest-path bench/sd-card-emulator/Cargo.toml -- --check
       - run: cargo clippy --manifest-path bench/sd-card-emulator/Cargo.toml --all-targets --locked --offline -- -D warnings
       - run: cargo test --manifest-path bench/sd-card-emulator/Cargo.toml --all-targets --locked --offline
+
+  packages:
+    uses: ./.github/workflows/packages.yml
+
+  dependencies:
+    name: Dependency advisories
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: 1.97.1
+      - run: cargo install cargo-audit --locked --version 0.22.2
+      - run: cargo audit --deny warnings
+      - run: cargo audit --deny warnings --file bench/sd-card-emulator/Cargo.lock
+
+  storage-faults:
+    name: Linux filesystem faults
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: 1.97.1
+      - name: Run the ext4 fault and recovery checks on a test NBD device
+        run: |
+          set -euo pipefail
+          sudo modprobe nbd nbds_max=1
+          test ! -e /sys/block/nbd0/pid
+          for scenario in smoke full-disk mid-commit; do
+            sudo env "PATH=$PATH" "CARGO_HOME=$HOME/.cargo" "RUSTUP_HOME=$HOME/.rustup" \
+              "FTW_NBD_OUTPUT=$PWD/bench-results/linux-nbd-smoke" \
+              "FTW_NBD_FULL_OUTPUT=$PWD/bench-results/linux-nbd-full-disk" \
+              "FTW_NBD_MID_OUTPUT=$PWD/bench-results/linux-nbd-mid-commit" \
+              bash "bench/sd-card-emulator/linux-$scenario.sh"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: linux-filesystem-faults
+          path: |
+            bench-results/**/*.json
+            bench-results/**/*.jsonl
+            bench-results/**/*.txt
+            bench-results/**/*.log
+          if-no-files-found: warn
+          retention-days: 14

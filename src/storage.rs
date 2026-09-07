@@ -3029,6 +3029,11 @@ fn encode_transaction(transaction: &Transaction) -> Result<Vec<u8>> {
     Ok(payload)
 }
 
+pub(crate) fn ingress_frame_bytes(transaction: &Transaction) -> Result<u64> {
+    let payload = encode_canonical_transaction(transaction)?;
+    Ok((FRAME_HEADER_BYTES + INGRESS_IDENTITY_BYTES + payload.len()) as u64)
+}
+
 fn encode_canonical_transaction(transaction: &Transaction) -> Result<Vec<u8>> {
     let record_count = u32::try_from(transaction.record_count())
         .map_err(|_| Error::Serialization("too many transaction records".to_owned()))?;

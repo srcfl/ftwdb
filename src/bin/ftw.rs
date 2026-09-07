@@ -37,6 +37,10 @@ impl From<std::io::Error> for CliError {
 
 fn main() -> ExitCode {
     let arguments: Vec<_> = env::args().collect();
+    if arguments.len() == 2 && arguments[1] == "--version" {
+        println!("ftw {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     let result = match arguments.get(1).map(String::as_str) {
         Some("inspect") => inspect(&arguments[2..]),
         Some("check-store") => check_store(&arguments[2..]),

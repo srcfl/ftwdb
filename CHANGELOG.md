@@ -6,7 +6,20 @@ steps in [docs/releases.md](docs/releases.md).
 
 ## [Unreleased]
 
+## [0.1.0-alpha.2]
+
+Candidate for bounded shadow collection alongside FTW beta. Not yet published.
+
 ### Added
+
+- A 512 MiB sidecar store limit and a 512 MiB free-disk reserve reject new
+  writes before append. Exact stored retries still work at either limit;
+  health reports degraded state and the client receives a retryable error.
+- Native Linux ARM64 and AMD64 archives now include all three tools, private
+  service examples, recovery docs, source identity, and per-binary checksums.
+- A Debian 12 container runs as UID 100 and GID 101 with only a Unix socket.
+- CI runs native ARM64 tests, container and archive checks, process crashes,
+  and Linux ext4/NBD full-disk and mid-commit recovery checks.
 
 - Sealed raw segments are published through the store manifest and used on the
   query path. `Store::seal_and_reclaim` rewrites `active.wlog` to catalog,
@@ -34,7 +47,22 @@ steps in [docs/releases.md](docs/releases.md).
 - A clean client EOF at a frame boundary no longer raises the sidecar's client
   error count; partial frames still do.
 
+### Limits of this candidate
+
+- Collection keeps SQLite/Parquet authoritative and is opt-in. The sidecar
+  does not establish complete replication or serve production reads.
+- Bounded collection runs without automatic rollups, sealing, or retention.
+  It stops at its storage limit. Preserve or replace its store as an operator
+  action; do not delete the current store while the sidecar runs.
+- Physical SD-card power cuts, target-box soak, resource measurements, and an
+  off-card backup/restore drill still gate a standalone FTWDB beta release.
+- Older binaries cannot open the new ingress or reclaimed receipt format.
+  Rollback needs a pre-upgrade snapshot or a fresh disposable shadow store.
+
 ### Fixed
+
+- Postcard no longer enables an unused embedded heapless backend, removing
+  the archived atomic-polyfill dependency from the lockfile.
 
 - Release publication now reads notes from the annotated tag through a file,
   which works with an explicit GitHub repository target.

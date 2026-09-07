@@ -19,6 +19,8 @@ pub enum Error {
         maximum: usize,
     },
     InvalidConfig(&'static str),
+    /// A shadow write would exceed its storage budget. No write took place.
+    ResourceLimit(&'static str),
     /// A caller-supplied argument violates a documented API precondition,
     /// such as a non-positive rollup resolution or out-of-order aggregate
     /// samples. Unlike `InvalidConfig`, which rejects a durable handle or
@@ -75,6 +77,7 @@ impl fmt::Display for Error {
                 write!(f, "batch has {points} points; maximum is {maximum}")
             }
             Self::InvalidConfig(reason) => write!(f, "invalid configuration: {reason}"),
+            Self::ResourceLimit(reason) => write!(f, "shadow storage limit: {reason}"),
             Self::InvalidArgument(reason) => write!(f, "invalid argument: {reason}"),
             Self::InvalidModel(reason) => write!(f, "invalid energy model: {reason}"),
             Self::Serialization(reason) => write!(f, "serialization error: {reason}"),

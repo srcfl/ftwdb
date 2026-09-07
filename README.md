@@ -33,6 +33,10 @@ This repository currently contains the first executable storage slice:
 - a draft, bounded Go-portable shadow protocol and local Unix sidecar;
 - tests, property tests, Criterion benchmarks, and a competitor benchmark plan.
 
+The current source prepares `0.1.0-alpha.2` for bounded, opt-in shadow
+collection alongside the FTW beta. SQLite/Parquet remain authoritative. See
+[collection limits and rollback](docs/shadow-sidecar.md#bounded-collection-in-the-ftw-beta).
+
 It is **not production-ready**. The active log still rebuilds an in-memory read
 index, and real SD-card power-cut evidence has not yet been collected. Writable
 stores can seal live raw into immutable segments, reclaim the active log, and

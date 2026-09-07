@@ -1,4 +1,5 @@
-use ftwdb::shadow_runtime::{ShadowRuntime, ShadowRuntimeConfig};
+use ftwdb::shadow_protocol::MAX_BATCH_POINTS;
+use ftwdb::shadow_runtime::{ShadowRuntime, ShadowRuntimeConfig, ShadowStorageLimits};
 use ftwdb::shadow_server::{ShadowServerConfig, ShadowStopToken, serve};
 use ftwdb::{Config, Durability, Store};
 use std::env;
@@ -15,6 +16,10 @@ use std::time::Duration;
 static TERMINATION_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 fn main() {
+    if env::args_os().len() == 2 && env::args_os().nth(1).as_deref() == Some("--version".as_ref()) {
+        println!("ftwdb-shadow {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if let Err(error) = run() {
         eprintln!("ftwdb-shadow: {error}");
         std::process::exit(1);
@@ -33,14 +38,33 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Err(usage().into());
     }
 
+    let limits = ShadowStorageLimits {
+        max_store_bytes: limit_from_env("FTWDB_SHADOW_MAX_STORE_BYTES", 512 * 1024 * 1024)?,
+        minimum_free_bytes: limit_from_env("FTWDB_SHADOW_MIN_FREE_BYTES", 512 * 1024 * 1024)?,
+    };
+    if env::var_os("FTWDB_SHADOW_MAINTAIN_SECS").is_some() {
+        return Err("bounded shadow collection does not run background maintenance; remove FTWDB_SHADOW_MAINTAIN_SECS".into());
+    }
     let stop = ShadowStopToken::new();
     let _signals = TerminationSignals::install(stop.clone())?;
     let store_path = PathBuf::from(store_path);
     prepare_private_store_root(&store_path)?;
+    // Bound active-log replay before allocating its in-memory index. A lower
+    // limit needs an operator decision about the existing evaluation store.
+    match fs::symlink_metadata(store_path.join("active.wlog")) {
+        Ok(metadata) if metadata.len() > limits.max_store_bytes => {
+            return Err("existing active log exceeds FTWDB_SHADOW_MAX_STORE_BYTES".into());
+        }
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
+    }
     let store = Store::open_with(
         store_path,
         Config {
             durability: Durability::Always,
+            max_batch_points: MAX_BATCH_POINTS,
+            // The wire codec bounds input frames separately. Keep the storage
+            // limit: its canonical encoding differs from the wire encoding.
             ..Config::default()
         },
     )?;
@@ -49,11 +73,17 @@ fn run() -> Result<(), Box<dyn Error>> {
         ShadowRuntimeConfig {
             queue_capacity: 8,
             max_queued_points: 32_768,
-            maintenance_interval: Some(Duration::from_secs(shadow_maintain_secs())),
+            storage_limits: Some(limits),
             ..ShadowRuntimeConfig::default()
         },
     )?;
     let submitter = runtime.submitter();
+    eprintln!(
+        "ftwdb-shadow: version={} max_store_bytes={} minimum_free_bytes={} maintenance=off",
+        env!("CARGO_PKG_VERSION"),
+        limits.max_store_bytes,
+        limits.minimum_free_bytes
+    );
     let server_config = ShadowServerConfig::new(PathBuf::from(socket_path));
     let result = serve(&server_config, submitter, &stop);
     let shutdown = runtime.shutdown();
@@ -172,11 +202,16 @@ fn usage() -> &'static str {
     "usage: ftwdb-shadow <store-directory> <socket-path>"
 }
 
-fn shadow_maintain_secs() -> u64 {
-    env::var("FTWDB_SHADOW_MAINTAIN_SECS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(300)
+fn limit_from_env(name: &str, default: u64) -> Result<u64, Box<dyn Error>> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| format!("{name} must be a positive byte count").into()),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn prepare_private_store_root(path: &Path) -> io::Result<()> {
