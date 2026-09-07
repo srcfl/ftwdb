@@ -10,7 +10,7 @@ if [[ -e "$out" ]] && find "$out" -mindepth 1 -print -quit | grep -q .; then
 fi
 linux_nbd_prepare
 trap linux_nbd_cleanup EXIT
-linux_nbd_start bench/sd-card-emulator/profiles/healthy.json 42
+linux_nbd_start "${FTW_NBD_PROFILE:-bench/sd-card-emulator/profiles/healthy.json}" 42
 linux_nbd_connect
 mkfs.ext4 -q -F /dev/nbd0
 linux_nbd_mount

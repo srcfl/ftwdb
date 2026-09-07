@@ -28,6 +28,7 @@ jobs:
       - run: cargo clippy --all-targets --all-features --locked --offline -- -D warnings
       - run: cargo test --all-targets --all-features --locked --offline
       - run: cargo test --doc --all-features --locked --offline
+      - run: cargo run --locked --offline -- --version
       - name: Process crash recovery
         env:
           FTWDB_POWER_CUT_ITERATIONS: 32
@@ -67,6 +68,18 @@ jobs:
       - name: Run the ext4 fault and recovery checks on a test NBD device
         run: |
           set -euo pipefail
+          # Keep the healthy card's cache/power-loss model and full workload.
+          # Artificial timing belongs in SD performance runs, not this gate.
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          profiles = Path("bench/sd-card-emulator/profiles")
+          card = json.loads((profiles / "healthy.json").read_text())
+          fast = json.loads((profiles / "full-disk-64m.json").read_text())
+          card.update(name="ci-durability", read=fast["read"], write=fast["write"])
+          Path("bench-results").mkdir(exist_ok=True)
+          Path("bench-results/ci-profile.json").write_text(json.dumps(card, indent=2))
+          PY
           sudo modprobe nbd nbds_max=1
           test ! -e /sys/block/nbd0/pid
           for scenario in smoke full-disk mid-commit; do
@@ -74,6 +87,8 @@ jobs:
               "FTW_NBD_OUTPUT=$PWD/bench-results/linux-nbd-smoke" \
               "FTW_NBD_FULL_OUTPUT=$PWD/bench-results/linux-nbd-full-disk" \
               "FTW_NBD_MID_OUTPUT=$PWD/bench-results/linux-nbd-mid-commit" \
+              "FTW_NBD_PROFILE=$PWD/bench-results/ci-profile.json" \
+              "FTW_SD_EMULATOR_COMMIT=$GITHUB_SHA" \
               bash "bench/sd-card-emulator/linux-$scenario.sh"
           done
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

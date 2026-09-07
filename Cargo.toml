@@ -1,5 +1,6 @@
 [package]
 name = "ftwdb"
+default-run = "ftw"
 version = "0.1.0-alpha.2"
 edition = "2024"
 rust-version = "1.97"

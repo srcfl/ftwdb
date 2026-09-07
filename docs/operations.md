@@ -58,7 +58,8 @@ the link error kind. If both fail, the returned I/O error keeps the copy error
 kind and its text and source also include the hard-link failure.
 
 This is a local consistent snapshot, not yet a remote backup policy. Encryption,
-incremental upload, retention, and salvage of a corrupted source remain open.
+incremental upload and remote retention remain open. A damaged source uses the
+separate [strict salvage](#strict-salvage) path below.
 
 ## Scheduled snapshot runbook
 

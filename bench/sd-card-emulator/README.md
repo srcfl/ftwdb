@@ -4,6 +4,12 @@ This standalone Rust crate exposes a sparse file as an NBD block device. Put a
 real Linux filesystem on `/dev/nbd0`, then run FTWDB on that filesystem. This
 keeps the filesystem, page cache, block layer, and database in the test path.
 
+CI uses the full workload and the healthy card's cache and power-loss settings,
+with fast read/write timing from the full-disk profile. It checks filesystem
+faults and recovery, not SD latency. The generated profile travels with the CI
+evidence. Local scripts keep the slow healthy profile unless `FTW_NBD_PROFILE`
+selects another profile; use those runs for the separate timing experiment.
+
 The model can inject:
 
 - read and write bandwidth and IOPS limits;
