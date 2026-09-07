@@ -10,7 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAGIC: &[u8; 8] = b"WMAN0001";
 const VERSION_V1: u16 = 1;
-const VERSION: u16 = 2;
+const VERSION_V2: u16 = 2;
+const VERSION: u16 = 3;
 const HEADER_BYTES: usize = 24;
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 const PREFIX: &str = "MANIFEST.";
@@ -49,6 +50,7 @@ pub struct RawSegmentDescriptor {
     pub source_points: u64,
     pub min_valid_time: i64,
     pub max_valid_time: i64,
+    pub content_crc32: u32,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -65,6 +67,27 @@ struct ManifestV1 {
     rollups: Vec<RollupDescriptor>,
 }
 
+// Version 2 was an unpublished development format. Its raw descriptors did
+// not bind file contents. Accept its empty segment list, but do not silently
+// accept old sealed files by computing a checksum from whatever is there now.
+#[derive(Deserialize)]
+struct ManifestV2 {
+    generation: u64,
+    rollups: Vec<RollupDescriptor>,
+    segments: Vec<RawSegmentDescriptorV2>,
+}
+
+#[derive(Deserialize)]
+struct RawSegmentDescriptorV2 {
+    _file: String,
+    _generation: u64,
+    _points: u64,
+    _source_commit: u64,
+    _source_points: u64,
+    _min_valid_time: i64,
+    _max_valid_time: i64,
+}
+
 impl Manifest {
     pub fn load(directory: &Path) -> Result<Self> {
         let candidates = generation_candidates(directory)?;
@@ -76,6 +99,7 @@ impl Manifest {
         for (generation, path) in candidates {
             match read_manifest(&path, generation) {
                 Ok(manifest) => return Ok(manifest),
+                Err(error @ Error::InvalidConfig(_)) => return Err(error),
                 Err(error) => last_error = Some(error),
             }
         }
@@ -231,7 +255,7 @@ fn read_manifest(path: &Path, expected_generation: u64) -> Result<Manifest> {
         return corruption("invalid manifest magic");
     }
     let version = u16::from_le_bytes(header[8..10].try_into().unwrap());
-    if version != VERSION && version != VERSION_V1 {
+    if version != VERSION && version != VERSION_V1 && version != VERSION_V2 {
         return corruption("unsupported manifest version");
     }
     if hash(&header[..20]) != u32::from_le_bytes(header[20..24].try_into().unwrap()) {
@@ -249,11 +273,13 @@ fn read_manifest(path: &Path, expected_generation: u64) -> Result<Manifest> {
     if hash(&payload) != u32::from_le_bytes(header[16..20].try_into().unwrap()) {
         return corruption("manifest payload checksum mismatch");
     }
-    let manifest =
-        decode_manifest_payload(&payload, version).map_err(|error| Error::Corruption {
+    let manifest = decode_manifest_payload(&payload, version).map_err(|error| match error {
+        Error::InvalidConfig(_) => error,
+        _ => Error::Corruption {
             offset: 0,
             reason: format!("manifest payload is invalid: {error}"),
-        })?;
+        },
+    })?;
     if manifest.generation != expected_generation {
         return corruption("manifest generation does not match its filename");
     }
@@ -268,6 +294,20 @@ fn decode_manifest_payload(payload: &[u8], version: u16) -> Result<Manifest> {
     if version == VERSION_V1 {
         let parsed: ManifestV1 = postcard::from_bytes(payload)
             .map_err(|error| Error::Serialization(format!("manifest decode failed: {error}")))?;
+        return Ok(Manifest {
+            generation: parsed.generation,
+            rollups: parsed.rollups,
+            segments: Vec::new(),
+        });
+    }
+    if version == VERSION_V2 {
+        let parsed: ManifestV2 = postcard::from_bytes(payload)
+            .map_err(|error| Error::Serialization(format!("manifest decode failed: {error}")))?;
+        if !parsed.segments.is_empty() {
+            return Err(Error::InvalidConfig(
+                "development v2 raw segments lack a content checksum; restore a pre-seal snapshot or use a fresh shadow store",
+            ));
+        }
         return Ok(Manifest {
             generation: parsed.generation,
             rollups: parsed.rollups,
@@ -394,6 +434,7 @@ mod tests {
             source_points,
             min_valid_time: 0,
             max_valid_time: 1,
+            content_crc32: 0,
         }
     }
 
@@ -417,6 +458,56 @@ mod tests {
         let mut wrong_total = value;
         wrong_total.segments[1].source_points = 4;
         assert!(validate_manifest(&wrong_total).is_err());
+    }
+
+    #[test]
+    fn legacy_rollup_manifests_load_but_unbound_development_segments_do_not_fall_back() {
+        fn write_legacy(directory: &std::path::Path, version: u16, payload: &[u8]) {
+            let mut header = [0_u8; super::HEADER_BYTES];
+            header[..8].copy_from_slice(super::MAGIC);
+            header[8..10].copy_from_slice(&version.to_le_bytes());
+            header[12..16].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+            header[16..20].copy_from_slice(&crc32fast::hash(payload).to_le_bytes());
+            let crc = crc32fast::hash(&header[..20]);
+            header[20..24].copy_from_slice(&crc.to_le_bytes());
+            std::fs::write(
+                directory.join("MANIFEST.00000000000000000002"),
+                [header.as_slice(), payload].concat(),
+            )
+            .unwrap();
+        }
+        let directory = tempdir().unwrap();
+        manifest(1).publish(directory.path()).unwrap();
+        let expected = manifest(2);
+        let v1 = postcard::to_stdvec(&(expected.generation, &expected.rollups)).unwrap();
+        write_legacy(directory.path(), super::VERSION_V1, &v1);
+        assert_eq!(Manifest::load(directory.path()).unwrap(), expected);
+        let v2 = postcard::to_stdvec(&(expected.generation, &expected.rollups, Vec::<u8>::new()))
+            .unwrap();
+        write_legacy(directory.path(), super::VERSION_V2, &v2);
+        assert_eq!(Manifest::load(directory.path()).unwrap(), expected);
+        let unbound = postcard::to_stdvec(&(
+            expected.generation,
+            &expected.rollups,
+            vec![("old.wseg", 2_u64, 1_u64, 1_u64, 1_u64, 0_i64, 0_i64)],
+        ))
+        .unwrap();
+        write_legacy(directory.path(), super::VERSION_V2, &unbound);
+        assert!(
+            matches!(Manifest::load(directory.path()), Err(crate::Error::InvalidConfig(reason))
+            if reason.contains("lack a content checksum"))
+        );
+    }
+
+    #[test]
+    fn raw_content_checksum_survives_manifest_publication() {
+        let directory = tempdir().unwrap();
+        let mut expected = manifest(2);
+        let mut segment = raw_segment("bound.wseg", 2, 5, 5);
+        segment.content_crc32 = 0x5ce0_1357;
+        expected.segments.push(segment);
+        expected.publish(directory.path()).unwrap();
+        assert_eq!(Manifest::load(directory.path()).unwrap(), expected);
     }
 
     #[test]

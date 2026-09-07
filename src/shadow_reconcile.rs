@@ -8,7 +8,7 @@
 //! one-way because catalog records do not retain an ingress source ID.
 //!
 //! This module does not decode another export format and does not write to the
-//! database. It uses only in-memory indexes rebuilt from checked log frames.
+//! database. It reads the live index and bounded blocks from sealed segments.
 
 use crate::shadow_protocol::CommitBatchRequest;
 use crate::{Database, IngressIdentity, Point};
@@ -495,36 +495,42 @@ fn reconcile_points(
 
     let mut observed_counts = BTreeMap::<ShadowPointKey, usize>::new();
     for (series_id, span) in spans {
-        let series_points = database.query_history(series_id, span.start, span.end)?;
-        report.scanned_points = report
-            .scanned_points
-            .checked_add(series_points.len())
-            .ok_or(ShadowReconcileError::LimitExceeded {
-                limit: ReconcileLimit::ScannedPoints,
-                maximum: limits.max_scanned_points,
-            })?;
-        check_limit(
-            report.scanned_points,
-            limits.max_scanned_points,
-            ReconcileLimit::ScannedPoints,
+        database.visit_history(
+            series_id,
+            span.start,
+            span.end,
+            |count| {
+                report.scanned_points = report.scanned_points.checked_add(count).ok_or(
+                    ShadowReconcileError::LimitExceeded {
+                        limit: ReconcileLimit::ScannedPoints,
+                        maximum: limits.max_scanned_points,
+                    },
+                )?;
+                check_limit(
+                    report.scanned_points,
+                    limits.max_scanned_points,
+                    ReconcileLimit::ScannedPoints,
+                )
+            },
+            |point| {
+                report.observed_points = report.observed_points.checked_add(1).ok_or(
+                    ShadowReconcileError::LimitExceeded {
+                        limit: ReconcileLimit::ObservedPoints,
+                        maximum: limits.max_observed_points,
+                    },
+                )?;
+                check_limit(
+                    report.observed_points,
+                    limits.max_observed_points,
+                    ReconcileLimit::ObservedPoints,
+                )?;
+                observed_counts
+                    .entry(point.into())
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+                Ok(())
+            },
         )?;
-        for point in series_points {
-            report.observed_points = report.observed_points.checked_add(1).ok_or(
-                ShadowReconcileError::LimitExceeded {
-                    limit: ReconcileLimit::ObservedPoints,
-                    maximum: limits.max_observed_points,
-                },
-            )?;
-            check_limit(
-                report.observed_points,
-                limits.max_observed_points,
-                ReconcileLimit::ObservedPoints,
-            )?;
-            observed_counts
-                .entry(point.into())
-                .and_modify(|count| *count += 1)
-                .or_insert(1);
-        }
     }
 
     let keys: BTreeSet<_> = expected_counts
@@ -795,6 +801,128 @@ mod tests {
         assert!(report.content_matches());
         assert_eq!(report.nondurable_receipts, 1);
         assert!(!report.ready_to_release_source_copy());
+    }
+
+    #[test]
+    fn scan_limit_counts_filtered_block_points_and_spans_seals_and_live_tail() {
+        let directory = tempdir().unwrap();
+        let mut store = crate::Store::open(directory.path()).unwrap();
+        let expected = batch(1.0);
+        store
+            .commit_ingress(
+                IngressIdentity::new(expected.source_id, expected.sequence, expected.commit_id),
+                transaction(&expected),
+            )
+            .unwrap();
+        let outside = [Point::actual(2, 0, 0.0), Point::actual(2, 8, 8.0)];
+        let mut transaction = crate::Transaction::new();
+        transaction.append_points(outside.to_vec());
+        store.commit(transaction).unwrap();
+        store.seal_and_reclaim().unwrap();
+        // Only the expected point falls in the comparison window. All three
+        // block entries must still count against the decode budget.
+        let check = |store: &crate::Store, maximum| {
+            reconcile_shadow_batches(
+                store.database(),
+                std::slice::from_ref(&expected),
+                ShadowReconcileLimits {
+                    max_scanned_points: maximum,
+                    ..ShadowReconcileLimits::default()
+                },
+            )
+        };
+        assert!(matches!(
+            check(&store, 2),
+            Err(ShadowReconcileError::LimitExceeded {
+                limit: ReconcileLimit::ScannedPoints,
+                maximum: 2,
+            })
+        ));
+        let report = check(&store, 3).unwrap();
+        assert_eq!(report.scanned_points, 3);
+        assert_eq!(report.observed_points, 1);
+        assert!(report.content_matches());
+
+        for seal in [true, false] {
+            let mut extra = crate::Transaction::new();
+            extra.append_points(vec![expected.points[0]]);
+            store.commit(extra).unwrap();
+            if seal {
+                store.seal_and_reclaim().unwrap();
+            }
+        }
+        assert!(matches!(
+            check(&store, 4),
+            Err(ShadowReconcileError::LimitExceeded {
+                limit: ReconcileLimit::ScannedPoints,
+                maximum: 4,
+            })
+        ));
+        let report = check(&store, 5).unwrap();
+        assert_eq!(report.scanned_points, 5);
+        assert_eq!(report.observed_points, 3);
+        assert_eq!(report.unexpected_points, 2);
+        assert!(matches!(
+            reconcile_shadow_batches(
+                store.database(),
+                &[expected],
+                ShadowReconcileLimits {
+                    max_observed_points: 1,
+                    ..ShadowReconcileLimits::default()
+                }
+            ),
+            Err(ShadowReconcileError::LimitExceeded {
+                limit: ReconcileLimit::ObservedPoints,
+                maximum: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn scan_limit_rejects_before_reading_an_oversize_block() {
+        use std::os::unix::fs::FileExt;
+        let directory = tempdir().unwrap();
+        let mut database = Database::open(directory.path().join("raw.wlog")).unwrap();
+        let expected = batch(1.0);
+        database
+            .commit_ingress(
+                IngressIdentity::new(expected.source_id, expected.sequence, expected.commit_id),
+                transaction(&expected),
+            )
+            .unwrap();
+        let segment_path = directory.path().join("raw.wseg");
+        crate::Segment::create(
+            &segment_path,
+            &[expected.points[0], Point::actual(2, 8, 8.0)],
+            2,
+        )
+        .unwrap();
+        let segment = crate::Segment::open(&segment_path).unwrap();
+        let offset = segment.first_block_payload_offset().unwrap();
+        database.attach_sealed_segments(vec![segment]);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&segment_path)
+            .unwrap();
+        file.write_all_at(&[0xff], offset).unwrap();
+        assert!(matches!(
+            reconcile_shadow_batches(
+                &database,
+                std::slice::from_ref(&expected),
+                ShadowReconcileLimits {
+                    max_scanned_points: 1,
+                    ..ShadowReconcileLimits::default()
+                }
+            ),
+            Err(ShadowReconcileError::LimitExceeded {
+                limit: ReconcileLimit::ScannedPoints,
+                maximum: 1
+            })
+        ));
+        assert!(matches!(
+            reconcile_shadow_batches(&database, &[expected], ShadowReconcileLimits::default()),
+            Err(ShadowReconcileError::Store(crate::Error::Corruption { .. }))
+        ));
     }
 
     #[test]

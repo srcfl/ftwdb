@@ -52,8 +52,8 @@ database/
 This is the current directory shape. Immutable raw segments are published
 through the same manifest generations as rollups. After `seal_and_reclaim`,
 `active.wlog` holds catalog records, identity receipts, and the unsealed tail.
-Open replays only that tail; older raw points are read from sealed segment
-files.
+Open replays only that tail and streams sealed files to verify their manifest
+checksums; it decodes older raw points from segments only when a query needs them.
 
 ## Write path
 

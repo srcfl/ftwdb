@@ -61,6 +61,14 @@ Candidate for bounded shadow collection alongside FTW beta. Not yet published.
 
 ### Fixed
 
+- Reconciliation charges full overlapping blocks before decoding and stops at
+  its scan/output limits across sealed history and the live tail.
+- Manifest v3 binds sealed raw file contents, counts, and time bounds. Open,
+  integrity checks, and salvage reject valid but unrelated replacements.
+  Open streams all sealed bytes for verification. Published alpha.1 stores
+  still load; unpublished v2 stores with sealed raw segments need a pre-seal
+  snapshot or a fresh shadow store.
+
 - Postcard no longer enables an unused embedded heapless backend, removing
   the archived atomic-polyfill dependency from the lockfile.
 

@@ -187,6 +187,31 @@ impl Segment {
         self.stats
     }
 
+    /// Checks the exact open file with a fixed-size buffer. This detects a
+    /// valid but unrelated segment copied over a manifest's named file.
+    pub(crate) fn content_crc32(&self) -> Result<u32> {
+        let mut hasher = crc32fast::Hasher::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut offset = 0;
+        while offset < self.stats.stored_bytes {
+            let read = (self.stats.stored_bytes - offset).min(buffer.len() as u64) as usize;
+            self.file.read_exact_at(&mut buffer[..read], offset)?;
+            hasher.update(&buffer[..read]);
+            offset += read as u64;
+        }
+        if self.file.metadata()?.len() != self.stats.stored_bytes {
+            return corruption(0, "segment length changed after open");
+        }
+        Ok(hasher.finalize())
+    }
+
+    pub(crate) fn valid_bounds(&self) -> Option<(i64, i64)> {
+        Some((
+            self.index.iter().map(|entry| entry.min_time).min()?,
+            self.index.iter().map(|entry| entry.max_time).max()?,
+        ))
+    }
+
     /// Reads and checksums every indexed block. Used by integrity checks and
     /// salvage so a corrupt payload cannot pass as healthy coverage.
     pub fn verify_blocks(&self) -> Result<()> {
@@ -223,6 +248,33 @@ impl Segment {
             );
         }
         Ok(result)
+    }
+
+    /// Reserve the full decoded block count before reading it, then visit
+    /// matches one at a time. Callers can bound both decoding and output.
+    pub(crate) fn visit_query<E: From<Error>>(
+        &self,
+        series_id: u64,
+        start: i64,
+        end: i64,
+        reserve: &mut impl FnMut(usize) -> std::result::Result<(), E>,
+        visit: &mut impl FnMut(Point) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        let first = self.index.partition_point(|entry| {
+            entry.series_id < series_id || (entry.series_id == series_id && entry.max_time < start)
+        });
+        for entry in self.index[first..]
+            .iter()
+            .take_while(|entry| entry.series_id == series_id && entry.min_time < end)
+        {
+            reserve(entry.points as usize)?;
+            for point in read_block(&self.file, *entry)? {
+                if point.valid_time >= start && point.valid_time < end {
+                    visit(point)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Inclusive valid-time bounds for one series, from the sparse index.
@@ -740,9 +792,13 @@ fn validate_index(index: &[IndexEntry], index_offset: u64, point_count: u64) -> 
             );
         }
         if let Some(previous) = previous
-            && (entry.series_id, entry.min_time) < (previous.series_id, previous.min_time)
+            && ((entry.series_id, entry.min_time) < (previous.series_id, previous.min_time)
+                || (entry.series_id == previous.series_id && entry.min_time < previous.max_time))
         {
-            return corruption(index_offset, "segment index is not sorted");
+            return corruption(
+                index_offset,
+                "segment index is not sorted or has overlapping blocks",
+            );
         }
         indexed_points += u64::from(entry.points);
         expected_offset = entry.offset + u64::from(entry.length);

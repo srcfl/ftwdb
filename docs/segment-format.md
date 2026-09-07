@@ -16,13 +16,38 @@ segment names are never overwritten.
 
 The segment header contains magic/version, block and point counts, index bounds,
 and a header CRC32. The index has its own CRC32 and must exactly cover every
-block byte in sorted `(series_id, min_valid_time)` order.
+block byte in sorted `(series_id, min_valid_time)` order. Blocks in one series
+must not overlap, apart from a shared boundary timestamp.
 
 Each block belongs to one series and stores min/max valid time, point count,
 encoding/compression IDs, encoded/stored sizes, a payload CRC32, and a header
 CRC32. A block holds at most 262,144 points, which bounds both decompression and
 the decoded point vector even when valid data reaches LZ4's maximum compression
 ratio. A query scans the small index and reads only overlapping blocks.
+
+Reconciliation seeks into that index and charges every point in an overlapping
+block against its scan limit before decoding. Timestamp filtering does not
+hide decode work. It counts matches as it visits them, without collecting the
+whole result first. The same limits span all series, segments, and the live tail.
+
+## Manifest binding
+
+Manifest version 3 stores a CRC32 of each raw segment's complete file. Open,
+integrity checks, and salvage verify that checksum, point count, and exact
+valid-time bounds before accepting the segment. A valid segment copied over
+another store's named file therefore fails the check. CRC32 detects accidental
+damage and file mix-ups; it does not authenticate files against deliberate edits.
+
+Open streams sealed files through a 64 KiB buffer to check this binding. It does
+not decode points into the live index, but startup now reads all sealed bytes.
+Measure that cost on the target card before enabling sealing in a live service.
+
+The reader still accepts the published alpha.1 manifest (version 1) and version
+2 with no raw segments. Version 2 with sealed raw files was an unpublished
+development format without content binding; the reader rejects it without
+falling back to an older manifest. Keep the source and use a pre-seal snapshot
+or a fresh shadow store. The new writer does not invent checksums for those
+old files, since it cannot prove which contents the old writer published.
 
 ## Column encoding
 

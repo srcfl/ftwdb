@@ -5,8 +5,10 @@
 `ftw check-store <directory>` opens the store read-only: the active commit
 log is opened without write access under a shared lock, torn-tail recovery is
 simulated in memory, and no manifest generation is published, pruned, or swept.
-It loads the highest valid manifest generation and re-opens every active rollup
-segment, validating checksums, encoded lengths, aggregate invariants,
+It checks each sealed raw file against its manifest content checksum, point
+count, and time bounds. It loads the highest valid manifest generation and
+re-opens every active rollup segment, validating checksums, encoded lengths,
+aggregate invariants,
 descriptor coverage, and raw-source watermarks. The command emits a single JSON
 record with raw commit/point counts, active rollup file/bucket/byte counts, and
 `raw_recovered_tail_bytes` plus `raw_recovered_tail` fields that distinguish an

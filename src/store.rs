@@ -633,6 +633,7 @@ impl Store {
         let max_valid_time = live.iter().map(|point| point.valid_time).max().unwrap();
         let segment_stats =
             Segment::create(self.segment_directory.join(&file), &live, SEAL_BLOCK_POINTS)?;
+        let content_crc32 = Segment::open(self.segment_directory.join(&file))?.content_crc32()?;
         self.database.write_seal_checkpoint(
             next_generation,
             u64::try_from(live.len()).unwrap_or(u64::MAX),
@@ -648,6 +649,7 @@ impl Store {
             source_points: stats.points,
             min_valid_time,
             max_valid_time,
+            content_crc32,
         });
         self.publish_or_poison(next)?;
         self.attach_published_segments()?;
@@ -849,16 +851,8 @@ impl Store {
         };
         for descriptor in &self.manifest.segments {
             let segment = Segment::open(self.segment_directory.join(&descriptor.file))?;
+            verify_raw_segment_descriptor(&segment, descriptor)?;
             segment.verify_blocks()?;
-            if segment.stats().points != descriptor.points {
-                return Err(Error::Corruption {
-                    offset: 0,
-                    reason: format!(
-                        "raw segment {} does not match its manifest point count",
-                        descriptor.file
-                    ),
-                });
-            }
         }
         for descriptor in self.active_rollups() {
             let segment = RollupSegment::open(self.rollup_directory.join(&descriptor.file))?;
@@ -1302,15 +1296,7 @@ impl Store {
                 offset: 0,
                 reason: format!("raw segment {} is unreadable: {error}", descriptor.file),
             })?;
-            if segment.stats().points != descriptor.points {
-                return Err(Error::Corruption {
-                    offset: 0,
-                    reason: format!(
-                        "raw segment {} point count does not match the manifest",
-                        descriptor.file
-                    ),
-                });
-            }
+            verify_raw_segment_descriptor(&segment, descriptor)?;
             opened.push(segment);
         }
         self.database.attach_sealed_segments(opened);
@@ -2030,6 +2016,25 @@ fn raw_segment_file_name(generation: u64) -> String {
     format!("g{generation}-{nonce}.wseg")
 }
 
+fn verify_raw_segment_descriptor(
+    segment: &Segment,
+    descriptor: &RawSegmentDescriptor,
+) -> Result<()> {
+    if segment.stats().points != descriptor.points
+        || segment.valid_bounds() != Some((descriptor.min_valid_time, descriptor.max_valid_time))
+        || segment.content_crc32()? != descriptor.content_crc32
+    {
+        return Err(Error::Corruption {
+            offset: 0,
+            reason: format!(
+                "raw segment {} does not match its manifest count, time bounds, or content checksum",
+                descriptor.file
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Default)]
 struct SealedSalvagePlan {
     manifest: Manifest,
@@ -2138,6 +2143,7 @@ fn plan_sealed_salvage(root: &Path, options: SalvageOptions) -> Result<SealedSal
                 descriptor.file
             ),
         })?;
+        verify_raw_segment_descriptor(&segment, descriptor)?;
         segment.verify_blocks().map_err(|error| Error::Corruption {
             offset: 0,
             reason: format!(
@@ -2145,15 +2151,6 @@ fn plan_sealed_salvage(root: &Path, options: SalvageOptions) -> Result<SealedSal
                 descriptor.file
             ),
         })?;
-        if segment.stats().points != descriptor.points {
-            return Err(Error::Corruption {
-                offset: 0,
-                reason: format!(
-                    "sealed raw segment {} does not match its manifest point count",
-                    descriptor.file
-                ),
-            });
-        }
     }
 
     Ok(SealedSalvagePlan {
@@ -4794,6 +4791,50 @@ mod tests {
     }
 
     #[test]
+    fn valid_replacement_segment_fails_manifest_binding_before_reads_or_recovery() {
+        for replacement in [
+            Point::actual(1, SECOND, 99.0),
+            Point::actual(2, SECOND, 1.0),
+            Point::actual(1, 2 * SECOND, 1.0),
+        ] {
+            let directory = tempdir().unwrap();
+            let root = directory.path().join("store");
+            let mut store = Store::open(&root).unwrap();
+            initialize(&mut store, Vec::new(), None);
+            let mut transaction = Transaction::new();
+            transaction.append_points(vec![Point::actual(1, SECOND, 1.0)]);
+            store.commit(transaction).unwrap();
+            store.seal_and_reclaim().unwrap();
+            let replacement_path = directory.path().join("replacement.wseg");
+            Segment::create(&replacement_path, &[replacement], 1).unwrap();
+            Segment::open(&replacement_path)
+                .unwrap()
+                .verify_blocks()
+                .unwrap();
+            std::fs::copy(replacement_path, &sealed_wseg_paths(&root)[0]).unwrap();
+            assert!(matches!(
+                store.check_integrity(),
+                Err(crate::Error::Corruption { .. })
+            ));
+            store.close().unwrap();
+            assert!(matches!(
+                Store::open_read_only(&root),
+                Err(crate::Error::Corruption { .. })
+            ));
+            assert!(matches!(
+                Store::open(&root),
+                Err(crate::Error::Corruption { .. })
+            ));
+            let restored = directory.path().join("restored");
+            assert!(Store::restore_from(&root, &restored).is_err());
+            assert!(!restored.exists());
+            let salvaged = directory.path().join("salvaged");
+            assert!(Store::salvage_from(&root, &salvaged).is_err());
+            assert!(!salvaged.exists());
+        }
+    }
+
+    #[test]
     fn query_latest_returns_corruption_for_corrupt_sealed_block_payload() {
         let directory = tempdir().unwrap();
         let root = directory.path().join("store");
@@ -4806,8 +4847,8 @@ mod tests {
             store.seal_and_reclaim().unwrap();
             store.close().unwrap();
         }
-        corrupt_first_sealed_block_payload(&root);
         let store = Store::open_read_only(&root).unwrap();
+        corrupt_first_sealed_block_payload(&root);
         assert!(matches!(
             store.database().query_latest(1, 0, DAY),
             Err(crate::Error::Corruption { .. })
@@ -4827,8 +4868,8 @@ mod tests {
             store.seal_and_reclaim().unwrap();
             store.close().unwrap();
         }
-        corrupt_first_sealed_block_payload(&root);
         let store = Store::open_read_only(&root).unwrap();
+        corrupt_first_sealed_block_payload(&root);
         assert!(matches!(
             store.check_integrity(),
             Err(crate::Error::Corruption { .. })

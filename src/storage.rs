@@ -1381,6 +1381,27 @@ impl Database {
         Ok(result)
     }
 
+    /// Visits raw history without collecting or sorting the whole result.
+    /// The caller reserves scan work before each sealed block or live slice.
+    pub(crate) fn visit_history<E: From<Error>>(
+        &self,
+        series_id: u64,
+        start: i64,
+        end: i64,
+        mut reserve: impl FnMut(usize) -> std::result::Result<(), E>,
+        mut visit: impl FnMut(Point) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        for segment in &self.sealed {
+            segment.visit_query(series_id, start, end, &mut reserve, &mut visit)?;
+        }
+        let live = series_time_slice(self.series_points(series_id), start, end);
+        reserve(live.len())?;
+        for point in live {
+            visit(*point)?;
+        }
+        Ok(())
+    }
+
     /// Live-index revisions only. Sealed history is not included.
     pub(crate) fn series_points(&self, series_id: u64) -> &[Point] {
         self.index.get(&series_id).map_or(&[], Vec::as_slice)
