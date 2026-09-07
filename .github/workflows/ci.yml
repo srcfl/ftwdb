@@ -91,14 +91,38 @@ jobs:
               "FTW_SD_EMULATOR_COMMIT=$GITHUB_SHA" \
               bash "bench/sd-card-emulator/linux-$scenario.sh"
           done
+      - name: Collect reports without walking private database snapshots
+        if: always()
+        run: |
+          sudo env "FTW_REPORT_UID=$(id -u)" "FTW_REPORT_GID=$(id -g)" python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+          root = Path("bench-results")
+          owner = (int(os.environ["FTW_REPORT_UID"]), int(os.environ["FTW_REPORT_GID"]))
+          reports = root / "evidence"
+          reports.mkdir(parents=True, exist_ok=True, mode=0o700)
+          os.chown(reports, *owner)
+          sources = list(root.glob("linux-nbd-*"))
+          for source in sources:
+              destination = reports / source.name
+              destination.mkdir(mode=0o700)
+              os.chown(destination, *owner)
+              # Only direct report files: never traverse store/backup trees.
+              for item in source.iterdir():
+                  if item.is_file() and item.suffix in (".json", ".jsonl", ".txt", ".log", ".stdout", ".stderr"):
+                      target = destination / item.name
+                      shutil.copy2(item, target)
+                      os.chown(target, *owner)
+          profile = root / "ci-profile.json"
+          if profile.is_file():
+              shutil.copy2(profile, reports / profile.name)
+              os.chown(reports / profile.name, *owner)
+          PY
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: linux-filesystem-faults
-          path: |
-            bench-results/**/*.json
-            bench-results/**/*.jsonl
-            bench-results/**/*.txt
-            bench-results/**/*.log
+          path: bench-results/evidence/
           if-no-files-found: warn
           retention-days: 14
