@@ -146,7 +146,7 @@ fn bench_real_fixture(arguments: &[String]) -> CliResult<()> {
         Ok(())
     })?;
     let ingest_seconds = started.elapsed().as_secs_f64();
-    let stored_bytes = directory_bytes(database_directory)?;
+    let stored_bytes = store.stored_bytes()?;
     let points_per_second = report.points as f64 / ingest_seconds;
     let bytes_per_point = if report.points == 0 {
         0.0
@@ -244,7 +244,7 @@ fn bench_tsbs_iot(arguments: &[String]) -> CliResult<()> {
         load_tsbs_iot(BufReader::new(File::open(input)?), &mut store, batch_rows)?
     };
     let ingest_seconds = started.elapsed().as_secs_f64();
-    let stored_bytes = directory_bytes(database_directory)?;
+    let stored_bytes = store.stored_bytes()?;
     let points_per_second = report.points as f64 / ingest_seconds;
     let rows_per_second = report.rows as f64 / ingest_seconds;
     let bytes_per_point = if report.points == 0 {
@@ -644,7 +644,7 @@ fn bench_ftwdb(arguments: &[String]) -> CliResult<()> {
     if gauge_bucket_checksum(&warm_query.buckets) != result_crc {
         return Err(runtime_invalid("cold and warm rollup query results differ"));
     }
-    let stored_bytes = directory_bytes(database_directory)?;
+    let stored_bytes = store.stored_bytes()?;
     let points_per_second = summary.points as f64 / ingest_seconds;
 
     println!(
@@ -664,20 +664,6 @@ fn bench_ftwdb(arguments: &[String]) -> CliResult<()> {
         stored_bytes
     );
     Ok(())
-}
-
-fn directory_bytes(path: &Path) -> CliResult<u64> {
-    let mut total = 0_u64;
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            total = total.saturating_add(directory_bytes(&entry.path())?);
-        } else {
-            total = total.saturating_add(metadata.len());
-        }
-    }
-    Ok(total)
 }
 
 fn parse<T>(value: &str, option: &str) -> CliResult<T>

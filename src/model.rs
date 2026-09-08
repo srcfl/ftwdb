@@ -114,6 +114,13 @@ impl SeriesDefinition {
         if self.maximum_gap_micros.is_some_and(|gap| gap < 0) {
             return Err("maximum gap must not be negative");
         }
+        if self
+            .rollup_policy
+            .raw_retain_for_micros
+            .is_some_and(|retention| retention <= 0)
+        {
+            return Err("raw retention must be positive or forever");
+        }
         for tier in &self.rollup_policy.tiers {
             match &tier.resolution {
                 RollupResolution::FixedMicros(value) if *value <= 0 => {
@@ -123,6 +130,11 @@ impl SeriesDefinition {
                     if iana_timezone.trim().is_empty() =>
                 {
                     return Err("calendar rollups require an IANA timezone");
+                }
+                RollupResolution::Calendar { iana_timezone, .. }
+                    if jiff::tz::TimeZone::get(iana_timezone).is_err() =>
+                {
+                    return Err("calendar rollups require a valid IANA timezone");
                 }
                 _ => {}
             }
@@ -211,6 +223,17 @@ impl Plan {
         if self.scenario.trim().is_empty() {
             return Err("plan scenario must not be empty");
         }
+        if self.supersedes == Some(self.id) {
+            return Err("plan cannot supersede itself");
+        }
+        if self
+            .objective_terms
+            .iter()
+            .any(|(name, value)| name.trim().is_empty() || !value.is_finite())
+            || self.objective_value.is_some_and(|value| !value.is_finite())
+        {
+            return Err("plan objectives require names and finite values");
+        }
         Ok(())
     }
 }
@@ -243,6 +266,23 @@ mod tests {
             },
         };
         assert_eq!(series.validate(), Ok(()));
+
+        let mut invalid_retention = series.clone();
+        invalid_retention.rollup_policy.raw_retain_for_micros = Some(0);
+        assert_eq!(
+            invalid_retention.validate(),
+            Err("raw retention must be positive or forever")
+        );
+
+        let mut invalid_timezone = series;
+        invalid_timezone.rollup_policy.tiers[0].resolution = RollupResolution::Calendar {
+            unit: super::CalendarUnit::Day,
+            iana_timezone: "Not/A-Time-Zone".to_owned(),
+        };
+        assert_eq!(
+            invalid_timezone.validate(),
+            Err("calendar rollups require a valid IANA timezone")
+        );
     }
 
     #[test]
@@ -263,6 +303,16 @@ mod tests {
         assert_eq!(
             plan.validate(),
             Err("plan horizon must have positive duration")
+        );
+
+        let mut invalid_objective = plan;
+        invalid_objective.horizon_end = 200;
+        invalid_objective
+            .objective_terms
+            .insert("cost".to_owned(), f64::NAN);
+        assert_eq!(
+            invalid_objective.validate(),
+            Err("plan objectives require names and finite values")
         );
     }
 }

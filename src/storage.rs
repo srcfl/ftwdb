@@ -11,6 +11,7 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const DATABASE_MAGIC: &[u8; 8] = b"FTWDB001";
 const DATABASE_VERSION: u16 = 1;
@@ -46,9 +47,14 @@ const FRAME_KIND_INGRESS_TRANSACTION: u16 = 3;
 /// unsealed tail even when reclaim has not yet rewritten `active.wlog`.
 const FRAME_KIND_SEAL_CHECKPOINT: u16 = 4;
 /// Compact identity receipts after WAL reclaim. Payload is postcard-encoded
-/// commit-id and ingress hashes so retries stay fail-closed without keeping
-/// sealed point bytes in the live log.
+/// receipt metadata plus exact retry bytes; recovery does not rebuild point
+/// records into the live query index.
 const FRAME_KIND_IDENTITY_INDEX: u16 = 5;
+const IDENTITY_INDEX_MAGIC_V2: &[u8; 8] = b"WIDX0002";
+/// A single retained transaction may already use the configured transaction
+/// limit. Kind 5 needs a small amount of receipt metadata around those exact
+/// bytes, while the writer splits multiple receipts across frames.
+const IDENTITY_INDEX_ENTRY_OVERHEAD_BYTES: usize = 1024;
 const INGRESS_IDENTITY_BYTES: usize = 16 + 8 + 16;
 const SEAL_CHECKPOINT_BYTES: usize = 16;
 const TRANSACTION_MAGIC: &[u8; 4] = b"WTXN";
@@ -184,20 +190,25 @@ impl From<IngressIdentity> for IngressKey {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct StoredIngressReceipt {
     identity: IngressIdentity,
     canonical_payload_offset: u64,
     canonical_payload_len: u32,
     canonical_payload_crc32: u32,
+    /// Exact canonical bytes retained by a compact identity index. Live
+    /// receipts instead point at their original frame in `active.wlog`.
+    compact_payload: Option<Arc<[u8]>>,
     commit: Commit,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct StoredIdentifiedReceipt {
     payload_offset: u64,
     payload_len: u32,
     payload_crc32: u32,
+    /// Exact identified-frame payload retained by a compact identity index.
+    compact_payload: Option<Arc<[u8]>>,
     commit: Commit,
 }
 
@@ -208,6 +219,11 @@ struct CompactIdentifiedReceipt {
     payload_crc32: u32,
     points: u64,
     records: u64,
+    /// Empty only when reading an index written by the first kind-5 format,
+    /// which stored CRC metadata but no bytes. Such receipts stay known but
+    /// fail closed on retry instead of treating CRC equality as exact proof.
+    #[serde(default)]
+    payload: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -219,12 +235,83 @@ struct CompactIngressReceipt {
     canonical_payload_crc32: u32,
     points: u64,
     records: u64,
+    /// See [`CompactIdentifiedReceipt::payload`].
+    #[serde(default)]
+    canonical_payload: Vec<u8>,
+    #[serde(default)]
+    frame_offset: u64,
+    #[serde(default)]
+    bytes_written: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct CompactIdentityIndex {
     identified: Vec<CompactIdentifiedReceipt>,
     ingress: Vec<CompactIngressReceipt>,
+}
+
+/// Old writers created this kind-5 payload before they retained exact retry
+/// bytes. Keep a decoder so those stores still open; their known identifiers
+/// fail closed on retry because this format cannot prove byte equality.
+#[derive(Deserialize)]
+struct LegacyCompactIdentifiedReceipt {
+    commit_id: u128,
+    payload_len: u32,
+    payload_crc32: u32,
+    points: u64,
+    records: u64,
+}
+
+#[derive(Deserialize)]
+struct LegacyCompactIngressReceipt {
+    source_id: u128,
+    sequence: u64,
+    commit_id: u128,
+    canonical_payload_len: u32,
+    canonical_payload_crc32: u32,
+    points: u64,
+    records: u64,
+}
+
+#[derive(Deserialize)]
+struct LegacyCompactIdentityIndex {
+    identified: Vec<LegacyCompactIdentifiedReceipt>,
+    ingress: Vec<LegacyCompactIngressReceipt>,
+}
+
+impl From<LegacyCompactIdentityIndex> for CompactIdentityIndex {
+    fn from(index: LegacyCompactIdentityIndex) -> Self {
+        Self {
+            identified: index
+                .identified
+                .into_iter()
+                .map(|receipt| CompactIdentifiedReceipt {
+                    commit_id: receipt.commit_id,
+                    payload_len: receipt.payload_len,
+                    payload_crc32: receipt.payload_crc32,
+                    points: receipt.points,
+                    records: receipt.records,
+                    payload: Vec::new(),
+                })
+                .collect(),
+            ingress: index
+                .ingress
+                .into_iter()
+                .map(|receipt| CompactIngressReceipt {
+                    source_id: receipt.source_id,
+                    sequence: receipt.sequence,
+                    commit_id: receipt.commit_id,
+                    canonical_payload_len: receipt.canonical_payload_len,
+                    canonical_payload_crc32: receipt.canonical_payload_crc32,
+                    points: receipt.points,
+                    records: receipt.records,
+                    canonical_payload: Vec::new(),
+                    frame_offset: 0,
+                    bytes_written: 0,
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Why the final bytes of a log were recovered.
@@ -248,6 +335,7 @@ pub enum SalvageStopReason {
     UnsupportedFrameVersion,
     FrameHeaderChecksumMismatch,
     InvalidLegacyFrameSize,
+    InvalidLegacyPoint,
     TransactionFrameTooLarge,
     IdentifiedTransactionTooShort,
     IngressTransactionTooShort,
@@ -273,6 +361,7 @@ impl fmt::Display for SalvageStopReason {
             Self::UnsupportedFrameVersion => "unsupported-frame-version",
             Self::FrameHeaderChecksumMismatch => "frame-header-checksum-mismatch",
             Self::InvalidLegacyFrameSize => "invalid-legacy-frame-size",
+            Self::InvalidLegacyPoint => "invalid-legacy-point",
             Self::TransactionFrameTooLarge => "transaction-frame-too-large",
             Self::IdentifiedTransactionTooShort => "identified-transaction-too-short",
             Self::IngressTransactionTooShort => "ingress-transaction-too-short",
@@ -347,9 +436,9 @@ pub struct Database {
     /// A replay compares encoded bytes (and re-reads the stored frame) so a
     /// reused identifier with different records cannot silently deduplicate.
     identified_receipts: HashMap<u128, StoredIdentifiedReceipt>,
-    /// One small receipt per ordered ingress frame. Canonical transaction
-    /// bytes stay in the log; a replay reads them only after an identity hit,
-    /// so the index stays bounded to fixed metadata per commit.
+    /// One receipt per ordered ingress frame. Live receipts read canonical
+    /// transaction bytes from the log. Reclaim retains those exact bytes in
+    /// kind 5 so CRC equality never becomes the retry decision.
     ingress_receipts: HashMap<IngressKey, StoredIngressReceipt>,
     ingress_commit_ids: HashMap<u128, IngressKey>,
     ingress_last_sequences: HashMap<u128, u64>,
@@ -666,7 +755,7 @@ impl Database {
             }
             if self.commit_ids.contains(&commit_id) {
                 let payload = encode_transaction(&transaction)?;
-                if let Some(receipt) = self.identified_receipts.get(&commit_id).copied() {
+                if let Some(receipt) = self.identified_receipts.get(&commit_id).cloned() {
                     if !self.identified_payload_matches(receipt, &payload)? {
                         return Err(Error::IngressCommitIdConflict { commit_id });
                     }
@@ -742,6 +831,7 @@ impl Database {
                     payload_offset: frame_offset + FRAME_HEADER_BYTES as u64,
                     payload_len,
                     payload_crc32: hash(&payload),
+                    compact_payload: None,
                     commit: Commit {
                         frame_offset,
                         points: point_count,
@@ -801,9 +891,9 @@ impl Database {
         let canonical = encode_canonical_transaction(&transaction)?;
         let key = IngressKey::from(identity);
 
-        if let Some(receipt) = self.ingress_receipts.get(&key).copied() {
+        if let Some(receipt) = self.ingress_receipts.get(&key).cloned() {
             if receipt.identity.commit_id != identity.commit_id
-                || !self.ingress_payload_matches(receipt, &canonical)?
+                || !self.ingress_payload_matches(receipt.clone(), &canonical)?
             {
                 return Err(Error::IngressSourceSequenceConflict {
                     source_id: identity.source_id,
@@ -916,6 +1006,7 @@ impl Database {
                 + INGRESS_IDENTITY_BYTES as u64,
             canonical_payload_len: canonical_len_u32,
             canonical_payload_crc32: hash(&canonical),
+            compact_payload: None,
             commit,
         };
         self.commit_ids.insert(identity.commit_id);
@@ -953,9 +1044,10 @@ impl Database {
             return Ok(false);
         }
         if receipt.payload_offset == 0 {
-            // Compact identity index: the original frame bytes were reclaimed
-            // with the sealed points. Length plus checksum stay fail-closed.
-            return Ok(true);
+            // An old compact index may lack exact bytes. Treat it as a known
+            // identifier that conflicts on retry; CRC equality alone cannot
+            // prove that the transaction is the same.
+            return Ok(receipt.compact_payload.as_deref() == Some(candidate));
         }
         let expected_payload_offset = receipt
             .commit
@@ -1037,7 +1129,7 @@ impl Database {
             return Ok(false);
         }
         if receipt.canonical_payload_offset == 0 {
-            return Ok(true);
+            return Ok(receipt.compact_payload.as_deref() == Some(candidate));
         }
         let expected_canonical_offset = receipt
             .commit
@@ -1134,7 +1226,7 @@ impl Database {
         let Some(receipt) = self
             .ingress_receipts
             .get(&IngressKey::from(identity))
-            .copied()
+            .cloned()
         else {
             return Ok(None);
         };
@@ -1340,13 +1432,19 @@ impl Database {
     }
 
     fn collect_raw_points(&self, series_id: u64, start: i64, end: i64) -> Result<Vec<Point>> {
-        let mut points = series_time_slice(self.series_points(series_id), start, end).to_vec();
+        // Segment order follows seal order. Read those older revisions before
+        // the live tail so the stable sort below keeps append order when two
+        // revisions have identical bitemporal keys. `winning_revisions` uses
+        // the later item as the tie-breaker, matching the documented
+        // `(knowledge_time, change_time, append_order)` rule.
+        let mut points = Vec::new();
         for segment in &self.sealed {
             if !segment.overlaps(series_id, start, end) {
                 continue;
             }
             points.extend(segment.query(series_id, start, end)?);
         }
+        points.extend_from_slice(series_time_slice(self.series_points(series_id), start, end));
         points.sort_by_key(|point| (point.valid_time, point.knowledge_time, point.change_time));
         Ok(points)
     }
@@ -1509,6 +1607,81 @@ impl Database {
         Ok(())
     }
 
+    fn compact_identity_index(&self) -> Result<CompactIdentityIndex> {
+        let mut identified = Vec::with_capacity(self.identified_receipts.len());
+        for (commit_id, receipt) in &self.identified_receipts {
+            let payload = if receipt.payload_offset == 0 {
+                receipt
+                    .compact_payload
+                    .as_deref()
+                    .map(<[u8]>::to_vec)
+                    .unwrap_or_default()
+            } else {
+                let mut payload = vec![0_u8; receipt.payload_len as usize];
+                self.file
+                    .read_exact_at(&mut payload, receipt.payload_offset)?;
+                if !self.identified_payload_matches_at(receipt.clone(), &payload)? {
+                    return corruption(
+                        receipt.commit.frame_offset,
+                        "stored identified payload changed before reclaim",
+                    );
+                }
+                payload
+            };
+            identified.push(CompactIdentifiedReceipt {
+                commit_id: *commit_id,
+                payload_len: receipt.payload_len,
+                payload_crc32: receipt.payload_crc32,
+                points: receipt.commit.points as u64,
+                records: receipt.commit.records as u64,
+                payload,
+            });
+        }
+        identified.sort_by_key(|receipt| receipt.commit_id);
+
+        let mut ingress = Vec::with_capacity(self.ingress_receipts.len());
+        for receipt in self.ingress_receipts.values() {
+            let canonical_payload = if receipt.canonical_payload_offset == 0 {
+                receipt
+                    .compact_payload
+                    .as_deref()
+                    .map(<[u8]>::to_vec)
+                    .unwrap_or_default()
+            } else {
+                let mut payload = vec![0_u8; receipt.canonical_payload_len as usize];
+                self.file
+                    .read_exact_at(&mut payload, receipt.canonical_payload_offset)?;
+                if !self.ingress_payload_matches_at(receipt.clone(), &payload)? {
+                    return corruption(
+                        receipt.commit.frame_offset,
+                        "stored ingress payload changed before reclaim",
+                    );
+                }
+                payload
+            };
+            ingress.push(CompactIngressReceipt {
+                source_id: receipt.identity.source_id,
+                sequence: receipt.identity.sequence,
+                commit_id: receipt.identity.commit_id,
+                canonical_payload_len: receipt.canonical_payload_len,
+                canonical_payload_crc32: receipt.canonical_payload_crc32,
+                points: receipt.commit.points as u64,
+                records: receipt.commit.records as u64,
+                canonical_payload,
+                frame_offset: receipt.commit.frame_offset,
+                bytes_written: receipt.commit.bytes_written,
+            });
+        }
+        // Recovery advances one cursor per source while it reads this list.
+        // HashMap iteration has no stable order, so sort before serializing.
+        ingress.sort_by_key(|receipt| (receipt.source_id, receipt.sequence));
+
+        Ok(CompactIdentityIndex {
+            identified,
+            ingress,
+        })
+    }
+
     /// Rewrites `active.wlog` to catalog + identity receipts + the live tail.
     ///
     /// The exclusive lock moves with the new inode: the compact file is locked
@@ -1522,12 +1695,12 @@ impl Database {
             return Err(Error::Poisoned);
         }
         self.flush()?;
+        let identity_index = self.compact_identity_index()?;
         let compact_path = compact_log_path(&self.path)?;
         if let Err(error) = write_compact_log(
             &compact_path,
             &self.catalog,
-            &self.identified_receipts,
-            &self.ingress_receipts,
+            &identity_index,
             &self.index,
             self.config.max_batch_points,
             self.config.max_transaction_bytes,
@@ -1640,9 +1813,19 @@ fn validate_config(config: Config) -> Result<()> {
     if config.max_batch_points == 0 {
         return Err(Error::InvalidConfig("max_batch_points must be positive"));
     }
+    if config.max_batch_points > u32::MAX as usize {
+        return Err(Error::InvalidConfig(
+            "max_batch_points exceeds the on-disk u32 count",
+        ));
+    }
     if config.max_transaction_bytes < TRANSACTION_HEADER_BYTES + RECORD_HEADER_BYTES {
         return Err(Error::InvalidConfig(
             "max_transaction_bytes is too small for one record",
+        ));
+    }
+    if config.max_transaction_bytes > u32::MAX as usize {
+        return Err(Error::InvalidConfig(
+            "max_transaction_bytes exceeds the on-disk u32 length",
         ));
     }
     if matches!(config.durability, Durability::EveryBytes(0)) {
@@ -1709,8 +1892,7 @@ fn compact_log_path(active: &Path) -> Result<PathBuf> {
 fn write_compact_log(
     path: &Path,
     catalog: &Catalog,
-    identified: &HashMap<u128, StoredIdentifiedReceipt>,
-    ingress: &HashMap<IngressKey, StoredIngressReceipt>,
+    identity_index: &CompactIdentityIndex,
     live_index: &HashMap<u64, Vec<Point>>,
     max_batch_points: usize,
     max_transaction_bytes: usize,
@@ -1722,51 +1904,15 @@ fn write_compact_log(
         .open(path)?;
     write_database_header(&mut file)?;
 
-    let catalog_records = catalog.snapshot_records();
+    let catalog_records = catalog.snapshot_records()?;
     if !catalog_records.is_empty() {
         let mut transaction = Transaction::new();
         transaction.records = catalog_records;
         write_standalone_transaction(&mut file, &transaction, max_transaction_bytes)?;
     }
 
-    if !identified.is_empty() || !ingress.is_empty() {
-        let index = CompactIdentityIndex {
-            identified: identified
-                .iter()
-                .map(|(commit_id, receipt)| CompactIdentifiedReceipt {
-                    commit_id: *commit_id,
-                    payload_len: receipt.payload_len,
-                    payload_crc32: receipt.payload_crc32,
-                    points: receipt.commit.points as u64,
-                    records: receipt.commit.records as u64,
-                })
-                .collect(),
-            ingress: ingress
-                .values()
-                .map(|receipt| CompactIngressReceipt {
-                    source_id: receipt.identity.source_id,
-                    sequence: receipt.identity.sequence,
-                    commit_id: receipt.identity.commit_id,
-                    canonical_payload_len: receipt.canonical_payload_len,
-                    canonical_payload_crc32: receipt.canonical_payload_crc32,
-                    points: receipt.commit.points as u64,
-                    records: receipt.commit.records as u64,
-                })
-                .collect(),
-        };
-        let payload = postcard::to_stdvec(&index).map_err(|error| {
-            Error::Serialization(format!("identity index encode failed: {error}"))
-        })?;
-        if payload.len() > max_transaction_bytes {
-            return Err(Error::Serialization(
-                "identity index exceeds max_transaction_bytes".to_owned(),
-            ));
-        }
-        let payload_len = u32::try_from(payload.len())
-            .map_err(|_| Error::Serialization("identity index exceeds u32 length".to_owned()))?;
-        let header = encode_frame_header(FRAME_KIND_IDENTITY_INDEX, 0, payload_len, hash(&payload));
-        file.write_all(&header)?;
-        file.write_all(&payload)?;
+    if !identity_index.identified.is_empty() || !identity_index.ingress.is_empty() {
+        write_identity_index_frames(&mut file, identity_index, max_transaction_bytes)?;
     }
 
     let tail: Vec<Point> = live_index.values().flatten().copied().collect();
@@ -1783,6 +1929,93 @@ fn write_compact_log(
     }
 
     file.sync_all()?;
+    Ok(())
+}
+
+fn identity_index_frame_limit(max_transaction_bytes: usize) -> usize {
+    max_transaction_bytes
+        .saturating_add(IDENTITY_INDEX_ENTRY_OVERHEAD_BYTES)
+        .min(u32::MAX as usize)
+}
+
+fn write_identity_index_frames(
+    file: &mut File,
+    index: &CompactIdentityIndex,
+    max_transaction_bytes: usize,
+) -> Result<()> {
+    let limit = identity_index_frame_limit(max_transaction_bytes);
+    let mut chunk = CompactIdentityIndex::default();
+    let mut estimated_bytes = 0_usize;
+
+    for receipt in &index.identified {
+        let singleton = CompactIdentityIndex {
+            identified: vec![receipt.clone()],
+            ingress: Vec::new(),
+        };
+        let bytes = encoded_identity_index(&singleton)?.len();
+        if bytes > limit {
+            return Err(Error::Serialization(
+                "one identified receipt exceeds the identity-index frame limit".to_owned(),
+            ));
+        }
+        if estimated_bytes > 0 && estimated_bytes.saturating_add(bytes) > limit {
+            write_identity_index_frame(file, &chunk, limit)?;
+            chunk = CompactIdentityIndex::default();
+            estimated_bytes = 0;
+        }
+        chunk.identified.push(receipt.clone());
+        estimated_bytes = estimated_bytes.saturating_add(bytes);
+    }
+    for receipt in &index.ingress {
+        let singleton = CompactIdentityIndex {
+            identified: Vec::new(),
+            ingress: vec![receipt.clone()],
+        };
+        let bytes = encoded_identity_index(&singleton)?.len();
+        if bytes > limit {
+            return Err(Error::Serialization(
+                "one ingress receipt exceeds the identity-index frame limit".to_owned(),
+            ));
+        }
+        if estimated_bytes > 0 && estimated_bytes.saturating_add(bytes) > limit {
+            write_identity_index_frame(file, &chunk, limit)?;
+            chunk = CompactIdentityIndex::default();
+            estimated_bytes = 0;
+        }
+        chunk.ingress.push(receipt.clone());
+        estimated_bytes = estimated_bytes.saturating_add(bytes);
+    }
+    if !chunk.identified.is_empty() || !chunk.ingress.is_empty() {
+        write_identity_index_frame(file, &chunk, limit)?;
+    }
+    Ok(())
+}
+
+fn encoded_identity_index(index: &CompactIdentityIndex) -> Result<Vec<u8>> {
+    let encoded = postcard::to_stdvec(index)
+        .map_err(|error| Error::Serialization(format!("identity index encode failed: {error}")))?;
+    let mut payload = Vec::with_capacity(IDENTITY_INDEX_MAGIC_V2.len() + encoded.len());
+    payload.extend_from_slice(IDENTITY_INDEX_MAGIC_V2);
+    payload.extend_from_slice(&encoded);
+    Ok(payload)
+}
+
+fn write_identity_index_frame(
+    file: &mut File,
+    index: &CompactIdentityIndex,
+    limit: usize,
+) -> Result<()> {
+    let payload = encoded_identity_index(index)?;
+    if payload.len() > limit {
+        return Err(Error::Serialization(
+            "identity index chunk exceeds its frame limit".to_owned(),
+        ));
+    }
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| Error::Serialization("identity index exceeds u32 length".to_owned()))?;
+    let header = encode_frame_header(FRAME_KIND_IDENTITY_INDEX, 0, payload_len, hash(&payload));
+    file.write_all(&header)?;
+    file.write_all(&payload)?;
     Ok(())
 }
 
@@ -1822,12 +2055,38 @@ fn apply_identity_index(
     ingress_commit_ids: &mut HashMap<u128, IngressKey>,
     ingress_last_sequences: &mut HashMap<u128, u64>,
 ) -> Result<()> {
-    let index: CompactIdentityIndex =
-        postcard::from_bytes(payload).map_err(|error| Error::Corruption {
-            offset,
-            reason: format!("identity index decode failed: {error}"),
-        })?;
+    let index = decode_identity_index(payload, offset)?;
     for receipt in index.identified {
+        if receipt.payload_len < (COMMIT_ID_BYTES + TRANSACTION_HEADER_BYTES) as u32 {
+            return corruption(offset, "identified receipt payload is too short");
+        }
+        let points = usize::try_from(receipt.points).map_err(|_| Error::Corruption {
+            offset,
+            reason: "identity index point count overflows usize".to_owned(),
+        })?;
+        let records = usize::try_from(receipt.records).map_err(|_| Error::Corruption {
+            offset,
+            reason: "identity index record count overflows usize".to_owned(),
+        })?;
+        let compact_payload = if receipt.payload.is_empty() {
+            None
+        } else {
+            if receipt.payload.len() != receipt.payload_len as usize
+                || hash(&receipt.payload) != receipt.payload_crc32
+                || receipt.payload.len() < COMMIT_ID_BYTES
+                || u128::from_le_bytes(receipt.payload[..COMMIT_ID_BYTES].try_into().unwrap())
+                    != receipt.commit_id
+            {
+                return corruption(offset, "identified receipt bytes do not match their index");
+            }
+            validate_compact_transaction(
+                &receipt.payload[COMMIT_ID_BYTES..],
+                records,
+                points,
+                offset,
+            )?;
+            Some(Arc::<[u8]>::from(receipt.payload))
+        };
         if !commit_ids.insert(receipt.commit_id) {
             return corruption(offset, "duplicate commit identifier");
         }
@@ -1837,10 +2096,11 @@ fn apply_identity_index(
                 payload_offset: 0,
                 payload_len: receipt.payload_len,
                 payload_crc32: receipt.payload_crc32,
+                compact_payload,
                 commit: Commit {
                     frame_offset: offset,
-                    points: receipt.points as usize,
-                    records: receipt.records as usize,
+                    points,
+                    records,
                     bytes_written: 0,
                     durable: false,
                     deduplicated: false,
@@ -1849,6 +2109,28 @@ fn apply_identity_index(
         );
     }
     for receipt in index.ingress {
+        if receipt.canonical_payload_len < TRANSACTION_HEADER_BYTES as u32 {
+            return corruption(offset, "ingress receipt payload is too short");
+        }
+        let points = usize::try_from(receipt.points).map_err(|_| Error::Corruption {
+            offset,
+            reason: "identity index point count overflows usize".to_owned(),
+        })?;
+        let records = usize::try_from(receipt.records).map_err(|_| Error::Corruption {
+            offset,
+            reason: "identity index record count overflows usize".to_owned(),
+        })?;
+        let compact_payload = if receipt.canonical_payload.is_empty() {
+            None
+        } else {
+            if receipt.canonical_payload.len() != receipt.canonical_payload_len as usize
+                || hash(&receipt.canonical_payload) != receipt.canonical_payload_crc32
+            {
+                return corruption(offset, "ingress receipt bytes do not match their index");
+            }
+            validate_compact_transaction(&receipt.canonical_payload, records, points, offset)?;
+            Some(Arc::<[u8]>::from(receipt.canonical_payload))
+        };
         let identity = IngressIdentity {
             source_id: receipt.source_id,
             sequence: receipt.sequence,
@@ -1876,11 +2158,12 @@ fn apply_identity_index(
                 canonical_payload_offset: 0,
                 canonical_payload_len: receipt.canonical_payload_len,
                 canonical_payload_crc32: receipt.canonical_payload_crc32,
+                compact_payload,
                 commit: Commit {
-                    frame_offset: offset,
-                    points: receipt.points as usize,
-                    records: receipt.records as usize,
-                    bytes_written: 0,
+                    frame_offset: receipt.frame_offset,
+                    points,
+                    records,
+                    bytes_written: receipt.bytes_written,
                     durable: false,
                     deduplicated: false,
                 },
@@ -1888,6 +2171,52 @@ fn apply_identity_index(
         );
         ingress_commit_ids.insert(identity.commit_id, key);
         ingress_last_sequences.insert(identity.source_id, identity.sequence);
+    }
+    Ok(())
+}
+
+fn decode_identity_index(payload: &[u8], offset: u64) -> Result<CompactIdentityIndex> {
+    if let Some(encoded) = payload.strip_prefix(IDENTITY_INDEX_MAGIC_V2) {
+        return postcard::from_bytes(encoded).map_err(|error| Error::Corruption {
+            offset,
+            reason: format!("identity index v2 decode failed: {error}"),
+        });
+    }
+    postcard::from_bytes::<LegacyCompactIdentityIndex>(payload)
+        .map(Into::into)
+        .map_err(|error| Error::Corruption {
+            offset,
+            reason: format!("legacy identity index decode failed: {error}"),
+        })
+}
+
+fn validate_compact_transaction(
+    payload: &[u8],
+    expected_records: usize,
+    expected_points: usize,
+    offset: u64,
+) -> Result<()> {
+    let records = decode_transaction(payload, expected_records, offset)?;
+    let points = records
+        .iter()
+        .map(|record| match record {
+            Record::Points(points) => points.len(),
+            _ => 0,
+        })
+        .try_fold(0_usize, usize::checked_add)
+        .ok_or_else(|| Error::Corruption {
+            offset,
+            reason: "identity index point count overflows".to_owned(),
+        })?;
+    if points != expected_points {
+        return corruption(offset, "identity index point count does not match payload");
+    }
+    for record in &records {
+        if let Record::Points(points) = record
+            && crate::catalog::validate_point_intervals(points).is_err()
+        {
+            return corruption(offset, "identity index contains invalid point values");
+        }
     }
     Ok(())
 }
@@ -1969,7 +2298,7 @@ fn scan_log(
         return Err(Error::UnsupportedVersion(version));
     }
     let expected_checksum = u32::from_le_bytes(database_header[12..16].try_into().unwrap());
-    if hash(&database_header[..12]) != expected_checksum {
+    if hash(&database_header[..12]) != expected_checksum || database_header[10..12] != [0, 0] {
         return Err(Error::InvalidHeader);
     }
 
@@ -2077,14 +2406,20 @@ fn scan_log(
                 );
             }
         } else if frame_kind == FRAME_KIND_SEAL_CHECKPOINT {
-            if payload_len != SEAL_CHECKPOINT_BYTES {
+            if item_count != 0 || payload_len != SEAL_CHECKPOINT_BYTES {
                 stop_or_corruption!(
                     SalvageStopReason::SealCheckpointInvalid,
-                    "seal checkpoint payload has the wrong length"
+                    "seal checkpoint header has an item count or wrong payload length"
                 );
             }
         } else if frame_kind == FRAME_KIND_IDENTITY_INDEX {
-            if payload_len > max_transaction_bytes {
+            if item_count != 0 {
+                stop_or_corruption!(
+                    SalvageStopReason::IdentityIndexInvalid,
+                    "identity index header has an item count"
+                );
+            }
+            if payload_len > identity_index_frame_limit(max_transaction_bytes) {
                 stop_or_corruption!(
                     SalvageStopReason::TransactionFrameTooLarge,
                     "identity index frame exceeds configured maximum"
@@ -2122,13 +2457,29 @@ fn scan_log(
         }
 
         if frame_kind == FRAME_KIND_LEGACY_POINTS {
-            for raw in payload.chunks_exact(POINT_BYTES) {
-                let point = decode_point(raw);
+            let recovered: Vec<_> = payload
+                .chunks_exact(POINT_BYTES)
+                .map(decode_point)
+                .collect();
+            if crate::catalog::validate_point_intervals(&recovered).is_err() {
+                stop_or_corruption!(
+                    SalvageStopReason::InvalidLegacyPoint,
+                    "legacy point frame violates point invariants"
+                );
+            }
+            for point in recovered {
                 index.entry(point.series_id).or_default().push(point);
             }
             points += item_count as u64;
         } else if frame_kind == FRAME_KIND_SEAL_CHECKPOINT {
             let generation = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let sealed_points = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+            if generation == 0 || sealed_points != points {
+                stop_or_corruption!(
+                    SalvageStopReason::SealCheckpointInvalid,
+                    "seal checkpoint generation or point count is invalid"
+                );
+            }
             if published_seals.contains(&generation) {
                 index.clear();
                 points = 0;
@@ -2255,6 +2606,7 @@ fn scan_log(
                         payload_offset: offset + FRAME_HEADER_BYTES as u64,
                         payload_len: u32::try_from(payload.len()).unwrap(),
                         payload_crc32: payload_checksum,
+                        compact_payload: None,
                         commit: Commit {
                             frame_offset: offset,
                             points: recovered_point_count,
@@ -2275,6 +2627,7 @@ fn scan_log(
                         + INGRESS_IDENTITY_BYTES as u64,
                     canonical_payload_len: u32::try_from(transaction_payload.len()).unwrap(),
                     canonical_payload_crc32: hash(transaction_payload),
+                    compact_payload: None,
                     commit: Commit {
                         frame_offset: offset,
                         points: recovered_point_count,
@@ -2729,6 +3082,9 @@ fn decode_transaction(payload: &[u8], expected_records: usize, offset: u64) -> R
     if version != TRANSACTION_VERSION {
         return corruption(offset, "unsupported transaction version");
     }
+    if payload[6..8] != [0, 0] {
+        return corruption(offset, "transaction reserved flags are non-zero");
+    }
     let record_count = u32::from_le_bytes(payload[8..12].try_into().unwrap()) as usize;
     if record_count != expected_records {
         return corruption(offset, "transaction record count mismatch");
@@ -2754,6 +3110,9 @@ fn decode_transaction(payload: &[u8], expected_records: usize, offset: u64) -> R
         let record_version = payload[cursor + 1];
         if record_version != 1 {
             return corruption(offset, "unsupported transaction record version");
+        }
+        if payload[cursor + 2..cursor + 4] != [0, 0] {
+            return corruption(offset, "transaction record reserved flags are non-zero");
         }
         let body_len =
             u32::from_le_bytes(payload[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
@@ -2985,6 +3344,129 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn rejects_non_zero_reserved_database_transaction_and_record_flags() {
+        let directory = tempdir().unwrap();
+
+        let database_path = directory.path().join("database-flags.ftwdb");
+        header_only(&database_path);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&database_path)
+            .unwrap();
+        let mut header = [0_u8; DATABASE_HEADER_BYTES];
+        file.read_exact(&mut header).unwrap();
+        header[10] = 1;
+        let checksum = crc32fast::hash(&header[..12]);
+        header[12..16].copy_from_slice(&checksum.to_le_bytes());
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&header).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        assert!(matches!(
+            Database::open(&database_path),
+            Err(Error::InvalidHeader)
+        ));
+
+        let transaction_path = directory.path().join("transaction-flags.ftwdb");
+        header_only(&transaction_path);
+        let mut payload = encode_transaction(&Transaction::new()).unwrap();
+        payload[6] = 1;
+        append_raw_frame(&transaction_path, FRAME_KIND_TRANSACTION, 0, &payload);
+        assert_eq!(
+            salvage_scan(&transaction_path, Config::default().max_batch_points).salvage_stop_reason,
+            Some(SalvageStopReason::InvalidTransaction)
+        );
+
+        let record_path = directory.path().join("record-flags.ftwdb");
+        header_only(&record_path);
+        let mut transaction = Transaction::new();
+        transaction.upsert_entity(home());
+        let mut payload = encode_transaction(&transaction).unwrap();
+        payload[super::TRANSACTION_HEADER_BYTES + 2] = 1;
+        append_raw_frame(&record_path, FRAME_KIND_TRANSACTION, 1, &payload);
+        assert_eq!(
+            salvage_scan(&record_path, Config::default().max_batch_points).salvage_stop_reason,
+            Some(SalvageStopReason::InvalidTransaction)
+        );
+    }
+
+    #[test]
+    fn salvage_rejects_invalid_legacy_points_and_control_frame_counts() {
+        let directory = tempdir().unwrap();
+
+        let legacy_path = directory.path().join("invalid-legacy-point.ftwdb");
+        header_only(&legacy_path);
+        let mut payload = Vec::new();
+        super::encode_point(Point::actual(1, 1, f64::INFINITY), &mut payload);
+        append_raw_frame(&legacy_path, super::FRAME_KIND_LEGACY_POINTS, 1, &payload);
+        assert_eq!(
+            salvage_scan(&legacy_path, Config::default().max_batch_points).salvage_stop_reason,
+            Some(SalvageStopReason::InvalidLegacyPoint)
+        );
+
+        let checkpoint_path = directory.path().join("invalid-checkpoint.ftwdb");
+        header_only(&checkpoint_path);
+        let mut checkpoint = [0_u8; super::SEAL_CHECKPOINT_BYTES];
+        checkpoint[..8].copy_from_slice(&1_u64.to_le_bytes());
+        append_raw_frame(
+            &checkpoint_path,
+            super::FRAME_KIND_SEAL_CHECKPOINT,
+            1,
+            &checkpoint,
+        );
+        assert_eq!(
+            salvage_scan(&checkpoint_path, Config::default().max_batch_points).salvage_stop_reason,
+            Some(SalvageStopReason::SealCheckpointInvalid)
+        );
+
+        let checkpoint_points_path = directory.path().join("invalid-checkpoint-points.ftwdb");
+        header_only(&checkpoint_points_path);
+        checkpoint[8..16].copy_from_slice(&1_u64.to_le_bytes());
+        append_raw_frame(
+            &checkpoint_points_path,
+            super::FRAME_KIND_SEAL_CHECKPOINT,
+            0,
+            &checkpoint,
+        );
+        assert_eq!(
+            salvage_scan(&checkpoint_points_path, Config::default().max_batch_points,)
+                .salvage_stop_reason,
+            Some(SalvageStopReason::SealCheckpointInvalid)
+        );
+
+        let index_path = directory.path().join("invalid-index-count.ftwdb");
+        header_only(&index_path);
+        let index = postcard::to_stdvec(&super::CompactIdentityIndex::default()).unwrap();
+        append_raw_frame(&index_path, super::FRAME_KIND_IDENTITY_INDEX, 1, &index);
+        assert_eq!(
+            salvage_scan(&index_path, Config::default().max_batch_points).salvage_stop_reason,
+            Some(SalvageStopReason::IdentityIndexInvalid)
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn config_rejects_limits_that_the_file_format_cannot_encode() {
+        let directory = tempdir().unwrap();
+        for config in [
+            Config {
+                max_batch_points: u32::MAX as usize + 1,
+                ..Config::default()
+            },
+            Config {
+                max_transaction_bytes: u32::MAX as usize + 1,
+                ..Config::default()
+            },
+        ] {
+            assert!(matches!(
+                Database::open_with(directory.path().join("limit.ftwdb"), config),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
     }
 
     fn salvage_scan(path: &std::path::Path, max_batch_points: usize) -> super::Scan {
@@ -4020,6 +4502,192 @@ mod tests {
             .with_commit_id(42);
         assert!(reopened.commit(exact_after_reopen).unwrap().deduplicated);
         assert_eq!(reopened.stats().unwrap().points, 1);
+    }
+
+    #[test]
+    fn compact_receipts_compare_exact_bytes_even_when_crc32_collides() {
+        let directory = tempdir().unwrap();
+        let database = Database::open(directory.path().join("collision.ftwdb")).unwrap();
+        let original = b"plumless";
+        let collision = b"buckeroo";
+        assert_eq!(original.len(), collision.len());
+        assert_eq!(crc32fast::hash(original), crc32fast::hash(collision));
+
+        let receipt = super::StoredIdentifiedReceipt {
+            payload_offset: 0,
+            payload_len: original.len() as u32,
+            payload_crc32: crc32fast::hash(original),
+            compact_payload: Some(std::sync::Arc::from(original.as_slice())),
+            commit: super::Commit {
+                frame_offset: 0,
+                points: 0,
+                records: 0,
+                bytes_written: 0,
+                durable: true,
+                deduplicated: false,
+            },
+        };
+
+        assert!(
+            !database
+                .identified_payload_matches_at(receipt, collision)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn reclaim_sorts_ingress_receipts_and_preserves_exact_replay_receipts() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("ordered-compact-index.ftwdb");
+        let mut database = Database::open(&path).unwrap();
+        let identities = [
+            IngressIdentity::new(2, 4, 204),
+            IngressIdentity::new(1, 10, 110),
+            IngressIdentity::new(1, 12, 112),
+            IngressIdentity::new(2, 9, 209),
+            IngressIdentity::new(1, 20, 120),
+        ];
+        let mut originals = Vec::new();
+        for identity in identities {
+            originals.push((
+                identity,
+                database
+                    .commit_ingress(identity, Transaction::new())
+                    .unwrap(),
+            ));
+        }
+
+        database.reclaim_live_log().unwrap();
+        for (identity, original) in &originals {
+            let replay = database
+                .commit_ingress(*identity, Transaction::new())
+                .unwrap();
+            assert!(replay.deduplicated);
+            assert_eq!(replay.frame_offset, original.frame_offset);
+            assert_eq!(replay.bytes_written, original.bytes_written);
+        }
+        database.close().unwrap();
+
+        let mut reopened = Database::open(&path).unwrap();
+        for (identity, original) in originals {
+            let replay = reopened
+                .commit_ingress(identity, Transaction::new())
+                .unwrap();
+            assert!(replay.deduplicated);
+            assert_eq!(replay.frame_offset, original.frame_offset);
+            assert_eq!(replay.bytes_written, original.bytes_written);
+        }
+    }
+
+    #[test]
+    fn reclaim_splits_large_exact_identity_indexes_into_bounded_frames() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("chunked-compact-index.ftwdb");
+        let config = Config {
+            max_transaction_bytes: 64,
+            ..Config::default()
+        };
+        let mut database = Database::open_with(&path, config).unwrap();
+        let identities: Vec<_> = (0_u64..80)
+            .map(|sequence| {
+                IngressIdentity::new(9, sequence, u128::from(sequence).saturating_add(1_000))
+            })
+            .collect();
+        for identity in &identities {
+            database
+                .commit_ingress(*identity, Transaction::new())
+                .unwrap();
+        }
+        database.reclaim_live_log().unwrap();
+        database.close().unwrap();
+
+        let mut reopened = Database::open_with(&path, config).unwrap();
+        for identity in identities {
+            assert!(
+                reopened
+                    .commit_ingress(identity, Transaction::new())
+                    .unwrap()
+                    .deduplicated
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_compact_identity_index_decodes_without_exact_payloads() {
+        #[derive(serde::Serialize)]
+        struct LegacyIdentified {
+            commit_id: u128,
+            payload_len: u32,
+            payload_crc32: u32,
+            points: u64,
+            records: u64,
+        }
+        #[derive(serde::Serialize)]
+        struct LegacyIngress {
+            source_id: u128,
+            sequence: u64,
+            commit_id: u128,
+            canonical_payload_len: u32,
+            canonical_payload_crc32: u32,
+            points: u64,
+            records: u64,
+        }
+        #[derive(serde::Serialize)]
+        struct LegacyIndex {
+            identified: Vec<LegacyIdentified>,
+            ingress: Vec<LegacyIngress>,
+        }
+
+        let encoded = postcard::to_stdvec(&LegacyIndex {
+            identified: vec![LegacyIdentified {
+                commit_id: 1,
+                payload_len: 28,
+                payload_crc32: 2,
+                points: 3,
+                records: 4,
+            }],
+            ingress: vec![LegacyIngress {
+                source_id: 5,
+                sequence: 6,
+                commit_id: 7,
+                canonical_payload_len: 12,
+                canonical_payload_crc32: 8,
+                points: 9,
+                records: 0,
+            }],
+        })
+        .unwrap();
+        let decoded = super::decode_identity_index(&encoded, 0).unwrap();
+        assert!(decoded.identified[0].payload.is_empty());
+        assert!(decoded.ingress[0].canonical_payload.is_empty());
+        assert_eq!(decoded.ingress[0].frame_offset, 0);
+        assert_eq!(decoded.ingress[0].bytes_written, 0);
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("legacy-index.ftwdb");
+        header_only(&path);
+        let mut transaction = Transaction::new();
+        transaction.with_commit_id(77);
+        let payload = encode_transaction(&transaction).unwrap();
+        let legacy = postcard::to_stdvec(&LegacyIndex {
+            identified: vec![LegacyIdentified {
+                commit_id: 77,
+                payload_len: payload.len() as u32,
+                payload_crc32: crc32fast::hash(&payload),
+                points: 0,
+                records: 0,
+            }],
+            ingress: Vec::new(),
+        })
+        .unwrap();
+        append_raw_frame(&path, super::FRAME_KIND_IDENTITY_INDEX, 0, &legacy);
+
+        let mut database = Database::open(&path).unwrap();
+        assert!(database.contains_commit_id(77));
+        assert!(matches!(
+            database.commit(transaction),
+            Err(Error::IngressCommitIdConflict { commit_id: 77 })
+        ));
     }
 
     #[test]
