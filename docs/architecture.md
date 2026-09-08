@@ -1,5 +1,9 @@
 # Architecture and invariants
 
+> Historical document. FTWDB is an archived test lab; its engine and shadow
+> integration are retired. See the [archive record](test-lab.md) for the
+> adopted DuckDB/Core direction, evidence and limits.
+
 ## Product boundary
 
 FTWDB is an embedded, single-node energy database first. It should run inside

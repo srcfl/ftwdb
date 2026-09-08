@@ -1,0 +1,115 @@
+{
+  "kind": "influx",
+  "tag": "smoke5-influx-r1",
+  "memory_mib": 512,
+  "cpus": 1,
+  "points": 100,
+  "image": "influxdb@sha256:b3e577f38c19963597170d8850a3a7f77af8f0cfa866c64cd13e5de0f238e114",
+  "started_at": "2026-09-07T18:12:38Z",
+  "command": [
+    "docker",
+    "run",
+    "-d",
+    "--name",
+    "ftwdb-eval-smoke5-influx-r1",
+    "--label",
+    "purpose=ftwdb-evaluation",
+    "--network",
+    "ftwdb-eval-20260907",
+    "--network-alias",
+    "engine",
+    "--cpus",
+    "1",
+    "--memory",
+    "512m",
+    "--memory-swap",
+    "512m",
+    "--pids-limit",
+    "256",
+    "--mount",
+    "type=volume,source=ftwdb-eval-smoke5-influx-r1-data,target=/data",
+    "--mount",
+    "type=bind,source=<evaluation-root>,target=/eval,readonly",
+    "influxdb@sha256:b3e577f38c19963597170d8850a3a7f77af8f0cfa866c64cd13e5de0f238e114",
+    "influxdb3",
+    "serve",
+    "--http-bind=0.0.0.0:8080",
+    "--node-id=eval",
+    "--object-store=file",
+    "--data-dir=/data",
+    "--without-auth",
+    "--wal-flush-interval=100ms",
+    "--exec-mem-pool-bytes=67108864",
+    "--force-snapshot-mem-threshold=100663296",
+    "--parquet-mem-cache-size=33554432",
+    "--datafusion-num-threads=1",
+    "--wal-replay-concurrency-limit=1"
+  ],
+  "health": "OK",
+  "submit_seconds": 0.0754548340000003,
+  "batch_latency_ms": {
+    "p50": 75.45170899999975,
+    "p95": 75.45170899999975,
+    "samples": [
+      75.45170899999975
+    ]
+  },
+  "validation": {
+    "compared": 100,
+    "expected": 100,
+    "missing": 0,
+    "extra": 0,
+    "duplicates": 0,
+    "f64_bit_differences": 0,
+    "max_absolute_error": 0.0,
+    "examples": [],
+    "seconds": 0.13076154200000012
+  },
+  "queries": {
+    "day_aggregate": {
+      "ms": [
+        2.4387080000001227,
+        1.8002919999999811,
+        1.8139999999999823,
+        1.575832999999971,
+        1.7168330000001397
+      ],
+      "median_ms": 1.8002919999999811,
+      "result_rows": 52,
+      "count_sum": 100
+    },
+    "five_minute": {
+      "ms": [
+        2.8951249999997763,
+        2.233208000000264,
+        2.093791000000067,
+        2.0397910000000685,
+        2.23320799999982
+      ],
+      "median_ms": 2.23320799999982,
+      "result_rows": 52,
+      "count_sum": 100
+    }
+  },
+  "state": {
+    "Status": "running",
+    "Running": true,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 196742,
+    "ExitCode": 0,
+    "Error": "",
+    "StartedAt": "2026-09-07T18:12:38.670359288Z",
+    "FinishedAt": "0001-01-01T00:00:00Z"
+  },
+  "ok": true,
+  "volume": "ftwdb-eval-smoke5-influx-r1-data",
+  "memory_peak_bytes_by_phase": {
+    "idle": 271056896,
+    "after_ingest": 271056896,
+    "after_query": 271056896,
+    "final": 271056896
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "kind": "sqlite-full",
+  "sent_points": 50,
+  "scope": "process SIGKILL only; no VM reboot, fsync fault injection, or physical power cut",
+  "command": [
+    "docker",
+    "run",
+    "-d",
+    "--name",
+    "ftwdb-eval-semantics-sqlite-full",
+    "--label",
+    "purpose=ftwdb-evaluation",
+    "--network",
+    "ftwdb-eval-20260907",
+    "--network-alias",
+    "engine",
+    "--cpus",
+    "1",
+    "--memory",
+    "512m",
+    "--memory-swap",
+    "512m",
+    "--pids-limit",
+    "256",
+    "--mount",
+    "type=volume,source=ftwdb-eval-semantics-sqlite-full-data,target=/data",
+    "--mount",
+    "type=bind,source=<evaluation-root>,target=/eval,readonly",
+    "-e",
+    "GOMAXPROCS=1",
+    "-e",
+    "GOMEMLIMIT=192MiB",
+    "-e",
+    "SQLITE_SYNC=FULL",
+    "alpine@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40",
+    "/eval/bin/sqlite-http"
+  ],
+  "ack_to_kill_return_ms": 154.38783300000014,
+  "killed_state": {
+    "Status": "exited",
+    "Running": false,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 0,
+    "ExitCode": 137,
+    "Error": "",
+    "StartedAt": "2026-09-07T18:14:08.348500198Z",
+    "FinishedAt": "2026-09-07T18:14:08.800460648Z"
+  },
+  "after_restart_rows": 50,
+  "after_restart_matching_values": 50,
+  "retry_responses": [
+    "accepted",
+    "accepted",
+    "accepted"
+  ],
+  "same_identity_readback": [
+    [
+      1767225601234,
+      2.5
+    ]
+  ],
+  "ok": true
+}

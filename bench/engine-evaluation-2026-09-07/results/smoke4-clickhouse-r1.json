@@ -1,0 +1,106 @@
+{
+  "kind": "clickhouse",
+  "tag": "smoke4-clickhouse-r1",
+  "memory_mib": 512,
+  "cpus": 1,
+  "points": 100,
+  "image": "clickhouse/clickhouse-server@sha256:456063a689194186633bb3db0862283068f4c2ee538852d3aaffa7eb66f1f841",
+  "started_at": "2026-09-07T18:11:05Z",
+  "command": [
+    "docker",
+    "run",
+    "-d",
+    "--name",
+    "ftwdb-eval-smoke4-clickhouse-r1",
+    "--label",
+    "purpose=ftwdb-evaluation",
+    "--network",
+    "ftwdb-eval-20260907",
+    "--network-alias",
+    "engine",
+    "--cpus",
+    "1",
+    "--memory",
+    "512m",
+    "--memory-swap",
+    "512m",
+    "--pids-limit",
+    "256",
+    "--mount",
+    "type=volume,source=ftwdb-eval-smoke4-clickhouse-r1-data,target=/data",
+    "--mount",
+    "type=bind,source=<evaluation-root>,target=/eval,readonly",
+    "--entrypoint",
+    "clickhouse",
+    "clickhouse/clickhouse-server@sha256:456063a689194186633bb3db0862283068f4c2ee538852d3aaffa7eb66f1f841",
+    "server",
+    "--config-file=/eval/harness/clickhouse.xml"
+  ],
+  "health": "Ok.\n",
+  "submit_seconds": 0.019748041999996246,
+  "batch_latency_ms": {
+    "p50": 19.74583299999466,
+    "p95": 19.74583299999466,
+    "samples": [
+      19.74583299999466
+    ]
+  },
+  "validation": {
+    "compared": 100,
+    "expected": 100,
+    "missing": 0,
+    "extra": 0,
+    "duplicates": 0,
+    "f64_bit_differences": 0,
+    "max_absolute_error": 0.0,
+    "examples": [],
+    "seconds": 0.07692166700000058
+  },
+  "queries": {
+    "day_aggregate": {
+      "ms": [
+        2.9809589999985064,
+        1.9642500000003338,
+        1.6912080000039964,
+        16.054832999998325,
+        2.157458999995754
+      ],
+      "median_ms": 2.157458999995754,
+      "result_rows": 52,
+      "count_sum": 100
+    },
+    "five_minute": {
+      "ms": [
+        3.403290999997921,
+        1.8730829999995535,
+        1.726374999996949,
+        10.592207999998493,
+        2.340708999994945
+      ],
+      "median_ms": 2.340708999994945,
+      "result_rows": 52,
+      "count_sum": 100
+    }
+  },
+  "state": {
+    "Status": "running",
+    "Running": true,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 196341,
+    "ExitCode": 0,
+    "Error": "",
+    "StartedAt": "2026-09-07T18:11:05.19437208Z",
+    "FinishedAt": "0001-01-01T00:00:00Z"
+  },
+  "ok": true,
+  "volume": "ftwdb-eval-smoke4-clickhouse-r1-data",
+  "memory_peak_bytes_by_phase": {
+    "idle": 536870912,
+    "after_ingest": 536870912,
+    "after_query": 536870912,
+    "final": 536870912
+  }
+}

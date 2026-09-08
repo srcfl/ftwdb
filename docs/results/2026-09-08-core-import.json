@@ -1,0 +1,117 @@
+{
+  "returncode": 0,
+  "elapsed_seconds": 387.617646208,
+  "peak_rss_bytes": 261701632,
+  "binary_sha256": "1e1c41707688e5e883369855465e82b1d5cb7376b1519513960596e19fd544ef",
+  "native_observer": "0",
+  "completed_parquet_files": 131,
+  "events": [
+    {
+      "action": "open",
+      "go_heap_alloc_bytes": 2810552,
+      "go_heap_sys_bytes": 11960320,
+      "go_sys_bytes": 17664264,
+      "stage": "open_start",
+      "utc": "2026-09-08T08:09:10.430652Z"
+    },
+    {
+      "go_heap_alloc_bytes": 3124952,
+      "go_heap_sys_bytes": 19595264,
+      "go_sys_bytes": 28629272,
+      "seconds": 387.477337,
+      "stage": "open_ok",
+      "utc": "2026-09-08T08:15:37.905849Z"
+    },
+    {
+      "duckdb": "v1.5.5",
+      "go_heap_alloc_bytes": 3128664,
+      "go_heap_sys_bytes": 19595264,
+      "go_sys_bytes": 28629272,
+      "max_temp_directory_size": "488.2 MiB",
+      "memory_limit": "122.0 MiB",
+      "persistent_native_observer": false,
+      "stage": "settings",
+      "threads": 2,
+      "utc": "2026-09-08T08:15:37.906533Z"
+    },
+    {
+      "go_heap_alloc_bytes": 3135520,
+      "go_heap_sys_bytes": 19595264,
+      "go_sys_bytes": 28629272,
+      "phase": "after_open",
+      "stage": "native_snapshot",
+      "tags_memory_temp": {
+        "ART_INDEX": [
+          786432,
+          0
+        ],
+        "BASE_TABLE": [
+          2883584,
+          0
+        ]
+      },
+      "utc": "2026-09-08T08:15:37.907006Z"
+    },
+    {
+      "go_heap_alloc_bytes": 3138016,
+      "go_heap_sys_bytes": 19595264,
+      "go_sys_bytes": 28629272,
+      "scope": "OpenWithLegacyHistory includes SQLite and Parquet before writer startup",
+      "stage": "parquet_completed_in_open",
+      "utc": "2026-09-08T08:15:37.907921Z"
+    },
+    {
+      "go_heap_alloc_bytes": 3140672,
+      "go_heap_sys_bytes": 19595264,
+      "go_sys_bytes": 28629272,
+      "samples": 160585961,
+      "stage": "after_parquet",
+      "utc": "2026-09-08T08:15:37.908657Z"
+    },
+    {
+      "go_heap_alloc_bytes": 3145072,
+      "go_heap_sys_bytes": 19595264,
+      "go_sys_bytes": 28629272,
+      "phase": "after_import",
+      "stage": "native_snapshot",
+      "tags_memory_temp": {
+        "ART_INDEX": [
+          786432,
+          0
+        ],
+        "BASE_TABLE": [
+          2883584,
+          0
+        ]
+      },
+      "utc": "2026-09-08T08:15:37.908745Z"
+    },
+    {
+      "go_heap_alloc_bytes": 3149024,
+      "go_heap_sys_bytes": 19595264,
+      "go_sys_bytes": 28629272,
+      "seconds": 0.006396583,
+      "stage": "close_ok",
+      "utc": "2026-09-08T08:15:37.915232Z"
+    }
+  ],
+  "max_go_heap": 9382984,
+  "max_go_sys": 28629272,
+  "duckdb_bytes": 7619227648,
+  "scope": "Historical local import test on Apple M5/macOS, 32 GiB RAM; not a Raspberry Pi or physical power-cut test.",
+  "core_commit": "1bd31f6b3fa6d95e3bcc8167d2064c1c7c0c3842",
+  "independent_readback": {
+    "sqlite_samples": 20998953,
+    "parquet_rows": 139587008,
+    "total_samples": 160585961,
+    "utc_days": 147,
+    "differences": 0,
+    "sha256": "49f66bcb765be4314b77d66e34d1ba0d0aa1054ec2be7a868594e5b1c3b8b48d"
+  },
+  "limitations": [
+    "This test used the earlier blocking OpenWithLegacyHistory path.",
+    "The separate 60-tick sample-only probe did not cover the energy ledger.",
+    "A full-day live-write soak and a full 160.6-million-row portable backup/restore were not run.",
+    "Raw site data and device identifiers are not part of this archive."
+  ]
+}

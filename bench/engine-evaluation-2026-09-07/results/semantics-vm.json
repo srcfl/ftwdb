@@ -1,0 +1,75 @@
+{
+  "kind": "vm",
+  "sent_points": 50,
+  "scope": "process SIGKILL only; no VM reboot, fsync fault injection, or physical power cut",
+  "command": [
+    "docker",
+    "run",
+    "-d",
+    "--name",
+    "ftwdb-eval-semantics-vm",
+    "--label",
+    "purpose=ftwdb-evaluation",
+    "--network",
+    "ftwdb-eval-20260907",
+    "--network-alias",
+    "engine",
+    "--cpus",
+    "1",
+    "--memory",
+    "512m",
+    "--memory-swap",
+    "512m",
+    "--pids-limit",
+    "256",
+    "--mount",
+    "type=volume,source=ftwdb-eval-semantics-vm-data,target=/data",
+    "--mount",
+    "type=bind,source=<evaluation-root>,target=/eval,readonly",
+    "-e",
+    "GOMAXPROCS=1",
+    "victoriametrics/victoria-metrics@sha256:6d164540a04f49ba4e696cbdb70f9fee78be1e94b8f2a1292743a0b1ab8275bd",
+    "-httpListenAddr=:8080",
+    "-storageDataPath=/data",
+    "-retentionPeriod=100y",
+    "-memory.allowedBytes=64MiB",
+    "-search.maxMemoryPerQuery=64MiB",
+    "-search.maxConcurrentRequests=1"
+  ],
+  "ack_to_kill_return_ms": 114.56291599999702,
+  "killed_state": {
+    "Status": "exited",
+    "Running": false,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 0,
+    "ExitCode": 137,
+    "Error": "",
+    "StartedAt": "2026-09-07T18:14:42.963740531Z",
+    "FinishedAt": "2026-09-07T18:14:43.343907571Z"
+  },
+  "after_restart_rows": 0,
+  "after_restart_matching_values": 0,
+  "retry_responses": [
+    "accepted",
+    "accepted",
+    "accepted"
+  ],
+  "same_identity_readback": [
+    [
+      1767225601234,
+      1.25
+    ],
+    [
+      1767225601234,
+      1.25
+    ],
+    [
+      1767225601234,
+      2.5
+    ]
+  ],
+  "ok": true
+}

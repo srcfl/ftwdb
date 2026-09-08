@@ -1,5 +1,9 @@
 # OSS database research
 
+> Historical document. FTWDB is an archived test lab; its engine and shadow
+> integration are retired. See the [archive record](test-lab.md) for the
+> adopted DuckDB/Core direction, evidence and limits.
+
 Reviewed 2026-07-21 from primary project documentation, repositories, and
 papers. “All databases” is not a finite or stable set; this is the maintained
 OSS comparison set plus historically important designs. The benchmark registry

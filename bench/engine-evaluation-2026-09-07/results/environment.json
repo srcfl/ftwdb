@@ -1,0 +1,26 @@
+{
+  "date": "2026-09-07",
+  "host_platform": "macOS-26.6.2-arm64-arm-64bit",
+  "machine": "arm64",
+  "python": "3.9.6",
+  "docker": {
+    "ServerVersion": "29.4.0",
+    "KernelVersion": "7.0.14-orbstack-00380-ga7e0a2dc9535",
+    "OperatingSystem": "OrbStack",
+    "OSType": "linux",
+    "Architecture": "aarch64",
+    "NCPU": 10,
+    "MemTotal": 16819609600,
+    "Driver": "overlayfs",
+    "CgroupVersion": "2",
+    "CgroupDriver": "cgroupfs"
+  },
+  "sha256": {
+    "harness/go.mod": "6243e33d053b933aad01cba329068fc081d999e33f1cc8d79637a8d0f1050a03",
+    "harness/go.sum": "f99837a4d786a403825a6dd28dd3e664fb08d7cf74c882a1aa2e502de7b260c4",
+    "bin/sqlite-http": "5cae44796e3779b6b109ddba8b3e4ced80291aae18a793fe9c65d83ee01bd7ce",
+    "harness/duck_server.py": "3e432c2f00024da34f4cdbba4b4cc7aa6bc38aef42779c22c565bd23c8a11985",
+    "harness/clickhouse.xml": "a1ae8739f1c6edf8db56169c8f9d7c9707e5847c00d5a3fb628af7c144c32e1b",
+    "snapshots/day.parquet": "be9c3b795bd2d4494143ee823ff0f50877b0464c41b8fe2361e5e0310308db3b"
+  }
+}

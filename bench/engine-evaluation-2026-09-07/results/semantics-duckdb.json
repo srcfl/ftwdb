@@ -1,0 +1,63 @@
+{
+  "kind": "duckdb",
+  "sent_points": 50,
+  "scope": "process SIGKILL only; no VM reboot, fsync fault injection, or physical power cut",
+  "command": [
+    "docker",
+    "run",
+    "-d",
+    "--name",
+    "ftwdb-eval-semantics-duckdb",
+    "--label",
+    "purpose=ftwdb-evaluation",
+    "--network",
+    "ftwdb-eval-20260907",
+    "--network-alias",
+    "engine",
+    "--cpus",
+    "1",
+    "--memory",
+    "512m",
+    "--memory-swap",
+    "512m",
+    "--pids-limit",
+    "256",
+    "--mount",
+    "type=volume,source=ftwdb-eval-semantics-duckdb-data,target=/data",
+    "--mount",
+    "type=bind,source=<evaluation-root>,target=/eval,readonly",
+    "-e",
+    "PYTHONPATH=/eval/bin/python-site",
+    "python@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36",
+    "python",
+    "/eval/harness/duck_server.py"
+  ],
+  "ack_to_kill_return_ms": 155.25608399999948,
+  "killed_state": {
+    "Status": "exited",
+    "Running": false,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 0,
+    "ExitCode": 137,
+    "Error": "",
+    "StartedAt": "2026-09-07T18:14:11.03189347Z",
+    "FinishedAt": "2026-09-07T18:14:11.87387166Z"
+  },
+  "after_restart_rows": 50,
+  "after_restart_matching_values": 50,
+  "retry_responses": [
+    "accepted",
+    "HTTP 500 /write: {\"error\": \"Constraint Error: Duplicate key \\\"driver: revision, metric: watts, ts_ms: 1767225601234\\\" violates primary key constraint.\"}",
+    "HTTP 500 /write: {\"error\": \"Constraint Error: Duplicate key \\\"driver: revision, metric: watts, ts_ms: 1767225601234\\\" violates primary key constraint.\"}"
+  ],
+  "same_identity_readback": [
+    [
+      1767225601234,
+      1.25
+    ]
+  ],
+  "ok": true
+}

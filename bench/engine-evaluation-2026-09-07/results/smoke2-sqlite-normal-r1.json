@@ -1,0 +1,26 @@
+{
+  "kind": "sqlite-normal",
+  "tag": "smoke2-sqlite-normal-r1",
+  "memory_mib": 512,
+  "cpus": 1,
+  "points": 100,
+  "image": "alpine@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40",
+  "started_at": "2026-09-07T18:07:48Z",
+  "error": "startup failed {\"Status\": \"exited\", \"Running\": false, \"Paused\": false, \"Restarting\": false, \"OOMKilled\": false, \"Dead\": false, \"Pid\": 0, \"ExitCode\": 143, \"Error\": \"\", \"StartedAt\": \"2026-09-07T18:07:48.953534314Z\", \"FinishedAt\": \"2026-09-07T18:08:02.407451088Z\"} ",
+  "traceback": "Traceback (most recent call last):\n  File \"<evaluation-root>/harness/run.py\", line 78, in ready\n    try: return http(self.port,path,timeout=1).decode()\n  File \"<evaluation-root>/harness/run.py\", line 26, in http\n    c=http.client.HTTPConnection('127.0.0.1',port,timeout=timeout)\nAttributeError: 'function' object has no attribute 'client'\n\nDuring handling of the above exception, another exception occurred:\n\nTraceback (most recent call last):\n  File \"<evaluation-root>/harness/run.py\", line 122, in run_trial\n    e.start();r['command']=e.command;r['health']=e.ready();e.snapshot_stats('idle')\n  File \"<evaluation-root>/harness/run.py\", line 72, in start\n    self.command=['docker',*args];docker(*args);self.ready()\n  File \"<evaluation-root>/harness/run.py\", line 81, in ready\n    if not state['Running']: raise RuntimeError('startup failed '+json.dumps(state)+' '+docker('logs','--tail','25',self.name,check=False))\nRuntimeError: startup failed {\"Status\": \"exited\", \"Running\": false, \"Paused\": false, \"Restarting\": false, \"OOMKilled\": false, \"Dead\": false, \"Pid\": 0, \"ExitCode\": 143, \"Error\": \"\", \"StartedAt\": \"2026-09-07T18:07:48.953534314Z\", \"FinishedAt\": \"2026-09-07T18:08:02.407451088Z\"} \n",
+  "ok": false,
+  "state": {
+    "Status": "exited",
+    "Running": false,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 0,
+    "ExitCode": 143,
+    "Error": "",
+    "StartedAt": "2026-09-07T18:07:48.953534314Z",
+    "FinishedAt": "2026-09-07T18:08:02.407451088Z"
+  },
+  "volume": "ftwdb-eval-smoke2-sqlite-normal-r1-data"
+}

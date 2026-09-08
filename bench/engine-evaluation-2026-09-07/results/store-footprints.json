@@ -1,0 +1,26 @@
+{
+  "sqlite-full": {
+    "logical_bytes": 26014840,
+    "allocated_bytes": 26017792
+  },
+  "sqlite-normal": {
+    "logical_bytes": 26014840,
+    "allocated_bytes": 26017792
+  },
+  "duckdb": {
+    "logical_bytes": 54276096,
+    "allocated_bytes": 54276096
+  },
+  "vm": {
+    "logical_bytes": 1214452,
+    "allocated_bytes": 1318912
+  },
+  "influx": {
+    "logical_bytes": 28672078,
+    "allocated_bytes": 28827648
+  },
+  "clickhouse": {
+    "logical_bytes": 19635612,
+    "allocated_bytes": 23703552
+  }
+}

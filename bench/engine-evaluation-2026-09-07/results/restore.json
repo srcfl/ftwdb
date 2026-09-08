@@ -1,0 +1,19 @@
+[
+  {
+    "kind": "sqlite-full",
+    "scope": "offline archive; new volume; full readback",
+    "matching_points": 889978,
+    "integrity_check": [
+      {
+        "integrity_check": "ok"
+      }
+    ],
+    "ok": true
+  },
+  {
+    "kind": "duckdb",
+    "scope": "offline archive; new volume; full readback",
+    "matching_points": 889978,
+    "ok": true
+  }
+]

@@ -1,0 +1,72 @@
+{
+  "kind": "influx",
+  "sent_points": 50,
+  "scope": "process SIGKILL only; no VM reboot, fsync fault injection, or physical power cut",
+  "command": [
+    "docker",
+    "run",
+    "-d",
+    "--name",
+    "ftwdb-eval-semantics-influx",
+    "--label",
+    "purpose=ftwdb-evaluation",
+    "--network",
+    "ftwdb-eval-20260907",
+    "--network-alias",
+    "engine",
+    "--cpus",
+    "1",
+    "--memory",
+    "512m",
+    "--memory-swap",
+    "512m",
+    "--pids-limit",
+    "256",
+    "--mount",
+    "type=volume,source=ftwdb-eval-semantics-influx-data,target=/data",
+    "--mount",
+    "type=bind,source=<evaluation-root>,target=/eval,readonly",
+    "influxdb@sha256:b3e577f38c19963597170d8850a3a7f77af8f0cfa866c64cd13e5de0f238e114",
+    "influxdb3",
+    "serve",
+    "--http-bind=0.0.0.0:8080",
+    "--node-id=eval",
+    "--object-store=file",
+    "--data-dir=/data",
+    "--without-auth",
+    "--wal-flush-interval=100ms",
+    "--exec-mem-pool-bytes=67108864",
+    "--force-snapshot-mem-threshold=100663296",
+    "--parquet-mem-cache-size=33554432",
+    "--datafusion-num-threads=1",
+    "--wal-replay-concurrency-limit=1"
+  ],
+  "ack_to_kill_return_ms": 115.04179199999953,
+  "killed_state": {
+    "Status": "exited",
+    "Running": false,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 0,
+    "ExitCode": 137,
+    "Error": "",
+    "StartedAt": "2026-09-07T18:14:44.714922431Z",
+    "FinishedAt": "2026-09-07T18:14:47.368059226Z"
+  },
+  "after_restart_rows": 50,
+  "after_restart_matching_values": 50,
+  "retry_responses": [
+    "accepted",
+    "accepted",
+    "accepted"
+  ],
+  "same_identity_readback": [
+    [
+      1767225601234,
+      2.5
+    ]
+  ],
+  "ok": true
+}

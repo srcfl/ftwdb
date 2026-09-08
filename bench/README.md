@@ -1,5 +1,9 @@
 # Competitor harness
 
+This is a frozen test lab. See the [archive record](../docs/test-lab.md) and
+the later [September engine evaluation](engine-evaluation-2026-09-07/README.md).
+The registry below describes the earlier harness and its subset coverage.
+
 `compose.yml` pins each server image by digest. Profiles keep heavyweight
 engines from accidentally running together on a developer laptop.
 
