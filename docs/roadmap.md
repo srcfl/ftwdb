@@ -1,5 +1,9 @@
 # Roadmap
 
+> Historical document. FTWDB is an archived test lab; its engine and shadow
+> integration are retired. See the [archive record](test-lab.md) for the
+> adopted DuckDB/Core direction, evidence and limits.
+
 ## M0: durability and semantics — initial exit complete
 
 - checksummed append frames and tail recovery;

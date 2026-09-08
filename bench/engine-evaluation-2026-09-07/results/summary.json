@@ -1,0 +1,65 @@
+{
+  "sqlite-full": {
+    "ingest_s": 3.8052914170000065,
+    "query_medians_ms": {
+      "day_aggregate": 180.7471660000033,
+      "five_minute": 908.4224160000076
+    },
+    "min_ingest_s": 3.3409402500000005,
+    "max_ingest_s": 3.877052000000006
+  },
+  "sqlite-normal": {
+    "ingest_s": 3.5786034590000213,
+    "query_medians_ms": {
+      "day_aggregate": 179.55079099999693,
+      "five_minute": 919.287957999984
+    },
+    "min_ingest_s": 3.229599500000006,
+    "max_ingest_s": 3.5823812499999974
+  },
+  "duckdb": {
+    "ingest_s": 2.314269582999998,
+    "query_medians_ms": {
+      "day_aggregate": 15.74766699999941,
+      "five_minute": 38.89283399999499
+    },
+    "min_ingest_s": 2.2631691249999903,
+    "max_ingest_s": 2.6808713340000025
+  },
+  "vm": {
+    "ingest_s": 0.35258724999999913,
+    "query_medians_ms": {
+      "count_over_24h": 7.265416999999275
+    },
+    "min_ingest_s": 0.3517180000000053,
+    "max_ingest_s": 0.3695138329999992
+  },
+  "influx": {
+    "ingest_s": 8.87435662499999,
+    "query_medians_ms": {
+      "day_aggregate": 269.5327920000068,
+      "five_minute": 270.1045830000055
+    },
+    "min_ingest_s": 8.837700042000002,
+    "max_ingest_s": 8.885396709000005
+  },
+  "clickhouse": {
+    "ingest_s": 2.4627296670000014,
+    "query_medians_ms": {
+      "day_aggregate": 28.769499999999226,
+      "five_minute": 70.58587500000257
+    },
+    "min_ingest_s": 2.3514801249999997,
+    "max_ingest_s": 3.042059792
+  },
+  "parquet": {
+    "sqlite-full": {
+      "all": 300.70191700000134,
+      "one_series": 240.5346660000003
+    },
+    "duckdb": {
+      "all": 8.988833000000085,
+      "one_series": 10.608000000001283
+    }
+  }
+}

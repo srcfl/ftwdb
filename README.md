@@ -1,4 +1,24 @@
-# FTWDB
+# FTWDB — archived energy-storage test lab
+
+**Archived on 8 September 2026.** This repository preserves the experimental
+engine, fault tests, sanitized workloads and database comparison results. It
+has no active release or support programme.
+
+FTW now embeds DuckDB in Core for history and keeps SQLite for configuration.
+FTWDB is no longer part of the FTW runtime. New storage work belongs in
+[FTW Core](https://github.com/srcfl/ftw/tree/master/go/internal/state).
+
+Start with the [archive record and lessons](docs/test-lab.md), the
+[engine comparison](docs/results/2026-09-07-engine-evaluation.md), and the
+[archived benchmark runners and raw measurements](bench/engine-evaluation-2026-09-07/README.md).
+The final local work is preserved on
+[`archive/final-lab-snapshot-2026-09-08`](https://github.com/srcfl/ftwdb/tree/archive/final-lab-snapshot-2026-09-08).
+That snapshot is separate from the newer fixes already on `main`.
+
+## Historical engine and lab commands
+
+The material below describes the experiment at archive time. Commands are for
+isolated research on copies of data, not a supported installation path.
 
 **Forecasts, Telemetry & Watts.**
 
@@ -7,7 +27,7 @@ small Rust engine that is fast on time-window aggregates, survives abrupt power
 loss, and minimizes write amplification on SD cards and other constrained edge
 storage.
 
-The current release is **v0.1.0-alpha.1**. It is an evaluation build for Unix
+The last published release is **v0.1.0-alpha.1**. It is an evaluation build for Unix
 systems, not a production release. Download release archives from
 [GitHub Releases](https://github.com/srcfl/ftwdb/releases), or install the CLI
 from its immutable tag:

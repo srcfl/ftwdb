@@ -1,0 +1,26 @@
+{
+  "kind": "clickhouse",
+  "tag": "smoke-clickhouse-r1",
+  "memory_mib": 512,
+  "cpus": 1,
+  "points": 100,
+  "image": "clickhouse/clickhouse-server@sha256:456063a689194186633bb3db0862283068f4c2ee538852d3aaffa7eb66f1f841",
+  "started_at": "2026-09-07T18:05:48Z",
+  "error": "docker ('run', '-d', '--name', 'ftwdb-eval-smoke-clickhouse-r1', '--label', 'purpose=ftwdb-evaluation', '--network', 'ftwdb-eval-20260907', '--cpus', '1', '--memory', '512m', '--memory-swap', '512m', '--pids-limit', '256', '--mount', 'type=volume,source=ftwdb-eval-smoke-clickhouse-r1-data,target=/data', '--mount', 'type=bind,source=<evaluation-root>,target=/eval,readonly', '-p', '127.0.0.1:18421:8123', '--entrypoint', 'clickhouse', 'clickhouse/clickhouse-server@sha256:456063a689194186633bb3db0862283068f4c2ee538852d3aaffa7eb66f1f841', 'server', '--config-file=/eval/harness/clickhouse.xml'): docker: Error response from daemon: failed to set up container networking: network ftwdb-eval-20260907 not found\n\nRun 'docker run --help' for more information\n",
+  "traceback": "Traceback (most recent call last):\n  File \"<evaluation-root>/harness/run.py\", line 122, in run_trial\n    e.start();r['command']=e.command;r['health']=e.ready();e.snapshot_stats('idle')\n  File \"<evaluation-root>/harness/run.py\", line 72, in start\n    self.command=['docker',*args];docker(*args);self.ready()\n  File \"<evaluation-root>/harness/run.py\", line 22, in docker\n    if check and p.returncode: raise RuntimeError('docker '+str(args)+': '+p.stderr[-3000:])\nRuntimeError: docker ('run', '-d', '--name', 'ftwdb-eval-smoke-clickhouse-r1', '--label', 'purpose=ftwdb-evaluation', '--network', 'ftwdb-eval-20260907', '--cpus', '1', '--memory', '512m', '--memory-swap', '512m', '--pids-limit', '256', '--mount', 'type=volume,source=ftwdb-eval-smoke-clickhouse-r1-data,target=/data', '--mount', 'type=bind,source=<evaluation-root>,target=/eval,readonly', '-p', '127.0.0.1:18421:8123', '--entrypoint', 'clickhouse', 'clickhouse/clickhouse-server@sha256:456063a689194186633bb3db0862283068f4c2ee538852d3aaffa7eb66f1f841', 'server', '--config-file=/eval/harness/clickhouse.xml'): docker: Error response from daemon: failed to set up container networking: network ftwdb-eval-20260907 not found\n\nRun 'docker run --help' for more information\n\n",
+  "ok": false,
+  "state": {
+    "Status": "created",
+    "Running": false,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 0,
+    "ExitCode": 128,
+    "Error": "failed to set up container networking: network ftwdb-eval-20260907 not found",
+    "StartedAt": "0001-01-01T00:00:00Z",
+    "FinishedAt": "0001-01-01T00:00:00Z"
+  },
+  "volume": "ftwdb-eval-smoke-clickhouse-r1-data"
+}

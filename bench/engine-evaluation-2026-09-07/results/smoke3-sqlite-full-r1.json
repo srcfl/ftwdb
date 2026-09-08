@@ -1,0 +1,26 @@
+{
+  "kind": "sqlite-full",
+  "tag": "smoke3-sqlite-full-r1",
+  "memory_mib": 512,
+  "cpus": 1,
+  "points": 100,
+  "image": "alpine@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40",
+  "started_at": "2026-09-07T18:08:55Z",
+  "error": "not ready after 60s",
+  "traceback": "Traceback (most recent call last):\n  File \"<evaluation-root>/harness/run.py\", line 125, in run_trial\n    e.start();r['command']=e.command;r['health']=e.ready();e.snapshot_stats('idle')\n  File \"<evaluation-root>/harness/run.py\", line 75, in start\n    self.command=['docker',*args];docker(*args);self.ready()\n  File \"<evaluation-root>/harness/run.py\", line 86, in ready\n    raise RuntimeError('not ready after 60s')\nRuntimeError: not ready after 60s\n",
+  "ok": false,
+  "state": {
+    "Status": "running",
+    "Running": true,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 195207,
+    "ExitCode": 0,
+    "Error": "",
+    "StartedAt": "2026-09-07T18:08:56.02876165Z",
+    "FinishedAt": "0001-01-01T00:00:00Z"
+  },
+  "volume": "ftwdb-eval-smoke3-sqlite-full-r1-data"
+}

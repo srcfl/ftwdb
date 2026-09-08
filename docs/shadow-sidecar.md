@@ -1,5 +1,9 @@
 # FTW shadow sidecar
 
+> Historical document. FTWDB is an archived test lab; its engine and shadow
+> integration are retired. See the [archive record](test-lab.md) for the
+> adopted DuckDB/Core direction, evidence and limits.
+
 ## Scope
 
 The shadow sidecar lets FTW copy data into FTWDB without changing control,

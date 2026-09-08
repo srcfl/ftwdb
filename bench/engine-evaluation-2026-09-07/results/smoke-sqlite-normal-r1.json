@@ -1,0 +1,26 @@
+{
+  "kind": "sqlite-normal",
+  "tag": "smoke-sqlite-normal-r1",
+  "memory_mib": 512,
+  "cpus": 1,
+  "points": 100,
+  "image": "alpine@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40",
+  "started_at": "2026-09-07T18:05:47Z",
+  "error": "docker ('run', '-d', '--name', 'ftwdb-eval-smoke-sqlite-normal-r1', '--label', 'purpose=ftwdb-evaluation', '--network', 'ftwdb-eval-20260907', '--cpus', '1', '--memory', '512m', '--memory-swap', '512m', '--pids-limit', '256', '--mount', 'type=volume,source=ftwdb-eval-smoke-sqlite-normal-r1-data,target=/data', '--mount', 'type=bind,source=<evaluation-root>,target=/eval,readonly', '-p', '127.0.0.1:18421:8080', '-e', 'GOMAXPROCS=1', '-e', 'GOMEMLIMIT=192MiB', '-e', 'SQLITE_SYNC=NORMAL', 'alpine@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40', '/eval/bin/sqlite-http'): docker: Error response from daemon: failed to set up container networking: network ftwdb-eval-20260907 not found\n\nRun 'docker run --help' for more information\n",
+  "traceback": "Traceback (most recent call last):\n  File \"<evaluation-root>/harness/run.py\", line 122, in run_trial\n    e.start();r['command']=e.command;r['health']=e.ready();e.snapshot_stats('idle')\n  File \"<evaluation-root>/harness/run.py\", line 72, in start\n    self.command=['docker',*args];docker(*args);self.ready()\n  File \"<evaluation-root>/harness/run.py\", line 22, in docker\n    if check and p.returncode: raise RuntimeError('docker '+str(args)+': '+p.stderr[-3000:])\nRuntimeError: docker ('run', '-d', '--name', 'ftwdb-eval-smoke-sqlite-normal-r1', '--label', 'purpose=ftwdb-evaluation', '--network', 'ftwdb-eval-20260907', '--cpus', '1', '--memory', '512m', '--memory-swap', '512m', '--pids-limit', '256', '--mount', 'type=volume,source=ftwdb-eval-smoke-sqlite-normal-r1-data,target=/data', '--mount', 'type=bind,source=<evaluation-root>,target=/eval,readonly', '-p', '127.0.0.1:18421:8080', '-e', 'GOMAXPROCS=1', '-e', 'GOMEMLIMIT=192MiB', '-e', 'SQLITE_SYNC=NORMAL', 'alpine@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40', '/eval/bin/sqlite-http'): docker: Error response from daemon: failed to set up container networking: network ftwdb-eval-20260907 not found\n\nRun 'docker run --help' for more information\n\n",
+  "ok": false,
+  "state": {
+    "Status": "created",
+    "Running": false,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 0,
+    "ExitCode": 128,
+    "Error": "failed to set up container networking: network ftwdb-eval-20260907 not found",
+    "StartedAt": "0001-01-01T00:00:00Z",
+    "FinishedAt": "0001-01-01T00:00:00Z"
+  },
+  "volume": "ftwdb-eval-smoke-sqlite-normal-r1-data"
+}

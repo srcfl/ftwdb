@@ -1,0 +1,71 @@
+{
+  "kind": "clickhouse",
+  "sent_points": 50,
+  "scope": "process SIGKILL only; no VM reboot, fsync fault injection, or physical power cut",
+  "command": [
+    "docker",
+    "run",
+    "-d",
+    "--name",
+    "ftwdb-eval-semantics-clickhouse",
+    "--label",
+    "purpose=ftwdb-evaluation",
+    "--network",
+    "ftwdb-eval-20260907",
+    "--network-alias",
+    "engine",
+    "--cpus",
+    "1",
+    "--memory",
+    "512m",
+    "--memory-swap",
+    "512m",
+    "--pids-limit",
+    "256",
+    "--mount",
+    "type=volume,source=ftwdb-eval-semantics-clickhouse-data,target=/data",
+    "--mount",
+    "type=bind,source=<evaluation-root>,target=/eval,readonly",
+    "--entrypoint",
+    "clickhouse",
+    "clickhouse/clickhouse-server@sha256:456063a689194186633bb3db0862283068f4c2ee538852d3aaffa7eb66f1f841",
+    "server",
+    "--config-file=/eval/harness/clickhouse.xml"
+  ],
+  "ack_to_kill_return_ms": 148.16208299999545,
+  "killed_state": {
+    "Status": "exited",
+    "Running": false,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 0,
+    "ExitCode": 137,
+    "Error": "",
+    "StartedAt": "2026-09-07T18:14:48.930096193Z",
+    "FinishedAt": "2026-09-07T18:14:51.026475973Z"
+  },
+  "after_restart_rows": 50,
+  "after_restart_matching_values": 50,
+  "retry_responses": [
+    "accepted",
+    "accepted",
+    "accepted"
+  ],
+  "same_identity_readback": [
+    [
+      1767225601234,
+      2.5
+    ],
+    [
+      1767225601234,
+      1.25
+    ],
+    [
+      1767225601234,
+      1.25
+    ]
+  ],
+  "ok": true
+}

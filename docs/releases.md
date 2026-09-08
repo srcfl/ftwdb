@@ -1,5 +1,9 @@
 # Release policy and process
 
+> Historical document. FTWDB is an archived test lab; its engine and shadow
+> integration are retired. See the [archive record](test-lab.md) for the
+> adopted DuckDB/Core direction, evidence and limits.
+
 FTWDB uses Semantic Versioning for the crate, tags, and GitHub releases. A tag
 has the form `vMAJOR.MINOR.PATCH` or
 `vMAJOR.MINOR.PATCH-(alpha|beta|rc).NUMBER`. The version in `Cargo.toml`, the

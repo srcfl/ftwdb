@@ -1,0 +1,113 @@
+{
+  "kind": "sqlite-full",
+  "tag": "smoke4-sqlite-full-r1",
+  "memory_mib": 512,
+  "cpus": 1,
+  "points": 100,
+  "image": "alpine@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40",
+  "started_at": "2026-09-07T18:10:30Z",
+  "command": [
+    "docker",
+    "run",
+    "-d",
+    "--name",
+    "ftwdb-eval-smoke4-sqlite-full-r1",
+    "--label",
+    "purpose=ftwdb-evaluation",
+    "--network",
+    "ftwdb-eval-20260907",
+    "--network-alias",
+    "engine",
+    "--cpus",
+    "1",
+    "--memory",
+    "512m",
+    "--memory-swap",
+    "512m",
+    "--pids-limit",
+    "256",
+    "--mount",
+    "type=volume,source=ftwdb-eval-smoke4-sqlite-full-r1-data,target=/data",
+    "--mount",
+    "type=bind,source=<evaluation-root>,target=/eval,readonly",
+    "-e",
+    "GOMAXPROCS=1",
+    "-e",
+    "GOMEMLIMIT=192MiB",
+    "-e",
+    "SQLITE_SYNC=FULL",
+    "alpine@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40",
+    "/eval/bin/sqlite-http"
+  ],
+  "health": "{\"sqlite\":\"3.53.3\",\"sync\":\"FULL\"}\n",
+  "submit_seconds": 0.004458666999999972,
+  "batch_latency_ms": {
+    "p50": 4.455291999999944,
+    "p95": 4.455291999999944,
+    "samples": [
+      4.455291999999944
+    ]
+  },
+  "validation": {
+    "compared": 100,
+    "expected": 100,
+    "missing": 0,
+    "extra": 0,
+    "duplicates": 0,
+    "f64_bit_differences": 0,
+    "max_absolute_error": 0.0,
+    "examples": [],
+    "seconds": 0.03728245799999996
+  },
+  "queries": {
+    "day_aggregate": {
+      "ms": [
+        0.9044999999999748,
+        0.929957999999953,
+        1.0945420000000317,
+        1.441958000000021,
+        0.9798750000000744
+      ],
+      "median_ms": 0.9798750000000744,
+      "result_rows": 52,
+      "count_sum": 100
+    },
+    "five_minute": {
+      "ms": [
+        0.9465419999999947,
+        0.8561249999999854,
+        0.8292909999999543,
+        0.877291999999974,
+        0.8333339999999634
+      ],
+      "median_ms": 0.8561249999999854,
+      "result_rows": 52,
+      "count_sum": 100
+    }
+  },
+  "parquet_write": {
+    "rows": 100
+  },
+  "parquet_write_seconds": 0.007500666999999961,
+  "state": {
+    "Status": "running",
+    "Running": true,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 195380,
+    "ExitCode": 0,
+    "Error": "",
+    "StartedAt": "2026-09-07T18:10:30.509456759Z",
+    "FinishedAt": "0001-01-01T00:00:00Z"
+  },
+  "ok": true,
+  "volume": "ftwdb-eval-smoke4-sqlite-full-r1-data",
+  "memory_peak_bytes_by_phase": {
+    "idle": 6070272,
+    "after_ingest": 6176768,
+    "after_query": 7770112,
+    "final": 11800576
+  }
+}

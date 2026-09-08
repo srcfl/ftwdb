@@ -1,0 +1,106 @@
+{
+  "kind": "duckdb",
+  "tag": "smoke4-duckdb-r1",
+  "memory_mib": 512,
+  "cpus": 1,
+  "points": 100,
+  "image": "python@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36",
+  "started_at": "2026-09-07T18:10:32Z",
+  "command": [
+    "docker",
+    "run",
+    "-d",
+    "--name",
+    "ftwdb-eval-smoke4-duckdb-r1",
+    "--label",
+    "purpose=ftwdb-evaluation",
+    "--network",
+    "ftwdb-eval-20260907",
+    "--network-alias",
+    "engine",
+    "--cpus",
+    "1",
+    "--memory",
+    "512m",
+    "--memory-swap",
+    "512m",
+    "--pids-limit",
+    "256",
+    "--mount",
+    "type=volume,source=ftwdb-eval-smoke4-duckdb-r1-data,target=/data",
+    "--mount",
+    "type=bind,source=<evaluation-root>,target=/eval,readonly",
+    "-e",
+    "PYTHONPATH=/eval/bin/python-site",
+    "python@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36",
+    "python",
+    "/eval/harness/duck_server.py"
+  ],
+  "health": "{\"duckdb\": \"1.5.5\"}",
+  "submit_seconds": 0.013538832999999695,
+  "batch_latency_ms": {
+    "p50": 13.53599999999977,
+    "p95": 13.53599999999977,
+    "samples": [
+      13.53599999999977
+    ]
+  },
+  "validation": {
+    "compared": 100,
+    "expected": 100,
+    "missing": 0,
+    "extra": 0,
+    "duplicates": 0,
+    "f64_bit_differences": 0,
+    "max_absolute_error": 0.0,
+    "examples": [],
+    "seconds": 0.06463391600000001
+  },
+  "queries": {
+    "day_aggregate": {
+      "ms": [
+        3.507082999999689,
+        1.501041999999675,
+        1.1559169999997287,
+        1.0732500000001366,
+        1.4966249999996961
+      ],
+      "median_ms": 1.4966249999996961,
+      "result_rows": 52,
+      "count_sum": 100
+    },
+    "five_minute": {
+      "ms": [
+        3.2435409999997944,
+        1.3244999999999507,
+        1.0787080000000948,
+        1.4283750000001483,
+        1.1762499999998788
+      ],
+      "median_ms": 1.3244999999999507,
+      "result_rows": 52,
+      "count_sum": 100
+    }
+  },
+  "state": {
+    "Status": "running",
+    "Running": true,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 195804,
+    "ExitCode": 0,
+    "Error": "",
+    "StartedAt": "2026-09-07T18:10:32.190035214Z",
+    "FinishedAt": "0001-01-01T00:00:00Z"
+  },
+  "ok": true,
+  "volume": "ftwdb-eval-smoke4-duckdb-r1-data",
+  "memory_peak_bytes_by_phase": {
+    "idle": 71593984,
+    "after_ingest": 79228928,
+    "after_query": 85647360,
+    "final": 85663744
+  }
+}

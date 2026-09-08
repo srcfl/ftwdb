@@ -1,0 +1,148 @@
+{
+  "kind": "vm",
+  "tag": "smoke4-vm-r1",
+  "memory_mib": 512,
+  "cpus": 1,
+  "points": 100,
+  "image": "victoriametrics/victoria-metrics@sha256:6d164540a04f49ba4e696cbdb70f9fee78be1e94b8f2a1292743a0b1ab8275bd",
+  "started_at": "2026-09-07T18:11:03Z",
+  "command": [
+    "docker",
+    "run",
+    "-d",
+    "--name",
+    "ftwdb-eval-smoke4-vm-r1",
+    "--label",
+    "purpose=ftwdb-evaluation",
+    "--network",
+    "ftwdb-eval-20260907",
+    "--network-alias",
+    "engine",
+    "--cpus",
+    "1",
+    "--memory",
+    "512m",
+    "--memory-swap",
+    "512m",
+    "--pids-limit",
+    "256",
+    "--mount",
+    "type=volume,source=ftwdb-eval-smoke4-vm-r1-data,target=/data",
+    "--mount",
+    "type=bind,source=<evaluation-root>,target=/eval,readonly",
+    "-e",
+    "GOMAXPROCS=1",
+    "victoriametrics/victoria-metrics@sha256:6d164540a04f49ba4e696cbdb70f9fee78be1e94b8f2a1292743a0b1ab8275bd",
+    "-httpListenAddr=:8080",
+    "-storageDataPath=/data",
+    "-retentionPeriod=100y",
+    "-memory.allowedBytes=64MiB",
+    "-search.maxMemoryPerQuery=64MiB",
+    "-search.maxConcurrentRequests=1"
+  ],
+  "health": "OK",
+  "submit_seconds": 0.014496166000000699,
+  "batch_latency_ms": {
+    "p50": 14.488583000002109,
+    "p95": 14.488583000002109,
+    "samples": [
+      14.488583000002109
+    ]
+  },
+  "force_visibility_seconds": 0.0028085419999968053,
+  "validation": {
+    "compared": 100,
+    "expected": 100,
+    "missing": 0,
+    "extra": 0,
+    "duplicates": 0,
+    "f64_bit_differences": 17,
+    "max_absolute_error": 7.750713848508894e-09,
+    "examples": [
+      {
+        "driver": "d1",
+        "metric": "s19",
+        "ts_ms": 1767225606451,
+        "expected": 0.037000000000000005,
+        "actual": 0.037
+      },
+      {
+        "driver": "d1",
+        "metric": "s19",
+        "ts_ms": 1767225601411,
+        "expected": 0.037000000000000005,
+        "actual": 0.037
+      },
+      {
+        "driver": "d1",
+        "metric": "s20",
+        "ts_ms": 1767225606451,
+        "expected": 193.10000000000002,
+        "actual": 193.1
+      },
+      {
+        "driver": "d1",
+        "metric": "s27",
+        "ts_ms": 1767225606443,
+        "expected": 430.70000000000005,
+        "actual": 430.7
+      },
+      {
+        "driver": "d1",
+        "metric": "s28",
+        "ts_ms": 1767225606443,
+        "expected": 136.95000000000002,
+        "actual": 136.95
+      }
+    ],
+    "seconds": 0.04102275000000333
+  },
+  "queries": {
+    "count_over_24h": {
+      "ms": [
+        0.8760419999944702,
+        0.6372080000005553,
+        0.6435419999988312,
+        0.6466249999945717,
+        0.6330419999969195
+      ],
+      "median_ms": 0.6435419999988312,
+      "answer": {
+        "status": "success",
+        "data": {
+          "resultType": "vector",
+          "result": [
+            {
+              "metric": {},
+              "value": [
+                1767312000,
+                "100"
+              ]
+            }
+          ]
+        }
+      }
+    }
+  },
+  "state": {
+    "Status": "running",
+    "Running": true,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 196025,
+    "ExitCode": 0,
+    "Error": "",
+    "StartedAt": "2026-09-07T18:11:03.403087083Z",
+    "FinishedAt": "0001-01-01T00:00:00Z"
+  },
+  "ok": true,
+  "volume": "ftwdb-eval-smoke4-vm-r1-data",
+  "memory_peak_bytes_by_phase": {
+    "idle": 31473664,
+    "after_ingest": 32198656,
+    "after_query": 34758656,
+    "final": 34758656
+  }
+}
